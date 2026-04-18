@@ -8,7 +8,21 @@ on:
 
 jobs:
   build-macos:
-    runs-on: macos-latest
+    # macos-latest = Apple Silicon (arm64). Intel Macs need the intel job artifact.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: macos-latest
+            artifact-name: TidanMgr-macos-arm64
+            portable-zip: TidanMgr-macos-arm64-portable.zip
+          - runs-on: macos-15-intel
+            artifact-name: TidanMgr-macos-intel
+            portable-zip: TidanMgr-macos-intel-portable.zip
+
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      TIDANMGR_PORTABLE_ZIP: ${{ matrix.portable-zip }}
 
     steps:
       - name: Checkout
@@ -25,5 +39,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TidanMgr-macos-portable
-          path: app/dist/TidanMgr-macos-portable.zip
+          name: ${{ matrix.artifact-name }}
+          path: app/dist/${{ matrix.portable-zip }}

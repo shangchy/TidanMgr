@@ -10,7 +10,8 @@ macOS packaging (must run on a Mac)
    - TidanMgr.app                 Double-click to run (data in ~/Library/Application Support/TidanMgr/)
    - PortableStart.command        Portable mode: data in dist/TidanMgrData/ (copy together with .app)
    - run_TidanMgr.sh              Run from Terminal with logs (portable data)
-   - TidanMgr-macos-portable.zip  Zip of the three items above (ASCII filename, for distribution)
+   - TidanMgr-macos-portable.zip  Default zip of the three items (ASCII; name matches host arch)
+   CI uploads: TidanMgr-macos-arm64-portable.zip (Apple Silicon), TidanMgr-macos-intel-portable.zip (Intel)
 
 3) First launch "cannot be opened": System Settings -> Privacy & Security -> Open Anyway; or right-click .app -> Open.
 
