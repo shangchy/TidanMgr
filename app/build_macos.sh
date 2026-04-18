@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run on macOS: produces dist/TidanMgr.app, helper scripts, and TidanMgr-macos-portable.zip (ASCII names).
+# Run on macOS: produces dist/TidanMgr.app, helper scripts, and a portable zip (default
+# TidanMgr-macos-portable.zip; CI may set TIDANMGR_PORTABLE_ZIP for arm64/intel-specific names).
 # Usage: cd app && bash build_macos.sh
 set -euo pipefail
 
@@ -58,14 +59,23 @@ exec "\$(cd "\$(dirname "\$0")" && pwd)/${APP_NAME}.app/Contents/MacOS/${APP_NAM
 EOS
 chmod +x "$RUN_SH"
 
-ZIP_PATH="$SCRIPT_DIR/dist/TidanMgr-macos-portable.zip"
-ZIP_TMP="$SCRIPT_DIR/TidanMgr-macos-portable.zip.tmp"
+# Default zip name keeps historical CI/docs; override with TIDANMGR_PORTABLE_ZIP for arch-specific builds.
+ZIP_BASENAME="${TIDANMGR_PORTABLE_ZIP:-TidanMgr-macos-portable.zip}"
+ZIP_PATH="$SCRIPT_DIR/dist/$ZIP_BASENAME"
+ZIP_TMP="$SCRIPT_DIR/${ZIP_BASENAME}.tmp"
 rm -f "$ZIP_PATH" "$ZIP_TMP"
 (
   cd "$SCRIPT_DIR/dist"
   zip -ry "$ZIP_TMP" "${APP_NAME}.app" PortableStart.command run_TidanMgr.sh
 )
 mv -f "$ZIP_TMP" "$ZIP_PATH"
+
+MAIN_BIN="$SCRIPT_DIR/dist/${APP_NAME}.app/Contents/MacOS/${APP_NAME}"
+if [ -f "$MAIN_BIN" ]; then
+  echo ""
+  echo "Main executable (file):"
+  file "$MAIN_BIN" || true
+fi
 
 echo ""
 echo "Done."
