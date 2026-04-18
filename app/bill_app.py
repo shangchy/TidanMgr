@@ -8,17 +8,19 @@ from typing import Any
 from urllib.parse import urlparse
 
 from openpyxl import load_workbook
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QModelIndex, QPoint, QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
     QFontMetrics,
+    QFontMetricsF,
     QGuiApplication,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
+    QPalette,
     QPolygon,
     QPolygonF,
 )
@@ -44,6 +46,9 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStatusBar,
     QStackedWidget,
+    QStyle,
+    QStyleOptionViewItem,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -155,6 +160,7 @@ FIELDS = [
     "type_code",
     "operator_code",
     "industry_code",
+    "allow_print_url",
     "url",
     "quantity",
     "duration",
@@ -173,6 +179,7 @@ HEADERS = {
     "type_code": "类型",
     "operator_code": "运营商",
     "industry_code": "行业编码",
+    "allow_print_url": "允许",
     "url": "URL",
     "quantity": "数量",
     "duration": "时长",
@@ -187,7 +194,25 @@ HEADERS = {
     "action": "操作",
 }
 
+
+def coerce_allow_print_url(raw: Any) -> bool:
+    """是否允许导出 URL；缺省为 True（兼容旧数据）。"""
+    if raw is None or raw == "":
+        return True
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if s in ("0", "false", "no", "否"):
+        return False
+    if s in ("1", "true", "yes", "是"):
+        return True
+    return True
+
+
 FROZEN_COLUMNS = 2
+# 「允许」列在右侧滚动表中的列索引；逻辑列号 = 滚动列 + 冻结列数
+ALLOW_PRINT_SCROLL_COL = FIELDS.index("allow_print_url") - 1
+ALLOW_PRINT_URL_DISPLAY_COL = ALLOW_PRINT_SCROLL_COL + FROZEN_COLUMNS
 MAIN_SCROLL_COLUMNS = len(DISPLAY_FIELDS) - FROZEN_COLUMNS
 # 历史滚动区：与主表相同字段列 + 提单时间 + 删除时间，不含「操作」列
 HISTORY_SCROLL_FIELDS = FIELDS[1:] + ["created_at", "deleted_at"]
@@ -590,6 +615,56 @@ class UrlDialog(QDialog):
         return self.editor.toPlainText().strip()
 
 
+class AllowPrintUrlCellDelegate(QStyledItemDelegate):
+    """「允许」列：单元格为表格默认底色；中间绘制浅色圆形图标，「是/否」在圆内居中。"""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = (opt.text or "").strip() or str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip() or "是"
+        yes = text == "是"
+        rect = option.rect
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        pal = opt.palette
+        if opt.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(rect, pal.brush(QPalette.ColorRole.Highlight))
+        elif opt.features & QStyleOptionViewItem.ViewItemFeature.Alternate:
+            painter.fillRect(rect, pal.brush(QPalette.ColorRole.AlternateBase))
+        else:
+            painter.fillRect(rect, pal.brush(QPalette.ColorRole.Base))
+
+        margin = 6
+        d = min(rect.width(), rect.height()) - 2 * margin
+        d = max(24, min(int(d), 38))
+        cx, cy = rect.center().x(), rect.center().y()
+        disc = QRect(int(cx - d / 2), int(cy - d / 2), d, d)
+        if yes:
+            fill = QColor(200, 232, 204)
+            border = QColor(165, 210, 172)
+            pen_text = QColor(52, 118, 68)
+        else:
+            fill = QColor(222, 222, 230)
+            border = QColor(198, 198, 208)
+            pen_text = QColor(92, 92, 108)
+        painter.setBrush(fill)
+        painter.setPen(QPen(border, 1))
+        painter.drawEllipse(disc)
+
+        f = QFont(opt.font)
+        f.setBold(True)
+        for _ in range(4):
+            fm = QFontMetricsF(f)
+            if fm.horizontalAdvance(text) <= d - 8 and fm.height() <= d - 6:
+                break
+            f.setPointSizeF(max(7.5, f.pointSizeF() - 0.5))
+        painter.setFont(f)
+        painter.setPen(pen_text)
+        painter.drawText(disc, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
+
+
 class BillApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -723,7 +798,9 @@ class BillApp(QMainWindow):
         btn_clear.setObjectName("btnGhost")
         btn_clear.clicked.connect(self.clear_bill_search_and_filters)
         self.chk_print_url = QCheckBox("是否打印URL")
-        self.lbl_hint = QLabel("未勾选：导出内容不包含URL信息 | 勾选：导出内容包含URL信息")
+        self.lbl_hint = QLabel(
+            "未勾选：不写 URL | 勾选：仅对「允许」列勾选的行写入 URL；未勾「允许」的行不写 URL"
+        )
         self.lbl_hint.setObjectName("hintLabel")
         self.btn_print = QPushButton("🖨 打印")
         self.btn_print.setObjectName("btnAccent")
@@ -802,6 +879,7 @@ class BillApp(QMainWindow):
         hdr_main_f.setSectionResizeMode(0, QHeaderView.Fixed)
         hdr_main_f.setSectionResizeMode(1, QHeaderView.Fixed)
         hdr_main_s.setSectionResizeMode(QHeaderView.Interactive)
+        self.table.setItemDelegateForColumn(ALLOW_PRINT_SCROLL_COL, AllowPrintUrlCellDelegate(self.table))
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         hdr_main_f.sectionClicked.connect(self._on_main_frozen_header_section_clicked)
         hdr_main_s.sectionClicked.connect(self._on_main_scroll_header_clicked)
@@ -886,6 +964,7 @@ class BillApp(QMainWindow):
         hdr_hist_f.setSectionResizeMode(0, QHeaderView.Fixed)
         hdr_hist_f.setSectionResizeMode(1, QHeaderView.Fixed)
         hdr_hist_s.setSectionResizeMode(QHeaderView.Interactive)
+        self.history_table.setItemDelegateForColumn(ALLOW_PRINT_SCROLL_COL, AllowPrintUrlCellDelegate(self.history_table))
         self.history_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         hdr_hist_f.sectionClicked.connect(self._on_hist_frozen_header_section_clicked)
         hdr_hist_s.sectionClicked.connect(self._on_history_scroll_header_clicked)
@@ -932,7 +1011,8 @@ class BillApp(QMainWindow):
         root.addWidget(main_wrap, 1)
         self.show_bill_page()
 
-        col_widths = [310, 150, 150, 120, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 170, 90]
+        # 与滚动区列顺序一致：类型…行业、「允许」、URL…；长度须 >= MAIN_SCROLL_COLUMNS+1（含 col_widths[0] 给冻结任务名列）
+        col_widths = [310, 150, 150, 120, 72, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 170, 90]
         self.table_frozen.setColumnWidth(0, 42)
         self.table_frozen.setColumnWidth(1, col_widths[0])
         self.table_frozen.setFixedWidth(42 + col_widths[0])
@@ -1002,7 +1082,9 @@ class BillApp(QMainWindow):
         self.lbl_time.setText(datetime.now().strftime("%Y/%m/%d %H:%M:%S"))
 
     def default_record(self):
-        return {k: "" for k in FIELDS} | {"checked": False, "created_at": ""}
+        d = {k: "" for k in FIELDS} | {"checked": False, "created_at": ""}
+        d["allow_print_url"] = True
+        return d
 
     def load_data(self):
         if DATA_FILE.exists():
@@ -1012,6 +1094,7 @@ class BillApp(QMainWindow):
                 self.records = []
         for rec in self.records:
             rec.setdefault("created_at", "")
+            rec["allow_print_url"] = coerce_allow_print_url(rec.get("allow_print_url"))
         if not self.records:
             self.records = [self.default_record()]
 
@@ -1025,6 +1108,7 @@ class BillApp(QMainWindow):
             rec.setdefault("checked", False)
             rec.setdefault("deleted_at", "")
             rec.setdefault("created_at", "")
+            rec["allow_print_url"] = coerce_allow_print_url(rec.get("allow_print_url"))
 
     def load_picker_recent(self):
         if PICKER_RECENT_FILE.exists():
@@ -1063,7 +1147,7 @@ class BillApp(QMainWindow):
         self.refresh_table()
 
     def is_row_saved(self, rec):
-        return any(str(rec.get(k, "")).strip() for k in FIELDS)
+        return any(str(rec.get(k, "")).strip() for k in FIELDS if k != "allow_print_url")
 
     def delete_selected(self):
         to_del = [i for i in range(len(self.records)) if self.records[i].get("checked")]
@@ -1151,6 +1235,15 @@ class BillApp(QMainWindow):
             tn_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.history_table_frozen.setItem(row, 1, tn_item)
             for sc, f in enumerate(FIELDS[1:]):
+                if f == "allow_print_url":
+                    yes = coerce_allow_print_url(rec.get("allow_print_url"))
+                    aw_item = QTableWidgetItem("是" if yes else "否")
+                    aw_item.setFont(QFont(self.history_table_frozen.font()))
+                    aw_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    aw_item.setToolTip("允许打印URL：是" if yes else "允许打印URL：否")
+                    aw_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    self.history_table.setItem(row, sc, aw_item)
+                    continue
                 item = QTableWidgetItem(self.display_val(rec, f))
                 item.setTextAlignment(Qt.AlignCenter)
                 item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -1210,6 +1303,7 @@ class BillApp(QMainWindow):
         for idx in sorted(restore_idx):
             src = self.history_records[idx]
             rec = {k: src.get(k, "") for k in FIELDS}
+            rec["allow_print_url"] = coerce_allow_print_url(src.get("allow_print_url"))
             rec["checked"] = False
             rec["created_at"] = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
             self.records.append(rec)
@@ -1226,6 +1320,8 @@ class BillApp(QMainWindow):
             return TYPE_MAP.get(rec.get(field, ""), "")
         if field == "operator_code":
             return OP_MAP.get(rec.get(field, ""), "")
+        if field == "allow_print_url":
+            return "是" if coerce_allow_print_url(rec.get("allow_print_url")) else "否"
         if field == "url":
             return first_url(rec.get(field, ""))
         return str(rec.get(field, ""))
@@ -1368,6 +1464,8 @@ class BillApp(QMainWindow):
             return BillApp._created_at_filter_key(rec.get("created_at"))
         if field in ("type_code", "operator_code"):
             return self.display_val(rec, field) or str(rec.get(field, "") or "")
+        if field == "allow_print_url":
+            return self.display_val(rec, "allow_print_url")
         if field == "url":
             return first_url(rec.get(field, ""))
         return str(rec.get(field, "") or "")
@@ -1645,6 +1743,8 @@ class BillApp(QMainWindow):
             return BillApp._created_at_filter_key(rec.get("created_at"))
         if field in ("type_code", "operator_code"):
             return self.display_val(rec, field) or str(rec.get(field, "") or "")
+        if field == "allow_print_url":
+            return self.display_val(rec, "allow_print_url")
         if field == "url":
             return first_url(rec.get(field, ""))
         return str(rec.get(field, "") or "")
@@ -1821,6 +1921,17 @@ class BillApp(QMainWindow):
                 tn_item.setToolTip(self.field_error_msgs.get((rec_idx, "task_name"), "字段校验失败"))
             self.table_frozen.setItem(row, 1, tn_item)
             for sc, f in enumerate(FIELDS[1:]):
+                if f == "allow_print_url":
+                    yes = coerce_allow_print_url(rec.get("allow_print_url"))
+                    aw_item = QTableWidgetItem("是" if yes else "否")
+                    aw_item.setFont(QFont(self.table_frozen.font()))
+                    aw_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    aw_item.setToolTip(
+                        "允许打印URL：是（单击切换为否）" if yes else "允许打印URL：否（单击切换为是）"
+                    )
+                    aw_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    self.table.setItem(row, sc, aw_item)
+                    continue
                 item = QTableWidgetItem(self.display_val(rec, f))
                 if f in ("url",):
                     item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -1910,6 +2021,13 @@ class BillApp(QMainWindow):
             rec_idx = self.filtered_indices[row]
             new_state = not self.records[rec_idx].get("checked", False)
             self.on_row_checkbox_changed(rec_idx, new_state)
+            return
+        if col == ALLOW_PRINT_URL_DISPLAY_COL:
+            rec_idx = self.filtered_indices[row]
+            cur = coerce_allow_print_url(self.records[rec_idx].get("allow_print_url"))
+            self.records[rec_idx]["allow_print_url"] = not cur
+            self.save_data()
+            self.refresh_table()
 
     def on_row_checkbox_changed(self, rec_idx: int, checked: bool):
         if self.updating_table:
@@ -1928,6 +2046,12 @@ class BillApp(QMainWindow):
         rec_idx = self.filtered_indices[row]
         field = FIELDS[col - 1]
         rec = self.records[rec_idx]
+        if field == "allow_print_url":
+            cur = coerce_allow_print_url(rec.get("allow_print_url"))
+            rec["allow_print_url"] = not cur
+            self.save_data()
+            self.refresh_table()
+            return
         if field == "url":
             dlg = UrlDialog(rec.get("url", ""), self)
             if dlg.exec() == QDialog.Accepted:
@@ -2235,7 +2359,7 @@ class BillApp(QMainWindow):
         if col == len(FIELDS) + 1:
             return
         field = FIELDS[col - 1]
-        if field in ("type_code", "operator_code", "duration", "url"):
+        if field in ("type_code", "operator_code", "duration", "url", "allow_print_url"):
             return
         if field in ("province", "exclude_province", "city", "exclude_city"):
             raw = item.text()
@@ -2576,7 +2700,8 @@ class BillApp(QMainWindow):
             for f, c in col_map.items():
                 if f == "url":
                     raw_url = str(rec.get("url", ""))
-                    if include_url:
+                    row_allow = coerce_allow_print_url(rec.get("allow_print_url"))
+                    if include_url and row_allow:
                         lines = [line for line in raw_url.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
                         ws[f"{c}{rr}"] = "\r\n".join(lines)
                     else:
