@@ -1,0 +1,1505 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>提单管理系统 - 桌面应用原型</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    --font-sans: "Manrope", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", "Cascadia Code", "SF Mono", Consolas, monospace;
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 14px;
+    --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+
+    --canvas-bg: radial-gradient(ellipse 120% 70% at 50% -15%, rgba(99, 102, 241, 0.16) 0%, transparent 52%), #0a0c10;
+    --window-bg: linear-gradient(168deg, #1c2230 0%, #141820 48%, #0f1118 100%);
+    --window-border: rgba(255, 255, 255, 0.085);
+    --window-shadow: 0 28px 80px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+
+    --titlebar-bg: linear-gradient(180deg, #252b3a 0%, #1a1f2c 100%);
+    --titlebar-border: rgba(255, 255, 255, 0.06);
+    --titlebar-text: #c5ccdc;
+
+    --sidebar-bg: linear-gradient(180deg, #12151e 0%, #0c0e14 100%);
+    --sidebar-border: rgba(255, 255, 255, 0.06);
+    --nav-muted: #f1f4fa;
+    --nav-hover-bg: rgba(255, 255, 255, 0.06);
+    --nav-active-bg: linear-gradient(90deg, rgba(124, 158, 255, 0.18) 0%, rgba(124, 158, 255, 0.02) 100%);
+    --nav-active-border: #a8bfff;
+    --nav-active-text: #ffffff;
+    --sidebar-label: #eef1f7;
+
+    --toolbar-bg: rgba(22, 26, 36, 0.92);
+    --toolbar-border: rgba(255, 255, 255, 0.06);
+    --surface-elevated: rgba(30, 36, 50, 0.65);
+    --surface-input: rgba(10, 12, 18, 0.75);
+    --border-default: rgba(255, 255, 255, 0.1);
+    --border-strong: rgba(255, 255, 255, 0.14);
+
+    --text-primary: #e9ecf4;
+    --text-secondary: #e4e8f1;
+    --text-tertiary: #cdd3df;
+
+    --accent: #8aa4ff;
+    --accent-bright: #b4c6ff;
+    --accent-soft: rgba(138, 164, 255, 0.14);
+    --accent-warm: #d4b896;
+    --accent-warm-soft: rgba(212, 184, 150, 0.12);
+
+    --success: #2d9d78;
+    --success-hover: #34b88a;
+    --danger: #e05263;
+    --danger-hover: #e86877;
+    --warn-hint: #e8b86a;
+
+    --group-bg: rgba(24, 28, 40, 0.85);
+    --group-header-bg: linear-gradient(90deg, rgba(138, 164, 255, 0.1) 0%, rgba(212, 184, 150, 0.06) 100%);
+    --group-header-text: #d4c4a8;
+    --group-border: rgba(255, 255, 255, 0.08);
+
+    --table-header-bg: linear-gradient(180deg, #222836 0%, #1a1f2c 100%);
+    --table-header-text: #f4f6fb;
+    --table-row-hover: rgba(124, 158, 255, 0.1);
+    --table-row-selected: rgba(124, 158, 255, 0.2);
+    --table-border: rgba(255, 255, 255, 0.06);
+
+    --btn-primary-bg: linear-gradient(180deg, #6b8cff 0%, #516fd9 100%);
+    --btn-primary-border: rgba(138, 164, 255, 0.45);
+    --btn-success-bg: linear-gradient(180deg, #2fa882 0%, #25856a 100%);
+    --btn-ghost-hover: rgba(255, 255, 255, 0.08);
+
+    --statusbar-bg: #e4e7ee;
+    --statusbar-fg: #4a5568;
+    --statusbar-border: rgba(0, 0, 0, 0.08);
+
+    --picker-accent: #7dd3c4;
+    --code-accent: #7dd3c4;
+
+    font-family: var(--font-sans);
+    background: var(--canvas-bg);
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 450;
+    letter-spacing: 0.015em;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body.light {
+    --canvas-bg: radial-gradient(ellipse 100% 80% at 50% -20%, rgba(59, 130, 246, 0.08) 0%, transparent 50%), #e8ebf2;
+    --window-bg: linear-gradient(180deg, #ffffff 0%, #f6f7fb 100%);
+    --window-border: rgba(15, 23, 42, 0.08);
+    --window-shadow: 0 24px 64px rgba(15, 23, 42, 0.12), 0 0 0 1px rgba(255, 255, 255, 0.8) inset;
+
+    --titlebar-bg: linear-gradient(180deg, #fafbfd 0%, #eef1f7 100%);
+    --titlebar-border: rgba(15, 23, 42, 0.08);
+    --titlebar-text: #334155;
+
+    --sidebar-bg: linear-gradient(180deg, #f3f5fa 0%, #e8ecf4 100%);
+    --sidebar-border: rgba(15, 23, 42, 0.08);
+    --nav-muted: #000000;
+    --nav-hover-bg: rgba(15, 23, 42, 0.06);
+    --nav-active-bg: linear-gradient(90deg, rgba(59, 130, 246, 0.12) 0%, rgba(59, 130, 246, 0.02) 100%);
+    --nav-active-border: #2563eb;
+    --nav-active-text: #000000;
+    --sidebar-label: #000000;
+
+    --toolbar-bg: rgba(255, 255, 255, 0.92);
+    --toolbar-border: rgba(15, 23, 42, 0.08);
+    --surface-elevated: #ffffff;
+    --surface-input: #ffffff;
+    --border-default: rgba(15, 23, 42, 0.12);
+    --border-strong: rgba(15, 23, 42, 0.18);
+
+    --text-primary: #000000;
+    --text-secondary: #0a0a0a;
+    --text-tertiary: #111111;
+
+    --accent: #2563eb;
+    --accent-bright: #3b82f6;
+    --accent-soft: rgba(37, 99, 235, 0.1);
+    --accent-warm: #b45309;
+    --accent-warm-soft: rgba(180, 83, 9, 0.08);
+
+    --success: #0d9488;
+    --success-hover: #14b8a6;
+    --danger: #dc2626;
+    --danger-hover: #ef4444;
+    --warn-hint: #b45309;
+
+    --group-bg: #ffffff;
+    --group-header-bg: linear-gradient(90deg, rgba(37, 99, 235, 0.06) 0%, rgba(180, 83, 9, 0.04) 100%);
+    --group-header-text: #1e3a5f;
+    --group-border: rgba(15, 23, 42, 0.1);
+
+    --table-header-bg: linear-gradient(180deg, #f1f5f9 0%, #e8edf5 100%);
+    --table-header-text: #000000;
+    --table-row-hover: rgba(37, 99, 235, 0.08);
+    --table-row-selected: rgba(37, 99, 235, 0.14);
+    --table-border: rgba(15, 23, 42, 0.08);
+
+    --btn-primary-bg: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+    --btn-primary-border: rgba(37, 99, 235, 0.35);
+    --btn-success-bg: linear-gradient(180deg, #14b8a6 0%, #0d9488 100%);
+    --btn-ghost-hover: rgba(15, 23, 42, 0.06);
+
+    --statusbar-bg: #e8ecf4;
+    --statusbar-fg: #475569;
+    --statusbar-border: rgba(15, 23, 42, 0.08);
+
+    --picker-accent: #0d9488;
+    --code-accent: #0f766e;
+
+    background: var(--canvas-bg);
+    color: var(--text-primary);
+  }
+
+  body.light .form-area.readonly input,
+  body.light .form-area.readonly select { background: #eef1f6; }
+  body.light .field input,
+  body.light .field select {
+    background: var(--surface-input);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+  }
+  body.light .field input:focus,
+  body.light .field select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  body.light .field select option { background: #fff; color: #0f172a; }
+  body.light .ind-off { background: #e2e8f0; color: #94a3b8; }
+  body.light .status-text { color: var(--text-secondary); }
+  body.light .task-preview {
+    background: #f1f5f9;
+    border: 1px solid var(--border-default);
+    color: var(--accent);
+  }
+  body.light .task-preview .lbl { color: var(--text-tertiary); }
+  body.light .datagrid-wrapper { border: 1px solid var(--border-default); }
+  body.light .datagrid th {
+    background: var(--table-header-bg);
+    color: var(--table-header-text);
+    border-bottom: 1px solid var(--table-border);
+    border-right: 1px solid var(--table-border);
+  }
+  body.light .datagrid td { border-bottom: 1px solid var(--table-border); border-right: 1px solid var(--table-border); }
+  body.light .datagrid tbody tr:hover { background: var(--table-row-hover); }
+  body.light .datagrid tbody tr.selected { background: var(--table-row-selected); }
+  body.light .empty-cell { color: #000000; opacity: 0.55; }
+  body.light .datagrid,
+  body.light .datagrid td { color: #000000; }
+  body.light .tag-stopped { background: #e2e8f0; color: #64748b; }
+  body.light .multi-picker {
+    background: #fff;
+    border: 1px solid var(--border-default);
+    box-shadow: 0 16px 48px rgba(15, 23, 42, 0.15);
+  }
+  body.light .multi-picker label { color: var(--text-primary); }
+  body.light .multi-picker label:hover { background: #f1f5f9; }
+  body.light [contenteditable="false"] { background-color: #f1f5f9 !important; cursor: not-allowed !important; }
+  body.light ::-webkit-scrollbar-thumb { background: rgba(15, 23, 42, 0.15); }
+  body.light ::-webkit-scrollbar-thumb:hover { background: rgba(15, 23, 42, 0.25); }
+
+  body.light .picker-panel { background: #fff; border-color: var(--border-default); }
+  body.light .picker-toolbar input { background: #fff; border-color: var(--border-default); color: var(--text-primary); }
+  body.light .search-input {
+    background: var(--surface-input);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+  }
+  body.light .search-input::placeholder { color: var(--text-tertiary); }
+  body.light .print-url-hint { color: var(--warn-hint); }
+  body.light .picker-row:hover { background: #f1f5f9; }
+  body.light .url-editor { background: #fff; border-color: var(--border-default); }
+  body.light .url-editor textarea { background: #fff; border-color: var(--border-default); color: var(--text-primary); }
+
+  .app-window {
+    max-width: 1440px;
+    width: calc(100vw - 40px);
+    margin: 20px auto;
+    background: var(--window-bg);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--window-shadow);
+    overflow: hidden;
+    border: 1px solid var(--window-border);
+  }
+
+  .titlebar {
+    height: 40px;
+    background: var(--titlebar-bg);
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--titlebar-border);
+    user-select: none;
+  }
+  .traffic-lights { display: flex; gap: 8px; }
+  .tl { width: 12px; height: 12px; border-radius: 50%; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25); }
+  .tl-close { background: linear-gradient(180deg, #ff857e, #ff5f57); }
+  .tl-min { background: linear-gradient(180deg, #ffd080, #febc2e); }
+  .tl-max { background: linear-gradient(180deg, #5ee87a, #28c840); }
+  .titlebar-text {
+    flex: 1;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    color: var(--titlebar-text);
+    text-transform: uppercase;
+  }
+
+  .app-layout { display: flex; height: calc(100vh - 100px); min-height: 600px; }
+
+  .sidebar {
+    width: 220px;
+    background: var(--sidebar-bg);
+    border-right: 1px solid var(--sidebar-border);
+    display: flex;
+    flex-direction: column;
+  }
+  .sidebar-header {
+    padding: 18px 18px 12px;
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--sidebar-label);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .nav-item {
+    padding: 11px 18px;
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--nav-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border-left: 3px solid transparent;
+    transition: background 0.18s var(--ease), color 0.18s var(--ease), border-color 0.18s var(--ease);
+  }
+  .nav-item:hover { background: var(--nav-hover-bg); color: var(--text-primary); }
+  .nav-item.active {
+    background: var(--nav-active-bg);
+    color: var(--nav-active-text);
+    border-left-color: var(--nav-active-border);
+    font-weight: 700;
+  }
+  .nav-item .ico { width: 22px; text-align: center; font-size: 1.05em; opacity: 0.95; }
+  .nav-item.disabled { opacity: 0.42; cursor: default; font-weight: 700; color: var(--nav-muted); }
+  .nav-divider { height: 1px; background: var(--sidebar-border); margin: 10px 18px; }
+  .sidebar-footer {
+    margin-top: auto;
+    padding: 14px 18px;
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--nav-muted);
+    border-top: 1px solid var(--sidebar-border);
+  }
+  .theme-switch-wrap { display: flex; flex-direction: column; gap: 8px; }
+  .theme-switch-wrap .lbl { font-size: 17px; font-weight: 700; color: var(--nav-muted); letter-spacing: 0.04em; }
+
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  .top-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 20px;
+    background: var(--toolbar-bg);
+    border-bottom: 1px solid var(--toolbar-border);
+    flex-wrap: wrap;
+    backdrop-filter: blur(12px);
+  }
+  .top-toolbar label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .top-toolbar input[type="checkbox"] { accent-color: var(--accent); }
+  .print-url-hint {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--warn-hint);
+    margin-left: 20px;
+    letter-spacing: 0.02em;
+  }
+  .search-input {
+    padding: 8px 14px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-family: var(--font-sans);
+    background: var(--surface-input);
+    color: var(--text-primary);
+    min-width: 200px;
+    transition: border-color 0.2s var(--ease), box-shadow 0.2s var(--ease);
+  }
+  .search-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .search-input::placeholder { color: var(--text-tertiary); }
+  .tb-separator { width: 1px; height: 22px; background: var(--border-default); }
+
+  .btn {
+    padding: 7px 16px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 600;
+    font-family: var(--font-sans);
+    letter-spacing: 0.03em;
+    cursor: pointer;
+    transition: transform 0.12s var(--ease), box-shadow 0.2s var(--ease), filter 0.2s var(--ease), background 0.2s var(--ease);
+    border: 1px solid transparent;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-primary {
+    background: var(--btn-primary-bg);
+    color: #fff;
+    border-color: var(--btn-primary-border);
+    box-shadow: 0 4px 14px rgba(80, 120, 255, 0.35);
+  }
+  .btn-primary:hover { filter: brightness(1.06); box-shadow: 0 6px 20px rgba(80, 120, 255, 0.45); }
+  .btn-success {
+    background: var(--btn-success-bg);
+    color: #fff;
+    border-color: rgba(45, 157, 120, 0.45);
+    box-shadow: 0 4px 14px rgba(45, 157, 120, 0.28);
+  }
+  .btn-success:hover { filter: brightness(1.05); }
+  .btn-danger {
+    background: linear-gradient(180deg, #f06676 0%, var(--danger) 100%);
+    color: #fff;
+    border-color: rgba(224, 82, 99, 0.45);
+    box-shadow: 0 3px 12px rgba(224, 82, 99, 0.25);
+  }
+  .btn-danger:hover { filter: brightness(1.05); }
+  .btn-danger.stopped {
+    background: var(--surface-elevated);
+    color: var(--text-tertiary);
+    border-color: var(--border-default);
+    box-shadow: none;
+    cursor: not-allowed;
+    filter: none;
+  }
+  .btn-ghost {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-default);
+  }
+  .btn-ghost:hover { background: var(--btn-ghost-hover); color: var(--text-primary); }
+
+  .form-area { display: none; }
+  .form-area.visible { display: block; }
+  .form-area.readonly input,
+  .form-area.readonly select { pointer-events: none; opacity: 0.55; background: var(--surface-elevated); }
+  .form-area-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  .form-area-header h3 {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--accent-bright);
+  }
+
+  .alert-icons { display: flex; gap: 6px; align-items: center; white-space: nowrap; }
+  .alert-icon {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: default;
+  }
+  .alert-icon.out { background: linear-gradient(135deg, var(--accent-bright), var(--accent)); color: #0f1118; }
+  .alert-icon.stop { background: linear-gradient(135deg, #f0c14d, #c98a1a); color: #1a1206; }
+  .alert-icon.none { background: transparent; }
+
+  .scroll-content { flex: 1; overflow-y: auto; padding: 18px 22px 28px; }
+
+  .group-box {
+    background: var(--group-bg);
+    border: 1px solid var(--group-border);
+    border-radius: var(--radius-md);
+    margin-bottom: 16px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2);
+  }
+  body.light .group-box { box-shadow: 0 4px 24px rgba(15, 23, 42, 0.06); }
+  .group-header {
+    padding: 10px 16px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--group-header-text);
+    background: var(--group-header-bg);
+    border-bottom: 1px solid var(--group-border);
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .group-header .arrow { font-size: 10px; color: var(--text-tertiary); }
+  .group-body { padding: 16px; }
+
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 20px; }
+  .field { display: flex; flex-direction: column; }
+  .field.full { grid-column: 1 / -1; }
+  .field > label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+    letter-spacing: 0.04em;
+  }
+  .field > label .req { color: var(--danger); font-weight: 700; }
+  .field input,
+  .field select {
+    height: 34px;
+    background: var(--surface-input);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    padding: 0 12px;
+    font-size: 13px;
+    font-family: var(--font-sans);
+    color: var(--text-primary);
+    outline: none;
+    transition: border-color 0.2s var(--ease), box-shadow 0.2s var(--ease);
+  }
+  .field input:focus,
+  .field select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .field select { cursor: pointer; }
+  .field select option { background: #1a1f2c; color: var(--text-primary); }
+
+  .status-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+  .indicator { padding: 4px 12px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: 0.03em; }
+  .ind-off { background: var(--surface-elevated); color: var(--text-tertiary); border: 1px solid var(--border-default); }
+  .ind-blue { background: var(--accent-soft); color: var(--accent-bright); border: 1px solid rgba(138, 164, 255, 0.35); }
+  .ind-yellow { background: var(--accent-warm-soft); color: var(--accent-warm); border: 1px solid rgba(212, 184, 150, 0.35); }
+  .status-text { font-size: 11px; color: var(--text-tertiary); margin-left: 4px; }
+
+  .task-preview {
+    background: rgba(10, 12, 18, 0.55);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--code-accent);
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .task-preview .lbl {
+    color: var(--text-tertiary);
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .datagrid-wrapper {
+    border: 1px solid var(--group-border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    margin-top: 8px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+  .datagrid { width: 100%; border-collapse: collapse; font-size: 12px; font-weight: 450; }
+  .datagrid th {
+    background: var(--table-header-bg);
+    color: var(--table-header-text);
+    font-weight: 700;
+    font-size: 17px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 15px 18px;
+    text-align: left;
+    border-bottom: 1px solid var(--table-border);
+    border-right: 1px solid var(--table-border);
+    position: sticky;
+    top: 0;
+    user-select: none;
+    cursor: default;
+  }
+  .datagrid th:last-child { border-right: none; }
+  .datagrid td {
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--table-border);
+    border-right: 1px solid var(--table-border);
+    color: var(--text-primary);
+    vertical-align: middle;
+  }
+  .datagrid td.cell-error { background: rgba(224, 82, 99, 0.22) !important; }
+  .datagrid td.cell-error select { border-color: var(--danger) !important; box-shadow: inset 0 0 0 1px var(--danger); }
+  .datagrid td:last-child { border-right: none; }
+  .datagrid tr:last-child td { border-bottom: none; }
+  .datagrid tbody tr { transition: background 0.15s var(--ease); }
+  .datagrid tbody tr:hover { background: var(--table-row-hover); }
+  .datagrid tbody tr.selected { background: var(--table-row-selected); }
+  .datagrid td input[type="checkbox"] { accent-color: var(--accent); }
+  .datagrid td select {
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 6px;
+    border: 1px solid var(--border-default);
+    background: var(--surface-input);
+    color: var(--text-primary);
+    padding: 6px 12px;
+    min-height: 2.25em;
+  }
+  .empty-cell {
+    text-align: center;
+    color: var(--text-tertiary);
+    font-weight: 700;
+    padding: 28px !important;
+    border-right: none !important;
+    letter-spacing: 0.04em;
+  }
+  body:not(.light) .empty-cell { color: #eceff7; }
+  .tag { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; }
+  .tag-running { background: var(--success); color: #fff; }
+  .tag-stopped { background: var(--surface-elevated); color: var(--text-tertiary); border: 1px solid var(--border-default); }
+
+  .bottom-actions { display: flex; justify-content: flex-start; gap: 10px; margin-top: 12px; }
+
+  .statusbar {
+    height: 28px;
+    background: var(--statusbar-bg);
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding: 0 16px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--statusbar-fg);
+    gap: 18px;
+    border-top: 1px solid var(--statusbar-border);
+  }
+  .statusbar .sep { width: 1px; height: 14px; background: rgba(0, 0, 0, 0.1); }
+  body:not(.light) .statusbar .sep { background: rgba(0, 0, 0, 0.12); }
+  .save-indicator { color: var(--text-secondary); font-weight: 600; }
+  .save-indicator.dirty { color: #b45309; }
+
+  .multi-picker {
+    position: absolute;
+    top: 32px;
+    left: 0;
+    z-index: 999;
+    background: var(--group-bg);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    padding: 8px;
+    min-width: 200px;
+    max-height: 200px;
+    overflow-y: auto;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  }
+  .multi-picker label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-radius: 6px;
+    transition: background 0.15s var(--ease);
+  }
+  .multi-picker label:hover { background: var(--nav-hover-bg); color: var(--text-primary); }
+  .multi-picker input[type="checkbox"] { accent-color: var(--accent); }
+  .field-error-msg { font-size: 11px; font-weight: 600; color: var(--danger); margin-top: 4px; }
+
+  .picker-panel {
+    position: fixed;
+    z-index: 2000;
+    background: var(--group-bg);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-md);
+    width: 300px;
+    height: 320px;
+    overflow: hidden;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+    padding: 12px;
+    display: none;
+    flex-direction: column;
+  }
+  .picker-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--picker-accent);
+    margin-bottom: 8px;
+  }
+  .picker-toolbar { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; flex-wrap: nowrap; }
+  .picker-toolbar input {
+    flex: 0 0 110px;
+    width: 110px;
+    height: 30px;
+    background: var(--surface-input);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    border-radius: var(--radius-sm);
+    padding: 0 10px;
+    font-size: 12px;
+    font-family: var(--font-sans);
+    min-width: 0;
+  }
+  .picker-toolbar .btn { padding: 5px 10px; white-space: nowrap; }
+  .picker-meta { font-size: 11px; font-weight: 600; color: var(--text-tertiary); margin-bottom: 8px; }
+  .picker-options { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-right: 2px; }
+  .picker-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; transition: background 0.15s var(--ease); }
+  .picker-row:hover { background: var(--nav-hover-bg); }
+  .cell-link {
+    color: var(--picker-accent);
+    font-weight: 600;
+    text-decoration: none;
+    border-bottom: 1px solid rgba(125, 211, 196, 0.45);
+    cursor: pointer;
+    transition: color 0.15s var(--ease), border-color 0.15s var(--ease);
+  }
+  .cell-link:hover { color: var(--accent-bright); border-bottom-color: var(--accent-bright); }
+  body.light .cell-link { border-bottom-color: rgba(13, 148, 136, 0.45); }
+
+  .url-editor-mask { position: fixed; inset: 0; background: rgba(6, 8, 14, 0.55); backdrop-filter: blur(4px); display: none; z-index: 2200; }
+  .url-editor {
+    position: fixed;
+    width: 560px;
+    max-width: calc(100vw - 40px);
+    background: var(--group-bg);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-md);
+    box-shadow: 0 28px 80px rgba(0, 0, 0, 0.55);
+    display: none;
+    z-index: 2300;
+    padding: 18px;
+  }
+  .url-editor h4 {
+    margin-bottom: 10px;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--picker-accent);
+  }
+  .url-editor textarea {
+    width: 100%;
+    height: 220px;
+    resize: vertical;
+    background: var(--surface-input);
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    border-radius: var(--radius-sm);
+    padding: 12px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .url-editor .actions { margin-top: 14px; display: flex; justify-content: flex-end; gap: 10px; }
+
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.14); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.24); background-clip: padding-box; }
+
+  @media screen and (min-width: 1600px) {
+    .app-window { max-width: 1600px; }
+    body { font-size: 14px; }
+    .datagrid { font-size: 13px; }
+    .datagrid th { font-size: 18px; padding: 16px 20px; }
+    .datagrid td { padding: 14px 20px; }
+    .sidebar-header, .nav-item, .sidebar-footer, .theme-switch-wrap .lbl { font-size: 18px; }
+    .sidebar { width: 240px; }
+    .field input,
+    .field select { height: 36px; font-size: 14px; }
+    .btn { padding: 8px 18px; font-size: 13px; }
+  }
+  @media screen and (min-width: 2400px) {
+    .app-window { max-width: 2000px; }
+    body { font-size: 15px; }
+    .sidebar { width: 260px; }
+  }
+  @media screen and (max-height: 900px) {
+    .app-layout { height: calc(100vh - 76px); }
+    .app-window { margin: 8px auto; }
+    .scroll-content { padding: 12px 16px 18px; }
+    .group-box { margin-bottom: 12px; }
+    .group-body { padding: 12px; }
+  }
+
+</style>
+</head>
+<body>
+
+<div class="app-window">
+  <!-- 标题栏 -->
+  <div class="titlebar">
+    <div class="traffic-lights">
+      <div class="tl tl-close"></div>
+      <div class="tl tl-min"></div>
+      <div class="tl tl-max"></div>
+    </div>
+    <div class="titlebar-text">提单管理系统 — 桌面应用</div>
+  </div>
+
+  <div class="app-layout">
+    <!-- 侧边栏 -->
+    <div class="sidebar">
+      <div class="sidebar-header">导航</div>
+      <div class="nav-item active"><span class="ico">📝</span> 提单表</div>
+      <div class="nav-item disabled"><span class="ico">📎</span> 配件表（规划中）</div>
+      <div class="nav-divider"></div>
+      <div class="nav-item disabled"><span class="ico">📊</span> 统计报表</div>
+      <div class="nav-item disabled"><span class="ico">⚙️</span> 设置</div>
+      <div class="sidebar-footer">
+        <div class="theme-switch-wrap">
+          <span class="lbl">主题模式</span>
+          <button class="btn btn-ghost" onclick="toggleTheme()" id="themeBtn">🌙 深色</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 主区域 -->
+    <div class="main">
+      <!-- 工具栏 -->
+      <div class="top-toolbar">
+        <input type="text" id="searchInput" class="search-input" placeholder="搜索任务名...">
+        <button class="btn btn-ghost" onclick="searchTask()">🔍 搜索</button>
+        <button class="btn btn-ghost" onclick="clearSearch()">🔄 清空筛选</button>
+        <div class="tb-separator"></div>
+        <div style="display: flex; flex-direction: column; gap: 2px;">
+          <label><input type="checkbox" id="chkPrintUrl"> 是否打印URL</label>
+          <span class="print-url-hint">未勾选：导出内容不包含URL信息 | 勾选：导出内容包含URL信息</span>
+        </div>
+        <div class="tb-separator"></div>
+        <button class="btn btn-primary" onclick="handlePrint()">🖨️ 打印</button>
+        <button class="btn btn-success" onclick="insertRow()">➕ 新增行</button>
+      </div>
+
+      <!-- 滚动内容 -->
+      <div class="scroll-content">
+
+        <!-- DataGrid 提单列表 -->
+        <div class="group-box">
+          <div class="group-body">
+            <div class="datagrid-wrapper" style="max-height: calc(100vh - 260px); min-height: 200px; overflow: auto;">
+              <table class="datagrid" style="min-width: 1850px;">
+                <thead>
+                  <tr>
+                    <th style="width:30px; cursor:pointer;" id="selectAllHeader" title="点击全选/反选当前可见数据" onclick="toggleSelectVisible()">☐</th>
+                    <th>任务名</th>
+                    <th>类型</th>
+                    <th>运营商</th>
+                    <th>行业编码</th>
+                    <th>URL</th>
+                    <th>数量</th>
+                    <th>时长</th>
+                    <th>年龄上限</th>
+                    <th>年龄下限</th>
+                    <th>pv</th>
+                    <th>省份</th>
+                    <th>排除省份</th>
+                    <th>地市</th>
+                    <th>排除地市</th>
+                    <th style="width:90px">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="orderBody">
+                  <tr><td colspan="16" class="empty-cell">暂无数据 — 点击新增行或双击首行数据区在上方插入空行</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="bottom-actions">
+              <button class="btn btn-ghost" onclick="deleteSelected()">🗑 删除选中</button>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /scroll-content -->
+
+      <!-- 底部状态栏 -->
+      <div class="statusbar">
+        <span id="sbCount">提单数: 0</span>
+        <div class="sep"></div>
+        <span id="sbTime"></span>
+        <div class="sep"></div>
+        <span id="saveState" class="save-indicator">已自动保存</span>
+      </div>
+    </div><!-- /main -->
+  </div><!-- /app-layout -->
+</div>
+
+<div id="pickerPanel" class="picker-panel"></div>
+<div id="urlMask" class="url-editor-mask"></div>
+<div id="urlEditor" class="url-editor">
+  <h4>编辑 URL（支持多行）</h4>
+  <textarea id="urlTextarea" placeholder="每行一个 URL"></textarea>
+  <div class="actions">
+    <button class="btn btn-ghost" onclick="closeUrlEditor()">❌ 取消</button>
+    <button class="btn btn-primary" onclick="saveUrlEditor()">💾 保存</button>
+  </div>
+</div>
+
+<script>
+const TYPE_MAP = { DB: 'dpi-白', DJ: '106', XC: '小程序', DH: 'dpi-灰', DY: '抖音' };
+const OP_MAP = { YD: '移动', LT: '联通', DX: '电信', YX: '移动|电信' };
+const DURATIONS = ['一天', '本周', '长期'];
+const PROVINCES = ['北京','天津','上海','重庆','河北','山西','辽宁','吉林','黑龙江','江苏','浙江','安徽','福建','江西','山东','河南','湖北','湖南','广东','海南','四川','贵州','云南','陕西','甘肃','青海','台湾','内蒙古','广西','西藏','宁夏','新疆','香港','澳门'];
+const CITIES = [
+  '石家庄','唐山','秦皇岛','邯郸','邢台','保定','张家口','承德','沧州','廊坊','衡水',
+  '太原','大同','阳泉','长治','晋城','朔州','晋中','运城','忻州','临汾','吕梁',
+  '沈阳','大连','鞍山','抚顺','本溪','丹东','锦州','营口','阜新','辽阳','盘锦','铁岭','朝阳','葫芦岛',
+  '长春','吉林','四平','辽源','通化','白山','松原','白城',
+  '哈尔滨','齐齐哈尔','鸡西','鹤岗','双鸭山','大庆','伊春','佳木斯','七台河','牡丹江','黑河','绥化',
+  '南京','无锡','徐州','常州','苏州','南通','连云港','淮安','盐城','扬州','镇江','泰州','宿迁',
+  '杭州','宁波','温州','嘉兴','湖州','绍兴','金华','衢州','舟山','台州','丽水',
+  '合肥','芜湖','蚌埠','淮南','马鞍山','淮北','铜陵','安庆','黄山','滁州','阜阳','宿州','六安','亳州','池州','宣城',
+  '福州','厦门','莆田','三明','泉州','漳州','南平','龙岩','宁德',
+  '南昌','景德镇','萍乡','九江','新余','鹰潭','赣州','吉安','宜春','抚州','上饶',
+  '济南','青岛','淄博','枣庄','东营','烟台','潍坊','济宁','泰安','威海','日照','临沂','德州','聊城','滨州','菏泽',
+  '郑州','开封','洛阳','平顶山','安阳','鹤壁','新乡','焦作','濮阳','许昌','漯河','三门峡','南阳','商丘','信阳','周口','驻马店',
+  '武汉','黄石','十堰','宜昌','襄阳','鄂州','荆门','孝感','荆州','黄冈','咸宁','随州',
+  '长沙','株洲','湘潭','衡阳','邵阳','岳阳','常德','张家界','益阳','郴州','永州','怀化','娄底',
+  '广州','韶关','深圳','珠海','汕头','佛山','江门','湛江','茂名','肇庆','惠州','梅州','汕尾','河源','阳江','清远','东莞','中山','潮州','揭阳','云浮',
+  '南宁','柳州','桂林','梧州','北海','防城港','钦州','贵港','玉林','百色','贺州','河池','来宾','崇左',
+  '海口','三亚','三沙','儋州',
+  '成都','自贡','攀枝花','泸州','德阳','绵阳','广元','遂宁','内江','乐山','南充','眉山','宜宾','广安','达州','雅安','巴中','资阳',
+  '贵阳','六盘水','遵义','安顺','毕节','铜仁',
+  '昆明','曲靖','玉溪','保山','昭通','丽江','普洱','临沧',
+  '拉萨','日喀则','昌都','林芝','山南','那曲',
+  '西安','铜川','宝鸡','咸阳','渭南','延安','汉中','榆林','安康','商洛',
+  '兰州','嘉峪关','金昌','白银','天水','武威','张掖','平凉','酒泉','庆阳','定西','陇南',
+  '西宁','海东',
+  '银川','石嘴山','吴忠','固原','中卫',
+  '乌鲁木齐','克拉玛依','吐鲁番','哈密'
+];
+const CN_NUM = { 1:'一',2:'两',3:'三',4:'四',5:'五',6:'六',7:'七',8:'八',9:'九',10:'十' };
+const DATA_KEY = 'bill-prototype-orders-v2';
+const PICKER_RECENT_KEY = 'bill-prototype-picker-recent-v1';
+let currentPicker = null;
+let currentUrlIndex = -1;
+let pickerRecent = {};
+let saveStateTimer = null;
+let fieldErrors = {};
+
+let allOrders = [
+  { taskName: '660001Z青岛YDDB01-护肤精华', typeCode: 'DB', operatorCode: 'YD', industryCode: '01', url: 'https://example.com/a1\nhttps://example.com/a2', quantity: '5000', duration: '本周', ageMax: '45', ageMin: '25', pv: '3000', province: '山东', excludeProvince: '', city: '', excludeCity: '', checked: false },
+  { taskName: '770032H杭州LTDJ03-信用卡推广', typeCode: 'DJ', operatorCode: 'LT', industryCode: '03', url: 'https://example.com/b2', quantity: '8000', duration: '长期', ageMax: '55', ageMin: '22', pv: '5000', province: '', excludeProvince: '', city: '杭州', excludeCity: '', checked: true }
+];
+let displayOrders = [...allOrders];
+
+function initTheme() {
+  const savedTheme = localStorage.getItem('theme') || 'light';
+  document.body.classList.toggle('light', savedTheme === 'light');
+  document.getElementById('themeBtn').textContent = savedTheme === 'light' ? '☀️ 浅色' : '🌙 深色';
+}
+function toggleTheme() {
+  const isLight = document.body.classList.toggle('light');
+  const theme = isLight ? 'light' : 'dark';
+  localStorage.setItem('theme', theme);
+  document.getElementById('themeBtn').textContent = isLight ? '☀️ 浅色' : '🌙 深色';
+}
+function updateClock() { document.getElementById('sbTime').textContent = new Date().toLocaleString('zh-CN'); }
+
+function firstUrl(v) { return (v || '').split('\n')[0] || ''; }
+function toParts(v) { return (v || '').split('|').map(s => s.trim()).filter(Boolean); }
+function regionToken(order) {
+  const p = toParts(order.province); const c = toParts(order.city);
+  if (p.length && !c.length) return p.length === 1 ? p[0] : `${CN_NUM[p.length] || p.length}省`;
+  if (c.length && !p.length) return c.length === 1 ? c[0] : `${CN_NUM[c.length] || c.length}市`;
+  return '全国';
+}
+function parseLeft(left) {
+  const m = left.match(/(YD|LT|DX|YX)(DB|DJ|XC|DH|DY)([A-Za-z0-9]+)$/);
+  if (!m) return null;
+  const prefix = left.slice(0, m.index);
+  const known = [...PROVINCES, ...CITIES, '全国'].sort((a,b)=>b.length-a.length);
+  let region = '', customer = prefix;
+  for (const k of known) { if (prefix.endsWith(k)) { region = k; customer = prefix.slice(0, -k.length); break; } }
+  if (!region) {
+    const rm = prefix.match(/([一二两三四五六七八九十\d]+[省市])$/);
+    if (rm) { region = rm[1]; customer = prefix.slice(0, -region.length); }
+  }
+  return { customer: customer || '客户', region, operatorCode: m[1], typeCode: m[2], industryCode: m[3] };
+}
+function rebuildTaskName(order) {
+  const raw = order.taskName || '';
+  const product = raw.includes('-') ? (raw.split('-')[1] || '产品') : '产品';
+  const parsed = raw.includes('-') ? parseLeft(raw.split('-')[0]) : null;
+  const customer = parsed?.customer || '客户';
+  order.taskName = `${customer}${regionToken(order)}${order.operatorCode || 'YD'}${order.typeCode || 'DB'}${order.industryCode || 'DK'}-${product}`;
+}
+function parseTaskNameToFields(order) {
+  if (!order.taskName || !order.taskName.includes('-')) return;
+  const parsed = parseLeft(order.taskName.split('-')[0]);
+  if (!parsed) return;
+  order.operatorCode = parsed.operatorCode;
+  order.typeCode = parsed.typeCode;
+  order.industryCode = parsed.industryCode;
+  const token = parsed.region;
+  if (!token || token === '全国' || /[一二两三四五六七八九十\d]+[省市]$/.test(token)) { order.province = ''; order.city = ''; }
+  else if (PROVINCES.includes(token)) { order.province = token; order.city = ''; }
+  else if (CITIES.includes(token)) { order.city = token; order.province = ''; }
+}
+
+function lockState(order) {
+  const pos = !!((order.province || '').trim() || (order.city || '').trim());
+  const neg = !!((order.excludeProvince || '').trim() || (order.excludeCity || '').trim());
+  return { pos, neg, p: !!(order.province || '').trim(), c: !!(order.city || '').trim() };
+}
+function isNumeric(v) {
+  return /^\d+$/.test((v || '').trim());
+}
+function validateRow(order, changedField) {
+  const numericFields = ['quantity', 'ageMax', 'ageMin', 'pv'];
+  for (const f of numericFields) {
+    const val = (order[f] || '').trim();
+    if (val && !isNumeric(val)) {
+      return { ok: false, message: `${fieldLabel(f)} 必须是数字` };
+    }
+  }
+  const min = (order.ageMin || '').trim();
+  const max = (order.ageMax || '').trim();
+  if (min && max) {
+    const minN = Number(min);
+    const maxN = Number(max);
+    if (maxN < minN) {
+      return { ok: false, message: '年龄上限必须大于或等于年龄下限' };
+    }
+  }
+  if (changedField === 'quantity' && (order.quantity || '').trim() === '0') {
+    return { ok: false, message: '数量必须大于 0' };
+  }
+  return { ok: true, message: '' };
+}
+function fieldLabel(f) {
+  const map = {
+    quantity: '数量',
+    ageMax: '年龄上限',
+    ageMin: '年龄下限',
+    pv: 'pv'
+  };
+  return map[f] || f;
+}
+function errorKey(index, field) {
+  return `${index}:${field}`;
+}
+function setFieldError(index, field, hasError) {
+  const key = errorKey(index, field);
+  if (hasError) fieldErrors[key] = true;
+  else delete fieldErrors[key];
+}
+function hasFieldError(index, field) {
+  return !!fieldErrors[errorKey(index, field)];
+}
+
+function saveOrders() {
+  localStorage.setItem(DATA_KEY, JSON.stringify(allOrders));
+  markSaved();
+}
+function loadOrders() {
+  try {
+    const raw = localStorage.getItem(DATA_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) allOrders = parsed;
+    }
+  } catch (_e) {}
+}
+function savePickerRecent() {
+  localStorage.setItem(PICKER_RECENT_KEY, JSON.stringify(pickerRecent));
+}
+function loadPickerRecent() {
+  try {
+    const raw = localStorage.getItem(PICKER_RECENT_KEY);
+    if (raw) pickerRecent = JSON.parse(raw) || {};
+  } catch (_e) {}
+}
+function updatePickerRecent(field, values) {
+  const current = Array.isArray(pickerRecent[field]) ? pickerRecent[field] : [];
+  const merged = [...values, ...current.filter(x => !values.includes(x))].slice(0, 10);
+  pickerRecent[field] = merged;
+  savePickerRecent();
+}
+function escapeHtml(v) {
+  return (v || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function pickerCell(i, field, value, locked, label) {
+  const text = value || '';
+  const errCls = hasFieldError(i, field) ? 'cell-error' : '';
+  if (locked) {
+    const reason = getLockReason(allOrders[i], field);
+    return `<td class="${errCls}" style="background:#5a5a5a66;cursor:not-allowed;" title="${escapeHtml(reason)}">${escapeHtml(text)}</td>`;
+  }
+  return `<td class="${errCls}"><span class="cell-link" onclick="openPicker(event,${i},'${field}','${label}')">${escapeHtml(text || '点击选择')}</span></td>`;
+}
+function getLockReason(order, field) {
+  const pos = !!((order.province || '').trim() || (order.city || '').trim());
+  const neg = !!((order.excludeProvince || '').trim() || (order.excludeCity || '').trim());
+  const hasProvince = !!(order.province || '').trim();
+  const hasCity = !!(order.city || '').trim();
+  if ((field === 'province' || field === 'city') && neg) return '已填写排除省份/排除地市，当前字段被锁定';
+  if ((field === 'excludeProvince' || field === 'excludeCity') && pos) return '已填写省份/地市，当前字段被锁定';
+  if (field === 'province' && hasCity) return '已填写地市，省份需清空后再编辑';
+  if (field === 'city' && hasProvince) return '已填写省份，地市需清空后再编辑';
+  return '字段处于锁定状态';
+}
+function markDirty() {
+  const el = document.getElementById('saveState');
+  if (!el) return;
+  el.textContent = '编辑中...';
+  el.classList.add('dirty');
+}
+function markSaved() {
+  const el = document.getElementById('saveState');
+  if (!el) return;
+  el.textContent = '已自动保存';
+  el.classList.remove('dirty');
+  if (saveStateTimer) clearTimeout(saveStateTimer);
+  saveStateTimer = setTimeout(() => {
+    el.textContent = '数据已同步到本地';
+  }, 1200);
+}
+
+function textCell(i, field, value, locked = false) {
+  const errCls = hasFieldError(i, field) ? 'cell-error' : '';
+  const lockStyle = locked ? ' style="background:#5a5a5a66;cursor:not-allowed;" contenteditable="false"' : ' contenteditable="true"';
+  const keydown = field === 'taskName' ? ' onkeydown="return blockTaskNameLineBreak(event)"' : '';
+  return `<td class="${errCls}"${lockStyle}${keydown} onblur="updateField(${i},'${field}', this.textContent)">${value || ''}</td>`;
+}
+function selectCell(i, field, value, opts, disabled = false) {
+  const errCls = hasFieldError(i, field) ? 'cell-error' : '';
+  return `<td class="${errCls}"><select ${disabled ? 'disabled' : ''} onchange="updateField(${i},'${field}', this.value)">${opts.map(o => `<option value="${o.value}" ${o.value===value?'selected':''}>${o.label}</option>`).join('')}</select></td>`;
+}
+
+function renderTable() {
+  const body = document.getElementById('orderBody');
+  document.getElementById('sbCount').textContent = `提单数: ${displayOrders.length}`;
+  updateSelectHeaderState();
+  if (!displayOrders.length) { body.innerHTML = '<tr><td colspan="16" class="empty-cell">暂无数据 — 点击新增行或双击首行数据区在上方插入空行</td></tr>'; return; }
+  body.innerHTML = displayOrders.map((o) => {
+    const realIndex = allOrders.indexOf(o);
+    const lock = lockState(o);
+    return `<tr class="${o.checked ? 'selected' : ''}">
+      <td style="cursor:pointer; text-align:center;" onclick="toggleCheckedByCell(${realIndex})">
+        <input type="checkbox" ${o.checked ? 'checked' : ''} style="pointer-events:none;">
+      </td>
+      ${textCell(realIndex, 'taskName', o.taskName)}
+      ${selectCell(realIndex, 'typeCode', o.typeCode, [{value:'',label:'-- 请选择 --'},...Object.entries(TYPE_MAP).map(([k,v]) => ({value:k,label:v}))])}
+      ${selectCell(realIndex, 'operatorCode', o.operatorCode, [{value:'',label:'-- 请选择 --'},...Object.entries(OP_MAP).map(([k,v]) => ({value:k,label:v}))])}
+      ${textCell(realIndex, 'industryCode', o.industryCode)}
+      <td ondblclick="editUrl(${realIndex})" title="双击编辑多行URL">${firstUrl(o.url)}</td>
+      ${textCell(realIndex, 'quantity', o.quantity)}
+      ${selectCell(realIndex, 'duration', o.duration, [{value:'',label:'-- 请选择 --'}, ...DURATIONS.map(v => ({value:v,label:v}))])}
+      ${textCell(realIndex, 'ageMax', o.ageMax)}
+      ${textCell(realIndex, 'ageMin', o.ageMin)}
+      ${textCell(realIndex, 'pv', o.pv)}
+      ${pickerCell(realIndex, 'province', o.province, lock.neg || lock.c, '省份')}
+      ${pickerCell(realIndex, 'excludeProvince', o.excludeProvince, lock.pos, '排除省份')}
+      ${pickerCell(realIndex, 'city', o.city, lock.neg || lock.p, '地市')}
+      ${pickerCell(realIndex, 'excludeCity', o.excludeCity, lock.pos, '排除地市')}
+      <td>
+        <button class="btn btn-danger" onclick="deleteRow(${realIndex})">🗑 删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+  bindFirstRowDblClick();
+  updateSelectHeaderState();
+}
+function updateSelectHeaderState() {
+  const header = document.getElementById('selectAllHeader');
+  if (!header) return;
+  if (!displayOrders.length) {
+    header.textContent = '☐';
+    header.title = '当前无可见数据';
+    return;
+  }
+  const visibleChecked = displayOrders.filter(o => o.checked).length;
+  if (visibleChecked === 0) {
+    header.textContent = '☐';
+    header.title = '点击全选当前可见数据';
+  } else if (visibleChecked === displayOrders.length) {
+    header.textContent = '☑';
+    header.title = '点击取消当前可见数据全选';
+  } else {
+    header.textContent = '◩';
+    header.title = '部分已选，点击全选当前可见数据';
+  }
+}
+function toggleSelectVisible() {
+  if (!displayOrders.length) return;
+  const allChecked = displayOrders.every(o => o.checked);
+  displayOrders.forEach(o => {
+    const idx = allOrders.indexOf(o);
+    if (idx >= 0) allOrders[idx].checked = !allChecked;
+  });
+  saveOrders();
+  searchTask();
+}
+
+function bindFirstRowDblClick() {
+  const rows = document.querySelectorAll('#orderBody tr');
+  if (!rows.length) return;
+  const first = rows[0];
+  if (!first || first.classList.contains('empty-cell')) return;
+  first.ondblclick = function(e) {
+    if (e.target.closest('button,select,input')) return;
+    const td = e.target.closest('td');
+    if (td && td.cellIndex === 5) return;
+    insertRow();
+  };
+}
+
+function updateField(index, field, value) {
+  const o = allOrders[index];
+  const oldValue = o[field];
+  markDirty();
+  let nextVal = (value || '').trim();
+  if (field === 'taskName') nextVal = nextVal.replace(/[\r\n]+/g, ' ');
+  o[field] = nextVal;
+  setFieldError(index, field, false);
+  if (field === 'ageMin' || field === 'ageMax') {
+    setFieldError(index, 'ageMin', false);
+    setFieldError(index, 'ageMax', false);
+  }
+  const valid = validateRow(o, field);
+  if (!valid.ok) {
+    if (valid.message.includes('年龄上限必须大于或等于年龄下限')) {
+      setFieldError(index, 'ageMin', true);
+      setFieldError(index, 'ageMax', true);
+    } else {
+      setFieldError(index, field, true);
+    }
+    alert(valid.message);
+    o[field] = oldValue;
+    searchTask();
+    return;
+  }
+  if (field === 'taskName') parseTaskNameToFields(o);
+  if (field === 'province' && o.province) { o.city = ''; o.excludeProvince = ''; o.excludeCity = ''; }
+  if (field === 'city' && o.city) { o.province = ''; o.excludeProvince = ''; o.excludeCity = ''; }
+  if (field === 'excludeProvince' && o.excludeProvince) { o.province = ''; o.city = ''; }
+  if (field === 'excludeCity' && o.excludeCity) { o.province = ''; o.city = ''; }
+  if (field !== 'taskName') rebuildTaskName(o);
+  saveOrders();
+  searchTask();
+}
+function blockTaskNameLineBreak(e) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    return false;
+  }
+  return true;
+}
+
+function editUrl(index) {
+  currentUrlIndex = index;
+  document.getElementById('urlTextarea').value = allOrders[index].url || '';
+  document.getElementById('urlMask').style.display = 'block';
+  const editor = document.getElementById('urlEditor');
+  editor.style.display = 'block';
+  editor.style.left = `${Math.max((window.innerWidth - editor.offsetWidth) / 2, 20)}px`;
+  editor.style.top = `${Math.max((window.innerHeight - 340) / 2, 20)}px`;
+}
+function closeUrlEditor() {
+  document.getElementById('urlMask').style.display = 'none';
+  document.getElementById('urlEditor').style.display = 'none';
+  currentUrlIndex = -1;
+}
+function saveUrlEditor() {
+  if (currentUrlIndex < 0) return;
+  markDirty();
+  allOrders[currentUrlIndex].url = document.getElementById('urlTextarea').value.trim();
+  saveOrders();
+  closeUrlEditor();
+  searchTask();
+}
+
+function openPicker(ev, index, field, label) {
+  ev.stopPropagation();
+  const panel = document.getElementById('pickerPanel');
+  const list = field.includes('city') ? CITIES : PROVINCES;
+  const selected = new Set(toParts(allOrders[index][field]));
+  const recent = Array.isArray(pickerRecent[field]) ? pickerRecent[field] : [];
+  const sorted = [...list].sort((a, b) => {
+    const aSel = selected.has(a) ? 1 : 0;
+    const bSel = selected.has(b) ? 1 : 0;
+    if (aSel !== bSel) return bSel - aSel;
+    const aRecent = recent.indexOf(a);
+    const bRecent = recent.indexOf(b);
+    const aR = aRecent >= 0 ? 1 : 0;
+    const bR = bRecent >= 0 ? 1 : 0;
+    if (aR !== bR) return bR - aR;
+    if (aR && bR) return aRecent - bRecent;
+    return a.localeCompare(b, 'zh-CN');
+  });
+  const allCount = sorted.length;
+  panel.innerHTML = `
+    <div class="picker-title">${label}（多选）</div>
+    <div class="picker-toolbar">
+      <input id="pickerSearchInput" placeholder="搜索选项..." oninput="filterPickerOptions(this.value)">
+      <button class="btn btn-ghost" onclick="closePicker()">❌ 取消</button>
+      <button class="btn btn-primary" onclick="applyPicker(${index},'${field}')">✓ 应用</button>
+    </div>
+    <div class="picker-meta">已选 <span id="pickerSelectedCount">${selected.size}</span> / ${allCount}</div>
+    <div id="pickerOptionsWrap" class="picker-options">
+      ${sorted.map(item => `
+        <label class="picker-row" data-label="${item}">
+          <input type="checkbox" value="${item}" ${selected.has(item) ? 'checked' : ''} onchange="refreshPickerCount()">
+          <span>${item}</span>
+        </label>
+      `).join('')}
+    </div>
+  `;
+  panel.style.display = 'flex';
+  const rect = ev.target.getBoundingClientRect();
+  panel.style.left = `${Math.min(rect.left, window.innerWidth - 260)}px`;
+  panel.style.top = `${Math.min(rect.bottom + 6, window.innerHeight - 320)}px`;
+  currentPicker = { index, field };
+  const input = document.getElementById('pickerSearchInput');
+  if (input) {
+    input.focus();
+    input.onkeydown = function(e) {
+      if (e.key === 'Enter' && currentPicker) {
+        applyPicker(currentPicker.index, currentPicker.field);
+      } else if (e.key === 'Escape') {
+        closePicker();
+      }
+    };
+  }
+}
+function closePicker() {
+  document.getElementById('pickerPanel').style.display = 'none';
+  currentPicker = null;
+}
+function refreshPickerCount() {
+  const panel = document.getElementById('pickerPanel');
+  const n = panel.querySelectorAll('input[type="checkbox"]:checked').length;
+  const el = document.getElementById('pickerSelectedCount');
+  if (el) el.textContent = String(n);
+}
+function filterPickerOptions(keyword) {
+  const kw = (keyword || '').trim().toLowerCase();
+  const rows = document.querySelectorAll('#pickerOptionsWrap .picker-row');
+  rows.forEach(row => {
+    const label = (row.getAttribute('data-label') || '').toLowerCase();
+    row.style.display = !kw || label.includes(kw) ? '' : 'none';
+  });
+}
+function applyPicker(index, field) {
+  const panel = document.getElementById('pickerPanel');
+  const checked = [...panel.querySelectorAll('input[type="checkbox"]:checked')].map(x => x.value);
+  markDirty();
+  updatePickerRecent(field, checked);
+  updateField(index, field, checked.join('|'));
+  closePicker();
+}
+
+function deleteSelected() {
+  const selectedRows = allOrders.filter(o => o.checked);
+  if (!selectedRows.length) {
+    alert('请先勾选要删除的数据');
+    return;
+  }
+  const hasSavedData = selectedRows.some(isRowSaved);
+  if (hasSavedData) {
+    const ok = window.confirm('选中的记录中包含已保存数据，确认删除吗？此操作不可撤销。');
+    if (!ok) return;
+  } else {
+    const ok = window.confirm('确认删除选中的记录吗？');
+    if (!ok) return;
+  }
+  markDirty();
+  allOrders = allOrders.filter(o => !o.checked);
+  saveOrders();
+  searchTask();
+}
+function deleteRow(index) {
+  if (index < 0 || index >= allOrders.length) return;
+  const row = allOrders[index];
+  const hasSavedData = isRowSaved(row);
+  const ok = hasSavedData
+    ? window.confirm('该行包含已保存数据，确认删除吗？此操作不可撤销。')
+    : window.confirm('确认删除该行吗？');
+  if (!ok) return;
+  allOrders.splice(index, 1);
+  saveOrders();
+  searchTask();
+}
+function isRowSaved(row) {
+  const keys = ['taskName','typeCode','operatorCode','industryCode','url','quantity','duration','ageMax','ageMin','pv','province','excludeProvince','city','excludeCity'];
+  return keys.some(k => String(row[k] || '').trim() !== '');
+}
+function toggleChecked(index, checked) {
+  markDirty();
+  allOrders[index].checked = checked;
+  saveOrders();
+  searchTask();
+}
+function toggleCheckedByCell(index) {
+  if (index < 0 || index >= allOrders.length) return;
+  toggleChecked(index, !allOrders[index].checked);
+}
+function clearSearch() {
+  document.getElementById('searchInput').value = '';
+  searchTask();
+}
+function insertRow() {
+  markDirty();
+  const empty = { taskName:'', typeCode:'', operatorCode:'', industryCode:'', url:'', quantity:'', duration:'', ageMax:'', ageMin:'', pv:'', province:'', excludeProvince:'', city:'', excludeCity:'', checked:false };
+  if (displayOrders.length > 0) {
+    const idx = allOrders.indexOf(displayOrders[0]);
+    if (idx >= 0) allOrders.splice(idx, 0, empty);
+    else allOrders.unshift(empty);
+  } else {
+    allOrders.push(empty);
+  }
+  saveOrders();
+  searchTask();
+}
+
+function searchTask() {
+  const kw = document.getElementById('searchInput').value.trim().toLowerCase();
+  displayOrders = kw ? allOrders.filter(o => (o.taskName || '').toLowerCase().includes(kw)) : [...allOrders];
+  renderTable();
+}
+
+function extractCustomer(taskName) {
+  const left = (taskName || '').split('-')[0] || '';
+  const parsed = parseLeft(left);
+  return (parsed?.customer || '客户').slice(0, 12);
+}
+
+async function handlePrint() {
+  const selected = allOrders.filter(o => o.checked);
+  if (!selected.length) { alert('请至少勾选一条记录'); return; }
+  const withUrl = document.getElementById('chkPrintUrl').checked;
+  let wb;
+  try {
+    const resp = await fetch('./template.xlsx');
+    if (!resp.ok) throw new Error('模板读取失败');
+    const ab = await resp.arrayBuffer();
+    wb = XLSX.read(ab, { type: 'array' });
+  } catch (_e) {
+    alert('未能读取模板文件 template.xlsx，请确保模板与原型在同一目录并通过本地服务访问。');
+    return;
+  }
+
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  if (!ws) {
+    alert('模板文件缺少工作表，无法导出。');
+    return;
+  }
+
+  // 固定列映射，不改模板结构，仅写入值。
+  const cols = {
+    taskName: 'A',
+    type: 'B',
+    operator: 'C',
+    industry: 'D',
+    url: 'E',
+    quantity: 'F',
+    duration: 'G',
+    ageMax: 'H',
+    ageMin: 'I',
+    pv: 'J',
+    province: 'K',
+    excludeProvince: 'L',
+    city: 'M',
+    excludeCity: 'N'
+  };
+
+  // 从第二行开始写，不改首行模板。
+  const startRow = 2;
+  const fieldOrder = ['taskName','type','operator','industry','url','quantity','duration','ageMax','ageMin','pv','province','excludeProvince','city','excludeCity'];
+  const lastTemplateRow = Math.max((XLSX.utils.decode_range(ws['!ref'] || 'A1:A1').e.r + 1), startRow);
+
+  // 清空模板原有数据区的值（仅值，不改样式/结构）。
+  for (let r = startRow; r <= lastTemplateRow; r++) {
+    for (const f of fieldOrder) {
+      const addr = `${cols[f]}${r}`;
+      if (ws[addr]) ws[addr].v = '';
+    }
+  }
+
+  selected.forEach((o, idx) => {
+    const row = startRow + idx;
+    const values = {
+      taskName: o.taskName || '',
+      type: TYPE_MAP[o.typeCode] || '',
+      operator: OP_MAP[o.operatorCode] || '',
+      industry: o.industryCode || '',
+      url: withUrl ? (o.url || '') : '',
+      quantity: o.quantity || '',
+      duration: o.duration || '',
+      ageMax: o.ageMax || '',
+      ageMin: o.ageMin || '',
+      pv: o.pv || '',
+      province: o.province || '',
+      excludeProvince: o.excludeProvince || '',
+      city: o.city || '',
+      excludeCity: o.excludeCity || ''
+    };
+    for (const f of fieldOrder) {
+      const addr = `${cols[f]}${row}`;
+      if (!ws[addr]) ws[addr] = { t: 's', v: '' };
+      ws[addr].v = values[f];
+      ws[addr].t = 's';
+    }
+  });
+
+  // 仅扩展引用范围，保持模板其它结构不变。
+  const endRow = Math.max(lastTemplateRow, startRow + selected.length - 1);
+  ws['!ref'] = `A1:N${endRow}`;
+
+  const d = new Date();
+  const date = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+  XLSX.writeFile(wb, `${extractCustomer(selected[0].taskName)}_${date}.xlsx`);
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    closePicker();
+    closeUrlEditor();
+  }
+  if (e.key === 'Insert') {
+    insertRow();
+  }
+});
+document.getElementById('urlMask').addEventListener('click', closeUrlEditor);
+document.addEventListener('click', (e) => {
+  const panel = document.getElementById('pickerPanel');
+  if (!panel.contains(e.target)) closePicker();
+});
+
+updateClock(); setInterval(updateClock, 1000);
+initTheme();
+loadPickerRecent();
+loadOrders();
+searchTask();
+</script>
+</body>
+</html>

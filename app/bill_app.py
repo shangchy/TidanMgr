@@ -1,0 +1,2641 @@
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+from openpyxl import load_workbook
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygon,
+    QPolygonF,
+)
+
+from bill_theme import STYLESHEET_DARK, STYLESHEET_LIGHT
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QStatusBar,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+def make_sidebar_logo_pixmap(*, dark: bool, size: int = 44) -> QPixmap:
+    """侧栏小图标：单据 + 折角 + 行线，贴合提单/表格管理场景。"""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    m = 4.0
+    body = QRectF(m, m + 1.0, size - 2 * m, size - 2 * m - 2.0)
+    if dark:
+        paper = QColor(26, 32, 48)
+        edge = QColor(118, 142, 210)
+        fold_fill = QColor(42, 50, 72)
+        fold_edge = QColor(88, 104, 150)
+        line_c = QColor(168, 184, 228, 200)
+        bar_c = QColor(140, 168, 255, 220)
+    else:
+        paper = QColor(255, 255, 255)
+        edge = QColor(37, 99, 235)
+        fold_fill = QColor(226, 232, 240)
+        fold_edge = QColor(148, 163, 184)
+        line_c = QColor(71, 85, 105, 220)
+        bar_c = QColor(37, 99, 235, 230)
+    fs = min(13.0, body.width() * 0.32)
+    main_rect = QRectF(body.left(), body.top(), body.width() - fs * 0.55, body.height())
+    path = QPainterPath()
+    path.addRoundedRect(main_rect, 3.5, 3.5)
+    painter.fillPath(path, QBrush(paper))
+    painter.strokePath(path, QPen(edge, 1.2))
+    fold = QPolygonF(
+        [
+            QPointF(main_rect.right(), main_rect.top()),
+            QPointF(body.right(), main_rect.top()),
+            QPointF(body.right(), main_rect.top() + fs),
+            QPointF(main_rect.right() - fs * 0.2, main_rect.top() + fs * 0.85),
+        ]
+    )
+    painter.setPen(QPen(fold_edge, 1.0))
+    painter.setBrush(QBrush(fold_fill))
+    painter.drawPolygon(fold)
+    lx0 = main_rect.left() + 5
+    lx1 = main_rect.right() - 5
+    y = main_rect.top() + 11
+    painter.setPen(QPen(line_c, 1.05))
+    for _ in range(3):
+        painter.drawLine(QPointF(lx0, y), QPointF(lx1, y))
+        y += 5.5
+    bx0 = main_rect.left() + 6
+    by = main_rect.bottom() - 7
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(bar_c))
+    for i in range(5):
+        bw = 1.6 if i % 2 == 0 else 1.0
+        bh = 5.5 if i != 2 else 7.0
+        painter.drawRect(QRectF(bx0, by - bh, bw, bh))
+        bx0 += bw + 1.4
+    painter.end()
+    return pm
+
+
+def _app_dir() -> Path:
+    """可写数据目录：开发为脚本目录；Windows 打包为 exe 同级；macOS 打包为应用支持库（或便携目录）。"""
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).resolve().parent
+    if sys.platform == "darwin":
+        portable = os.environ.get("TIDANMGR_PORTABLE", "").strip().lower() in ("1", "true", "yes")
+        if portable:
+            macos = Path(sys.executable).resolve().parent
+            bundle = macos.parent.parent
+            data = bundle.parent / "TidanMgrData"
+            data.mkdir(parents=True, exist_ok=True)
+            return data
+        support = Path.home() / "Library" / "Application Support" / "TidanMgr"
+        support.mkdir(parents=True, exist_ok=True)
+        return support
+    return Path(sys.executable).resolve().parent
+
+
+APP_DIR = _app_dir()
+DATA_FILE = APP_DIR / "data.json"
+HISTORY_FILE = APP_DIR / "history_data.json"
+THEME_FILE = APP_DIR / "theme.json"
+PICKER_RECENT_FILE = APP_DIR / "picker_recent.json"
+# 打包时模板随 --add-data 放入 _MEIPASS；未打包时放在 app 目录
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    _bundled_tpl = Path(sys._MEIPASS) / "template.xlsx"
+    TEMPLATE_FILE = _bundled_tpl if _bundled_tpl.exists() else (APP_DIR / "template.xlsx")
+else:
+    TEMPLATE_FILE = APP_DIR / "template.xlsx"
+
+# 本地时间：此时间之后授权失效（2026-04-30 23:00:00 及之前可用）
+_LICENSE_EXPIRE_AT = datetime(2026, 4, 30, 23, 0, 0)
+_LICENSE_EXPIRED_MSG = "授权已过期，请联系管理员。"
+
+
+def is_license_valid() -> bool:
+    return datetime.now() <= _LICENSE_EXPIRE_AT
+
+
+FIELDS = [
+    "task_name",
+    "type_code",
+    "operator_code",
+    "industry_code",
+    "url",
+    "quantity",
+    "duration",
+    "age_max",
+    "age_min",
+    "pv",
+    "province",
+    "exclude_province",
+    "city",
+    "exclude_city",
+]
+DISPLAY_FIELDS = ["checked"] + FIELDS + ["created_at", "action"]
+HEADERS = {
+    "checked": "☐",
+    "task_name": "任务名",
+    "type_code": "类型",
+    "operator_code": "运营商",
+    "industry_code": "行业编码",
+    "url": "URL",
+    "quantity": "数量",
+    "duration": "时长",
+    "age_max": "年龄上限",
+    "age_min": "年龄下限",
+    "pv": "pv",
+    "province": "省份",
+    "exclude_province": "排除省份",
+    "city": "地市",
+    "exclude_city": "排除地市",
+    "created_at": "提单时间",
+    "action": "操作",
+}
+
+FROZEN_COLUMNS = 2
+MAIN_SCROLL_COLUMNS = len(DISPLAY_FIELDS) - FROZEN_COLUMNS
+# 历史滚动区：与主表相同字段列 + 提单时间 + 删除时间，不含「操作」列
+HISTORY_SCROLL_FIELDS = FIELDS[1:] + ["created_at", "deleted_at"]
+HISTORY_SCROLL_COLUMNS = len(HISTORY_SCROLL_FIELDS)
+
+TYPE_MAP = {"DB": "dpi-白", "DJ": "106", "XC": "小程序", "DH": "dpi-灰", "DY": "抖音"}
+OP_MAP = {"YD": "移动", "LT": "联通", "DX": "电信", "YX": "移动|电信"}
+DURATIONS = ["一天", "本周", "长期"]
+PROVINCES = [
+    "北京", "天津", "上海", "重庆", "河北", "山西", "辽宁", "吉林", "黑龙江",
+    "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南", "湖北", "湖南",
+    "广东", "海南", "四川", "贵州", "云南", "陕西", "甘肃", "青海", "台湾",
+    "内蒙古", "广西", "西藏", "宁夏", "新疆", "香港", "澳门",
+]
+CITIES = [
+    "石家庄", "唐山", "秦皇岛", "邯郸", "邢台", "保定", "张家口", "承德", "沧州", "廊坊", "衡水",
+    "太原", "大同", "阳泉", "长治", "晋城", "朔州", "晋中", "运城", "忻州", "临汾", "吕梁",
+    "沈阳", "大连", "鞍山", "抚顺", "本溪", "丹东", "锦州", "营口", "阜新", "辽阳", "盘锦", "铁岭", "朝阳", "葫芦岛",
+    "长春", "吉林", "四平", "辽源", "通化", "白山", "松原", "白城",
+    "哈尔滨", "齐齐哈尔", "鸡西", "鹤岗", "双鸭山", "大庆", "伊春", "佳木斯", "七台河", "牡丹江", "黑河", "绥化",
+    "南京", "无锡", "徐州", "常州", "苏州", "南通", "连云港", "淮安", "盐城", "扬州", "镇江", "泰州", "宿迁",
+    "杭州", "宁波", "温州", "嘉兴", "湖州", "绍兴", "金华", "衢州", "舟山", "台州", "丽水",
+    "合肥", "芜湖", "蚌埠", "淮南", "马鞍山", "淮北", "铜陵", "安庆", "黄山", "滁州", "阜阳", "宿州", "六安", "亳州", "池州", "宣城",
+    "福州", "厦门", "莆田", "三明", "泉州", "漳州", "南平", "龙岩", "宁德",
+    "南昌", "景德镇", "萍乡", "九江", "新余", "鹰潭", "赣州", "吉安", "宜春", "抚州", "上饶",
+    "济南", "青岛", "淄博", "枣庄", "东营", "烟台", "潍坊", "济宁", "泰安", "威海", "日照", "临沂", "德州", "聊城", "滨州", "菏泽",
+]
+
+# CITIES 按省级行政区连续分段，与 PROVINCES 中「河北」起至「山东」顺序一一对应（其余省暂无地市表数据）
+_PROVINCE_CITY_BLOCK_NAMES = PROVINCES[4:15]
+_PROVINCE_CITY_BLOCK_SIZES = [11, 11, 14, 8, 12, 13, 11, 16, 9, 11, 16]
+
+
+def _build_province_to_cities() -> dict[str, tuple[str, ...]]:
+    d: dict[str, tuple[str, ...]] = {}
+    i = 0
+    for name, n in zip(_PROVINCE_CITY_BLOCK_NAMES, _PROVINCE_CITY_BLOCK_SIZES):
+        d[name] = tuple(CITIES[i : i + n])
+        i += n
+    assert i == len(CITIES), "PROVINCE_CITY_BLOCK_SIZES 与 CITIES 总长度不一致"
+    return d
+
+
+PROVINCE_TO_CITIES = _build_province_to_cities()
+
+
+def cities_under_provinces(provinces: list[str]) -> list[str]:
+    """已选省份下的地市并集，顺序与 CITIES 全局顺序一致。"""
+    union: set[str] = set()
+    for p in provinces:
+        union.update(PROVINCE_TO_CITIES.get(p, ()))
+    return [c for c in CITIES if c in union]
+
+
+def split_multi(value: str) -> list[str]:
+    return [x.strip() for x in str(value or "").split("|") if x.strip()]
+
+
+# 任务名前半段：从前到后第一个「地域」中文词 + 紧随其后的 6 位字母数字（运营商2+类型2+行业2）
+_REGION_NAME_TOKENS = sorted(set(PROVINCES + CITIES + ["全国"]), key=len, reverse=True)
+_REGION_NUM_RE = re.compile(r"^([一二两三四五六七八九十]+省|[一二两三四五六七八九十]+市|\d+省|\d+市)")
+
+
+def find_earliest_region_in_left(left: str) -> tuple[int, int, str] | None:
+    """返回 (起始下标, 结束下标不含, 地域词)。取最靠前起点；同起点取长匹配。"""
+    n = len(left)
+    best: tuple[int, int, str] | None = None
+    for start in range(n):
+        ch = left[start]
+        if not ("\u4e00" <= ch <= "\u9fff"):
+            continue
+        cand: str | None = None
+        for tok in _REGION_NAME_TOKENS:
+            if start + len(tok) <= n and left[start : start + len(tok)] == tok:
+                cand = tok
+                break
+        if cand is None:
+            m = _REGION_NUM_RE.match(left[start:])
+            if m:
+                cand = m.group(1)
+        if not cand:
+            continue
+        end = start + len(cand)
+        if best is None or start < best[0] or (start == best[0] and len(cand) > len(best[2])):
+            best = (start, end, cand)
+    return best
+
+
+def first_url(value: str) -> str:
+    if not value:
+        return ""
+    for line in str(value).splitlines():
+        clean = line.strip()
+        if clean:
+            return clean
+    return ""
+
+
+def sanitize_filename(text: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', "_", str(text or "")).strip() or "客户"
+
+
+def int_to_cn(n: int) -> str:
+    return {1: "一", 2: "两", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}.get(n, str(n))
+
+
+class _ComboLineEditPopupFilter(QObject):
+    """可编辑且 lineEdit 只读时，点文字区域默认不弹列表；左键按下时打开下拉。"""
+
+    def __init__(self, combo: QComboBox):
+        super().__init__(combo)
+        self._combo = combo
+
+    def eventFilter(self, watched, event):
+        if (
+            event.type() == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.LeftButton
+            and watched is self._combo.lineEdit()
+        ):
+            self._combo.showPopup()
+        return False
+
+
+def style_combo_centered(combo: QComboBox):
+    combo.setEditable(True)
+    le = combo.lineEdit()
+    if le:
+        le.setReadOnly(True)
+        le.setAlignment(Qt.AlignCenter)
+        le.installEventFilter(_ComboLineEditPopupFilter(combo))
+
+
+class ColumnPickFilterPopup(QDialog):
+    """列筛选：无确定/取消；勾选即写回并刷新；Qt.Popup 点击表格外关闭。勾选状态用 _selected 维护以便搜索时保留。"""
+
+    def __init__(
+        self,
+        bill: "BillApp",
+        mode: str,
+        field: str,
+        title: str,
+        options: list[str],
+        selected: set[str],
+        anchor_bottom_right: QPoint,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowFlags(Qt.Dialog | Qt.Popup)
+        self.setWindowTitle(title)
+        self.resize(360, 440)
+        self._bill = bill
+        self._mode = mode
+        self._field = field
+        self._options = list(options)
+        self._anchor_br = QPoint(anchor_bottom_right)
+        self._suppress_list = False
+        opt_set = set(options)
+        self._selected = set(selected) & opt_set if selected else set()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索选项...")
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.NoSelection)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        layout.addWidget(self.search)
+        layout.addWidget(self.list_widget, 1)
+        self.search.textChanged.connect(self._render)
+        self.list_widget.itemChanged.connect(self._on_item_changed)
+        self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self._render()
+
+    def _on_item_double_clicked(self, item: QListWidgetItem):
+        if item.checkState() == Qt.CheckState.Checked:
+            item.setCheckState(Qt.CheckState.Unchecked)
+        else:
+            item.setCheckState(Qt.CheckState.Checked)
+
+    def _position_near_anchor(self):
+        """弹窗左上角与筛选按钮右下角对齐，并限制在可用屏幕内。"""
+        self.adjustSize()
+        fg = self.frameGeometry()
+        w, h = fg.width(), fg.height()
+        x = self._anchor_br.x()
+        y = self._anchor_br.y()
+        scr = QGuiApplication.screenAt(self._anchor_br)
+        if scr is None:
+            scr = QApplication.primaryScreen()
+        ag = scr.availableGeometry() if scr else QRect()
+        if ag.width() > 0:
+            x = max(ag.left(), min(x, ag.right() - w + 1))
+            y = max(ag.top(), min(y, ag.bottom() - h + 1))
+        self.move(x, y)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._position_near_anchor)
+
+    def _on_item_changed(self, item: QListWidgetItem):
+        if self._suppress_list:
+            return
+        t = item.text()
+        if item.checkState() == Qt.CheckState.Checked:
+            self._selected.add(t)
+        else:
+            self._selected.discard(t)
+        self._apply_to_bill()
+
+    def _apply_to_bill(self):
+        sel = set(self._selected)
+        if self._field == "created_at":
+            sel = {BillApp._created_at_filter_key(x) for x in sel}
+        full = {BillApp._created_at_filter_key(x) for x in self._options} if self._field == "created_at" else set(self._options)
+        target = self._bill.header_filters if self._mode.startswith("main") else self._bill.history_header_filters
+        if not sel or sel == full:
+            target.pop(self._field, None)
+        else:
+            target[self._field] = sel
+        if self._mode.startswith("main"):
+            self._bill.refresh_table()
+        else:
+            self._bill.refresh_history_table()
+
+    def _render(self):
+        self._suppress_list = True
+        self.list_widget.blockSignals(True)
+        try:
+            kw = self.search.text().strip().lower()
+            self.list_widget.clear()
+            for x in self._options:
+                if kw and kw not in x.lower():
+                    continue
+                it = QListWidgetItem(x)
+                it.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                it.setCheckState(Qt.CheckState.Checked if x in self._selected else Qt.CheckState.Unchecked)
+                self.list_widget.addItem(it)
+        finally:
+            self.list_widget.blockSignals(False)
+            self._suppress_list = False
+
+
+class HoverFilterHeaderView(QHeaderView):
+    """表头悬停时在右侧显示筛选三角；点击三角打开多选筛选。"""
+
+    BTN_W = 20
+
+    def __init__(self, parent_table: QTableWidget, bill: "BillApp", mode: str):
+        super().__init__(Qt.Orientation.Horizontal, parent_table)
+        self._table = parent_table
+        self._bill = bill
+        self._mode = mode
+        self._hover_section = -1
+        self.setMouseTracking(True)
+        self.setDefaultAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+
+    def leaveEvent(self, event):
+        self._hover_section = -1
+        self.viewport().update()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
+        idx = self.logicalIndexAt(event.position().toPoint())
+        if idx != self._hover_section:
+            self._hover_section = idx
+            self.viewport().update()
+        super().mouseMoveEvent(event)
+
+    def _filter_btn_rect(self, logical_index: int) -> QRect:
+        pos = self.sectionViewportPosition(logical_index)
+        w = self.sectionSize(logical_index)
+        h = self.height()
+        return QRect(pos + w - self.BTN_W, 0, self.BTN_W, h)
+
+    def _hit_filter_btn(self, pos: QPoint) -> int:
+        idx = self.logicalIndexAt(pos)
+        if idx < 0 or not self._bill._header_show_filter_btn(self._mode, idx):
+            return -1
+        r = self._filter_btn_rect(idx)
+        if r.contains(pos):
+            return idx
+        return -1
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            fi = self._hit_filter_btn(pos)
+            if fi >= 0:
+                self._bill._open_header_filter_from_header(self._mode, fi)
+                event.accept()
+                return
+            idx = self.logicalIndexAt(pos)
+            # 冻结首列勾选表头：自定义 HeaderView 下 sectionClicked 可能不触发，在此显式处理全选/取消全选
+            if idx == 0 and self._mode in ("main_frozen", "hist_frozen"):
+                self._bill._on_frozen_header_col0_clicked(self._mode)
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
+
+    def paintSection(self, painter: QPainter, rect: QRect, logical_index: int):
+        super().paintSection(painter, rect, logical_index)
+        if self._hover_section != logical_index:
+            return
+        if not self._bill._header_show_filter_btn(self._mode, logical_index):
+            return
+        tri = QRect(rect.right() - self.BTN_W + 4, rect.center().y() - 4, 10, 8)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = self.palette().color(self.foregroundRole())
+        painter.setPen(QPen(c, 1.2))
+        painter.setBrush(QBrush(c))
+        cx, top, bot = tri.center().x(), tri.top() + 1, tri.bottom() - 1
+        painter.drawPolygon(
+            QPolygon([QPoint(cx, bot), QPoint(tri.left() + 1, top), QPoint(tri.right() - 1, top)])
+        )
+        painter.restore()
+
+
+class MultiSelectDialog(QDialog):
+    """省份/地市等多选：仅双击行切换选中（单击不改变勾选）。"""
+
+    def __init__(self, title: str, items: list[str], selected: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(320, 420)
+        self._items = items
+        self._state_all: set[str] = set(selected)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索...")
+        hint = QLabel("双击行：选中或取消")
+        hint.setObjectName("hintLabel")
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.SingleSelection)
+        self.list_widget.itemDoubleClicked.connect(self._on_row_double_clicked)
+        self.btns = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.search)
+        layout.addWidget(hint)
+        layout.addWidget(self.list_widget)
+        layout.addWidget(self.btns)
+        self.search.textChanged.connect(self._render)
+        self.btns.accepted.connect(self.accept)
+        self.btns.rejected.connect(self.reject)
+        self._render()
+
+    @staticmethod
+    def _row_label(x: str, checked: bool) -> str:
+        return ("☑ " if checked else "☐ ") + x
+
+    def _on_row_double_clicked(self, item: QListWidgetItem):
+        x = str(item.data(Qt.UserRole))
+        if x in self._state_all:
+            self._state_all.discard(x)
+        else:
+            self._state_all.add(x)
+        item.setText(self._row_label(x, x in self._state_all))
+
+    def _render(self):
+        keyword = self.search.text().strip().lower()
+        self.list_widget.clear()
+        for x in self._items:
+            if keyword and keyword not in x.lower():
+                continue
+            checked = x in self._state_all
+            item = QListWidgetItem(self._row_label(x, checked))
+            item.setData(Qt.UserRole, x)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.list_widget.addItem(item)
+        for i in range(self.list_widget.count()):
+            it = self.list_widget.item(i)
+            name = str(it.data(Qt.UserRole))
+            if name in self._state_all:
+                self.list_widget.setCurrentRow(i)
+                self.list_widget.scrollToItem(it)
+                break
+
+    def values(self):
+        return [x for x in self._items if x in self._state_all]
+
+
+class UrlDialog(QDialog):
+    def __init__(self, value: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("编辑URL（多行）")
+        self.resize(520, 360)
+        self.editor = QTextEdit()
+        self.editor.setPlainText(value or "")
+        btns = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.editor)
+        layout.addWidget(btns)
+
+    def value(self):
+        return self.editor.toPlainText().strip()
+
+
+class BillApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("BillAppMain")
+        self.setWindowTitle("提单管理")
+        self.resize(1500, 860)
+        self.records: list[dict[str, Any]] = []
+        self.history_records: list[dict[str, Any]] = []
+        self.history_filtered_indices: list[int] = []
+        self.filtered_indices: list[int] = []
+        self.theme = self.load_theme()
+        self.updating_table = False
+        self.select_all_state = False
+        self.field_errors: dict[tuple[int, str], bool] = {}
+        self.field_error_msgs: dict[tuple[int, str], str] = {}
+        self.picker_recent: dict[str, list[str]] = {}
+        self.header_filters: dict[str, set[str]] = {}
+        self.header_sort_field: str | None = None
+        self.header_sort_order = Qt.SortOrder.AscendingOrder
+        self._table_v_sync = False
+        self._table_sel_sync = False
+        self.history_header_filters: dict[str, set[str]] = {}
+        self.history_sort_field: str | None = None
+        self.history_sort_order = Qt.SortOrder.AscendingOrder
+        self._hist_v_sync = False
+        self._hist_sel_sync = False
+        self._filter_popup: ColumnPickFilterPopup | None = None
+        self._license_timer = QTimer(self)
+        self._license_timer.timeout.connect(self._check_license_and_exit_if_needed)
+        self._license_timer.start(30_000)
+        self._setup_ui()
+        fm = QFontMetrics(self.font())
+        self._data_row_height = max(44, int((fm.height() + max(fm.leading(), 0)) * 1.5) + 14)
+        self.load_data()
+        self.load_history_data()
+        self.load_picker_recent()
+        self.apply_theme()
+        self.refresh_table()
+
+    def _check_license_and_exit_if_needed(self):
+        if is_license_valid():
+            return
+        self._license_timer.stop()
+        _show_license_expired_dialog()
+        QApplication.quit()
+
+    def _setup_ui(self):
+        center = QWidget(self)
+        self.setCentralWidget(center)
+        root = QHBoxLayout(center)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.sidebar = QFrame()
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setAutoFillBackground(True)
+        self.sidebar.setFixedWidth(240)
+        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout.setContentsMargins(10, 16, 10, 20)
+        sidebar_layout.setSpacing(8)
+        self.sidebar_brand = QWidget()
+        self.sidebar_brand.setObjectName("sidebarBrand")
+        brand_row = QHBoxLayout(self.sidebar_brand)
+        brand_row.setContentsMargins(0, 0, 0, 0)
+        brand_row.setSpacing(12)
+        self._sidebar_logo_icon = QLabel()
+        self._sidebar_logo_icon.setFixedSize(44, 44)
+        brand_titles = QVBoxLayout()
+        brand_titles.setContentsMargins(0, 1, 0, 0)
+        brand_titles.setSpacing(5)
+        self._sidebar_logo_title = QLabel("提单管理")
+        self._sidebar_logo_title.setObjectName("sidebarLogoTitle")
+        self._sidebar_logo_sub = QLabel("任务表 · 核对与归档")
+        self._sidebar_logo_sub.setObjectName("sidebarLogoSub")
+        brand_titles.addWidget(self._sidebar_logo_title)
+        brand_titles.addWidget(self._sidebar_logo_sub)
+        brand_row.addWidget(self._sidebar_logo_icon, 0, Qt.AlignmentFlag.AlignTop)
+        brand_row.addLayout(brand_titles, 1)
+        self.nav_bill = QPushButton("📝  提单表")
+        self.nav_bill.setObjectName("navActive")
+        self.nav_bill.clicked.connect(self.show_bill_page)
+        side_item_sub1 = QLabel("📎  配件表（规划中）")
+        side_item_sub1.setObjectName("navDisabled")
+        self.nav_history = QPushButton("🕘  历史提单表")
+        self.nav_history.setObjectName("navNormal")
+        self.nav_history.clicked.connect(self.show_history_page)
+        self.nav_settings = QPushButton("⚙️  设置")
+        self.nav_settings.setObjectName("navNormal")
+        self.nav_settings.clicked.connect(self.show_settings_page)
+        divider = QFrame()
+        divider.setObjectName("sideDivider")
+        divider.setFrameShape(QFrame.HLine)
+        sidebar_layout.addWidget(self.sidebar_brand)
+        sidebar_layout.addWidget(self.nav_bill)
+        sidebar_layout.addWidget(self.nav_history)
+        sidebar_layout.addWidget(divider)
+        sidebar_layout.addWidget(side_item_sub1)
+        sidebar_layout.addWidget(self.nav_settings)
+        sidebar_layout.addStretch(1)
+        root.addWidget(self.sidebar)
+
+        main_wrap = QWidget()
+        main_layout = QVBoxLayout(main_wrap)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        self.content_stack = QStackedWidget()
+        self.content_stack.setObjectName("contentStack")
+        self.content_stack.setAutoFillBackground(True)
+        main_layout.addWidget(self.content_stack, 1)
+
+        bill_page = QWidget()
+        bill_page.setObjectName("stackBillPage")
+        bill_page.setAutoFillBackground(True)
+        bill_page_layout = QVBoxLayout(bill_page)
+        bill_page_layout.setContentsMargins(0, 0, 0, 0)
+        bill_page_layout.setSpacing(0)
+        top = QHBoxLayout()
+        top.setContentsMargins(16, 12, 16, 12)
+        top.setSpacing(12)
+        self.btn_toggle_sidebar = QPushButton("📂 菜单")
+        self.btn_toggle_sidebar.setObjectName("btnGhost")
+        self.btn_toggle_sidebar.clicked.connect(self.toggle_sidebar)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索任务名...")
+        self.search.setFixedWidth(220)
+        self.search.textChanged.connect(self.refresh_table)
+        btn_search = QPushButton("🔍 搜索")
+        btn_search.setObjectName("btnGhost")
+        btn_search.clicked.connect(self.on_bill_search_clicked)
+        btn_clear = QPushButton("🔄 清空筛选")
+        btn_clear.setObjectName("btnGhost")
+        btn_clear.clicked.connect(self.clear_bill_search_and_filters)
+        self.chk_print_url = QCheckBox("是否打印URL")
+        self.lbl_hint = QLabel("未勾选：导出内容不包含URL信息 | 勾选：导出内容包含URL信息")
+        self.lbl_hint.setObjectName("hintLabel")
+        self.btn_print = QPushButton("🖨 打印")
+        self.btn_print.setObjectName("btnAccent")
+        self.btn_print.clicked.connect(self.export_excel)
+        self.btn_add = QPushButton("➕ 新增行")
+        self.btn_add.setObjectName("btnSuccess")
+        self.btn_add.clicked.connect(self.add_row)
+        self.btn_bulk_fill = QPushButton("📋 批量填充")
+        self.btn_bulk_fill.setObjectName("btnAccent")
+        self.btn_bulk_fill.clicked.connect(self.bulk_fill_selected)
+        self.btn_delete_sel = QPushButton("🗑 删除选中")
+        self.btn_delete_sel.setObjectName("btnDanger")
+        self.btn_delete_sel.clicked.connect(self.delete_selected)
+        print_opt_layout = QVBoxLayout()
+        print_opt_layout.setContentsMargins(0, 0, 0, 0)
+        print_opt_layout.setSpacing(2)
+        print_opt_layout.addWidget(self.chk_print_url)
+        print_opt_layout.addWidget(self.lbl_hint)
+        sep1 = QFrame()
+        sep1.setObjectName("toolbarSep")
+        sep1.setFrameShape(QFrame.VLine)
+        sep2 = QFrame()
+        sep2.setObjectName("toolbarSep")
+        sep2.setFrameShape(QFrame.VLine)
+        for w in [self.btn_toggle_sidebar, self.search, btn_search, btn_clear]:
+            top.addWidget(w)
+        top.addWidget(sep1)
+        top.addLayout(print_opt_layout)
+        top.addWidget(sep2)
+        for w in [self.btn_print, self.btn_add, self.btn_bulk_fill]:
+            top.addWidget(w)
+        top.addStretch(1)
+        bill_page_layout.addLayout(top)
+
+        table_split = QWidget()
+        table_split.setObjectName("tableSplit")
+        split_lo = QHBoxLayout(table_split)
+        split_lo.setContentsMargins(0, 0, 0, 0)
+        split_lo.setSpacing(0)
+        self.table_frozen = QTableWidget(0, FROZEN_COLUMNS)
+        self.table_frozen.setObjectName("tableFrozenCol")
+        self.table_frozen.setHorizontalHeaderLabels([HEADERS["checked"], HEADERS["task_name"]])
+        self.table_frozen.verticalHeader().setVisible(False)
+        self.table_frozen.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table_frozen.setAlternatingRowColors(True)
+        self.table_frozen.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 与右侧主表同时保留横向滚动条占位，避免仅一侧出现横向条时纵向视口高度不一致导致滚动错位
+        self.table_frozen.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.table_frozen.horizontalScrollBar().setEnabled(False)
+        self.table_frozen.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.table_frozen.setFrameShape(QFrame.NoFrame)
+        self.table_frozen.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.table_frozen.cellClicked.connect(lambda r, c: self.on_cell_clicked(r, c))
+        self.table_frozen.cellDoubleClicked.connect(lambda r, c: self.on_cell_double_click(r, c))
+        self.table = QTableWidget(0, MAIN_SCROLL_COLUMNS)
+        self.table.setObjectName("tableScrollPart")
+        scroll_headers = [HEADERS[x] for x in DISPLAY_FIELDS[FROZEN_COLUMNS:]]
+        self.table.setHorizontalHeaderLabels(scroll_headers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.itemChanged.connect(self.on_item_changed)
+        self.table.cellDoubleClicked.connect(lambda r, c: self.on_cell_double_click(r, c + FROZEN_COLUMNS))
+        self.table.cellClicked.connect(lambda r, c: self.on_cell_clicked(r, c + FROZEN_COLUMNS))
+        self.table.currentCellChanged.connect(
+            lambda cr, cc, pr, pc: self.on_current_cell_changed(
+                cr, cc + FROZEN_COLUMNS if cc >= 0 else -1, pr, pc
+            )
+        )
+        self.table.customContextMenuRequested.connect(self.on_table_context_menu)
+        hdr_main_f = HoverFilterHeaderView(self.table_frozen, self, "main_frozen")
+        hdr_main_s = HoverFilterHeaderView(self.table, self, "main_scroll")
+        self.table_frozen.setHorizontalHeader(hdr_main_f)
+        self.table.setHorizontalHeader(hdr_main_s)
+        hdr_main_f.setSectionResizeMode(0, QHeaderView.Fixed)
+        hdr_main_f.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr_main_s.setSectionResizeMode(QHeaderView.Interactive)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        hdr_main_f.sectionClicked.connect(self._on_main_frozen_header_section_clicked)
+        hdr_main_s.sectionClicked.connect(self._on_main_scroll_header_clicked)
+        self.table.verticalScrollBar().valueChanged.connect(lambda v: self._sync_main_v_scroll(v, "scroll"))
+        self.table_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_main_v_scroll(v, "frozen"))
+        self.table.itemSelectionChanged.connect(self._sync_selection_main_to_frozen)
+        self.table_frozen.itemSelectionChanged.connect(self._sync_selection_frozen_to_main)
+        split_lo.addWidget(self.table_frozen, 0)
+        split_lo.addWidget(self.table, 1)
+        table_wrap = QWidget()
+        table_layout = QVBoxLayout(table_wrap)
+        table_layout.setContentsMargins(16, 10, 16, 16)
+        table_layout.setSpacing(8)
+        table_layout.addWidget(table_split, 1)
+        bottom_actions = QHBoxLayout()
+        bottom_actions.addWidget(self.btn_delete_sel)
+        bottom_actions.addStretch(1)
+        table_layout.addLayout(bottom_actions)
+        bill_page_layout.addWidget(table_wrap, 1)
+        self.content_stack.addWidget(bill_page)
+
+        history_page = QWidget()
+        history_page.setObjectName("stackHistoryPage")
+        history_page.setAutoFillBackground(True)
+        history_layout = QVBoxLayout(history_page)
+        history_layout.setContentsMargins(16, 12, 16, 16)
+        history_layout.setSpacing(10)
+        history_top = QHBoxLayout()
+        history_title = QLabel("历史提单列表（只读）")
+        history_title.setObjectName("sectionTitle")
+        history_top.addWidget(history_title)
+        self.history_search = QLineEdit()
+        self.history_search.setPlaceholderText("搜索任务名...")
+        self.history_search.setFixedWidth(220)
+        self.history_search.textChanged.connect(self.refresh_history_table)
+        btn_history_search = QPushButton("🔍 搜索")
+        btn_history_search.setObjectName("btnGhost")
+        btn_history_search.clicked.connect(self.on_history_search_clicked)
+        btn_history_clear = QPushButton("🔄 清空筛选")
+        btn_history_clear.setObjectName("btnGhost")
+        btn_history_clear.clicked.connect(self.clear_history_search_and_filters)
+        history_top.addWidget(self.history_search)
+        history_top.addWidget(btn_history_search)
+        history_top.addWidget(btn_history_clear)
+        history_top.addStretch(1)
+        self.btn_restore_selected = QPushButton("↩ 恢复选中到提单表")
+        self.btn_restore_selected.setObjectName("btnAccent")
+        self.btn_restore_selected.clicked.connect(self.restore_selected_history)
+        history_top.addWidget(self.btn_restore_selected)
+        history_layout.addLayout(history_top)
+        hist_split = QWidget()
+        hist_split.setObjectName("historyTableSplit")
+        hist_lo = QHBoxLayout(hist_split)
+        hist_lo.setContentsMargins(0, 0, 0, 0)
+        hist_lo.setSpacing(0)
+        self.history_table_frozen = QTableWidget(0, FROZEN_COLUMNS)
+        self.history_table_frozen.setObjectName("tableFrozenCol")
+        self.history_table_frozen.setHorizontalHeaderLabels([HEADERS["checked"], HEADERS["task_name"]])
+        self.history_table_frozen.verticalHeader().setVisible(False)
+        self.history_table_frozen.setSelectionBehavior(QTableWidget.SelectRows)
+        self.history_table_frozen.setAlternatingRowColors(True)
+        self.history_table_frozen.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.history_table_frozen.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.history_table_frozen.horizontalScrollBar().setEnabled(False)
+        self.history_table_frozen.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.history_table_frozen.setFrameShape(QFrame.NoFrame)
+        self.history_table_frozen.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.history_table_frozen.cellClicked.connect(lambda r, c: self.on_history_cell_clicked(r, c))
+        self.history_table = QTableWidget(0, HISTORY_SCROLL_COLUMNS)
+        self.history_table.setObjectName("historyScrollPart")
+        history_scroll_headers = [HEADERS[f] for f in HISTORY_SCROLL_FIELDS if f != "deleted_at"] + ["删除时间"]
+        self.history_table.setHorizontalHeaderLabels(history_scroll_headers)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.history_table.setAlternatingRowColors(True)
+        self.history_table.cellClicked.connect(lambda r, c: self.on_history_cell_clicked(r, c + FROZEN_COLUMNS))
+        self.history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        hdr_hist_f = HoverFilterHeaderView(self.history_table_frozen, self, "hist_frozen")
+        hdr_hist_s = HoverFilterHeaderView(self.history_table, self, "hist_scroll")
+        self.history_table_frozen.setHorizontalHeader(hdr_hist_f)
+        self.history_table.setHorizontalHeader(hdr_hist_s)
+        hdr_hist_f.setSectionResizeMode(0, QHeaderView.Fixed)
+        hdr_hist_f.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr_hist_s.setSectionResizeMode(QHeaderView.Interactive)
+        self.history_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        hdr_hist_f.sectionClicked.connect(self._on_hist_frozen_header_section_clicked)
+        hdr_hist_s.sectionClicked.connect(self._on_history_scroll_header_clicked)
+        self.history_table.verticalScrollBar().valueChanged.connect(lambda v: self._sync_hist_v_scroll(v, "scroll"))
+        self.history_table_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_hist_v_scroll(v, "frozen"))
+        self.history_table.itemSelectionChanged.connect(self._sync_selection_hist_to_frozen)
+        self.history_table_frozen.itemSelectionChanged.connect(self._sync_selection_hist_frozen_to_scroll)
+        hist_lo.addWidget(self.history_table_frozen, 0)
+        hist_lo.addWidget(self.history_table, 1)
+        history_layout.addWidget(hist_split, 1)
+        self.content_stack.addWidget(history_page)
+
+        settings_page = QWidget()
+        settings_page.setObjectName("stackSettingsPage")
+        settings_page.setAutoFillBackground(True)
+        settings_layout = QVBoxLayout(settings_page)
+        settings_layout.setContentsMargins(24, 24, 24, 24)
+        settings_layout.setSpacing(10)
+        settings_title = QLabel("设置")
+        settings_title.setObjectName("settingsTitle")
+        settings_layout.addWidget(settings_title)
+        settings_layout.addWidget(QLabel("主题模式"))
+        self.btn_theme = QPushButton("🎨 切换主题")
+        self.btn_theme.setObjectName("btnGhost")
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        settings_layout.addWidget(self.btn_theme)
+        settings_layout.addStretch(1)
+        self.content_stack.addWidget(settings_page)
+
+        status = QStatusBar(self)
+        self.setStatusBar(status)
+        self.lbl_count = QLabel("提单数: 0")
+        self.lbl_time = QLabel()
+        self.lbl_save = QLabel("已自动保存")
+        status.addPermanentWidget(self.lbl_count)
+        status.addPermanentWidget(QLabel("|"))
+        status.addPermanentWidget(self.lbl_time)
+        status.addPermanentWidget(QLabel("|"))
+        status.addPermanentWidget(self.lbl_save)
+        timer = QTimer(self)
+        timer.timeout.connect(self.update_time)
+        timer.start(1000)
+        self.update_time()
+        root.addWidget(main_wrap, 1)
+        self.show_bill_page()
+
+        col_widths = [310, 150, 150, 120, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 170, 90]
+        self.table_frozen.setColumnWidth(0, 42)
+        self.table_frozen.setColumnWidth(1, col_widths[0])
+        self.table_frozen.setFixedWidth(42 + col_widths[0])
+        for s in range(MAIN_SCROLL_COLUMNS):
+            self.table.setColumnWidth(s, col_widths[s + 1])
+        self.history_table_frozen.setColumnWidth(0, 42)
+        self.history_table_frozen.setColumnWidth(1, col_widths[0])
+        self.history_table_frozen.setFixedWidth(42 + col_widths[0])
+        hist_widths = col_widths + [160]
+        for s in range(HISTORY_SCROLL_COLUMNS):
+            self.history_table.setColumnWidth(s, hist_widths[s + 1])
+        self.table_frozen.itemChanged.connect(self.on_item_changed)
+
+    def load_theme(self):
+        if THEME_FILE.exists():
+            try:
+                return json.loads(THEME_FILE.read_text(encoding="utf-8")).get("theme", "light")
+            except Exception:
+                return "light"
+        return "light"
+
+    def save_theme(self):
+        THEME_FILE.write_text(json.dumps({"theme": self.theme}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def apply_theme(self):
+        self.setStyleSheet(STYLESHEET_DARK if self.theme == "dark" else STYLESHEET_LIGHT)
+        self._refresh_sidebar_logo()
+
+    def _refresh_sidebar_logo(self):
+        if not hasattr(self, "_sidebar_logo_icon"):
+            return
+        self._sidebar_logo_icon.setPixmap(make_sidebar_logo_pixmap(dark=self.theme == "dark", size=44))
+
+    def toggle_theme(self):
+        self.theme = "dark" if self.theme == "light" else "light"
+        self.apply_theme()
+        self.save_theme()
+
+    def toggle_sidebar(self):
+        visible = not self.sidebar.isVisible()
+        self.sidebar.setVisible(visible)
+        self.btn_toggle_sidebar.setText("📂 菜单" if visible else "📂 展开")
+
+    def show_bill_page(self):
+        self.content_stack.setCurrentIndex(0)
+        self.nav_bill.setObjectName("navActive")
+        self.nav_history.setObjectName("navNormal")
+        self.nav_settings.setObjectName("navNormal")
+        self.apply_theme()
+
+    def show_history_page(self):
+        self.content_stack.setCurrentIndex(1)
+        self.nav_bill.setObjectName("navNormal")
+        self.nav_history.setObjectName("navActive")
+        self.nav_settings.setObjectName("navNormal")
+        self.refresh_history_table()
+        self.apply_theme()
+
+    def show_settings_page(self):
+        self.content_stack.setCurrentIndex(2)
+        self.nav_bill.setObjectName("navNormal")
+        self.nav_history.setObjectName("navNormal")
+        self.nav_settings.setObjectName("navActive")
+        self.apply_theme()
+
+    def update_time(self):
+        self.lbl_time.setText(datetime.now().strftime("%Y/%m/%d %H:%M:%S"))
+
+    def default_record(self):
+        return {k: "" for k in FIELDS} | {"checked": False, "created_at": ""}
+
+    def load_data(self):
+        if DATA_FILE.exists():
+            try:
+                self.records = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                self.records = []
+        for rec in self.records:
+            rec.setdefault("created_at", "")
+        if not self.records:
+            self.records = [self.default_record()]
+
+    def load_history_data(self):
+        if HISTORY_FILE.exists():
+            try:
+                self.history_records = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                self.history_records = []
+        for rec in self.history_records:
+            rec.setdefault("checked", False)
+            rec.setdefault("deleted_at", "")
+            rec.setdefault("created_at", "")
+
+    def load_picker_recent(self):
+        if PICKER_RECENT_FILE.exists():
+            try:
+                data = json.loads(PICKER_RECENT_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self.picker_recent = {str(k): list(v) for k, v in data.items()}
+            except Exception:
+                self.picker_recent = {}
+
+    def save_picker_recent(self):
+        PICKER_RECENT_FILE.write_text(json.dumps(self.picker_recent, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def update_picker_recent(self, field: str, values: list[str]):
+        old = self.picker_recent.get(field, [])
+        merged = values + [x for x in old if x not in values]
+        self.picker_recent[field] = merged[:20]
+        self.save_picker_recent()
+
+    def save_data(self):
+        stamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        for rec in self.records:
+            if self.is_row_saved(rec) and not str(rec.get("created_at", "")).strip():
+                rec["created_at"] = stamp
+        DATA_FILE.write_text(json.dumps(self.records, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.lbl_save.setText("已自动保存")
+
+    def save_history_data(self):
+        HISTORY_FILE.write_text(json.dumps(self.history_records, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.lbl_save.setText("已自动保存")
+
+    def add_row(self):
+        insert_at = self.filtered_indices[0] if self.filtered_indices else 0
+        self.records.insert(insert_at, self.default_record())
+        self.save_data()
+        self.refresh_table()
+
+    def is_row_saved(self, rec):
+        return any(str(rec.get(k, "")).strip() for k in FIELDS)
+
+    def delete_selected(self):
+        to_del = [i for i in range(len(self.records)) if self.records[i].get("checked")]
+        if not to_del:
+            QMessageBox.information(self, "提示", "请先勾选要删除的数据")
+            return
+        has_saved = any(self.is_row_saved(self.records[i]) for i in to_del)
+        msg = "选中的记录中包含已保存数据，确认删除吗？此操作不可撤销。" if has_saved else "确认删除选中的记录吗？"
+        if QMessageBox.question(self, "确认删除", msg) != QMessageBox.Yes:
+            return
+        for idx in sorted(to_del, reverse=True):
+            rec = self.records[idx]
+            if self.is_row_saved(rec):
+                self.archive_record(rec)
+            self.records.pop(idx)
+        self.save_data()
+        self.save_history_data()
+        self.refresh_table()
+
+    def delete_row(self, idx):
+        if idx < 0 or idx >= len(self.records):
+            return
+        has_saved = self.is_row_saved(self.records[idx])
+        msg = "该行包含已保存数据，确认删除吗？此操作不可撤销。" if has_saved else "确认删除该行吗？"
+        if QMessageBox.question(self, "确认删除", msg) != QMessageBox.Yes:
+            return
+        rec = self.records[idx]
+        if self.is_row_saved(rec):
+            self.archive_record(rec)
+        self.records.pop(idx)
+        self.save_data()
+        self.save_history_data()
+        self.refresh_table()
+
+    def archive_record(self, rec):
+        hist = dict(rec)
+        hist["checked"] = False
+        hist["deleted_at"] = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        self.history_records.insert(0, hist)
+
+    def clear_history_search_and_filters(self):
+        self.history_search.setText("")
+        self.history_header_filters.clear()
+        self.history_sort_field = None
+        self.refresh_history_table()
+
+    def refresh_history_table(self):
+        self.updating_table = True
+        query = self.history_search.text().strip().lower()
+        self.history_filtered_indices = [
+            i
+            for i, r in enumerate(self.history_records)
+            if (not query or query in str(r.get("task_name", "")).lower()) and self._history_row_matches_header_filters(r)
+        ]
+        if not self.history_sort_field:
+            self.history_filtered_indices.sort(
+                key=lambda i: self._created_at_sort_key(self.history_records[i]), reverse=True
+            )
+        else:
+            f = self.history_sort_field
+            rev = self.history_sort_order == Qt.SortOrder.DescendingOrder
+            self.history_filtered_indices.sort(
+                key=lambda i, ff=f: self._sort_key_history_field(self.history_records[i], ff),
+                reverse=rev,
+            )
+        n = len(self.history_filtered_indices)
+        self.history_table.setRowCount(n)
+        self.history_table_frozen.setRowCount(n)
+        for row, rec_idx in enumerate(self.history_filtered_indices):
+            rec = self.history_records[rec_idx]
+            box_wrap = QWidget()
+            box_layout = QHBoxLayout(box_wrap)
+            box_layout.setContentsMargins(0, 0, 0, 0)
+            box_layout.setAlignment(Qt.AlignCenter)
+            chk = QCheckBox()
+            chk.setChecked(bool(rec.get("checked")))
+            chk.stateChanged.connect(lambda _=0, x=rec_idx, c=chk: self.on_history_checkbox_changed(x, c.isChecked()))
+            box_layout.addWidget(chk)
+            self.history_table_frozen.setCellWidget(row, 0, box_wrap)
+            ph0 = QTableWidgetItem("")
+            ph0.setFlags(Qt.ItemIsEnabled)
+            self.history_table_frozen.setItem(row, 0, ph0)
+            tn_item = QTableWidgetItem(self.display_val(rec, "task_name"))
+            tn_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            tn_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.history_table_frozen.setItem(row, 1, tn_item)
+            for sc, f in enumerate(FIELDS[1:]):
+                item = QTableWidgetItem(self.display_val(rec, f))
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.history_table.setItem(row, sc, item)
+            ca_hist = QTableWidgetItem(str(rec.get("created_at", "")))
+            ca_hist.setTextAlignment(Qt.AlignCenter)
+            ca_hist.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.history_table.setItem(row, len(FIELDS) - 1, ca_hist)
+            deleted_item = QTableWidgetItem(str(rec.get("deleted_at", "")))
+            deleted_item.setTextAlignment(Qt.AlignCenter)
+            deleted_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.history_table.setItem(row, len(FIELDS), deleted_item)
+        h = self._data_row_height
+        for r in range(n):
+            self.history_table.setRowHeight(r, h)
+            self.history_table_frozen.setRowHeight(r, h)
+        self._update_history_header_sort_indicator()
+        self._update_history_header_tooltips()
+        self.update_history_header_check()
+        self.updating_table = False
+
+    def update_history_header_check(self):
+        it = self.history_table_frozen.horizontalHeaderItem(0)
+        if not it:
+            return
+        if not self.history_filtered_indices:
+            it.setText("☐")
+            return
+        checked_count = sum(1 for i in self.history_filtered_indices if self.history_records[i].get("checked"))
+        symbol = "☐" if checked_count == 0 else ("☑" if checked_count == len(self.history_filtered_indices) else "◩")
+        it.setText(symbol)
+
+    def on_history_cell_clicked(self, row, col):
+        if self.updating_table or col != 0:
+            return
+        if row < 0 or row >= len(self.history_filtered_indices):
+            return
+        rec_idx = self.history_filtered_indices[row]
+        self.on_history_checkbox_changed(rec_idx, not self.history_records[rec_idx].get("checked", False))
+
+    def on_history_checkbox_changed(self, rec_idx: int, checked: bool):
+        if self.updating_table:
+            return
+        if rec_idx < 0 or rec_idx >= len(self.history_records):
+            return
+        self.history_records[rec_idx]["checked"] = bool(checked)
+        self.save_history_data()
+        self.refresh_history_table()
+
+    def restore_selected_history(self):
+        restore_idx = [i for i, rec in enumerate(self.history_records) if rec.get("checked")]
+        if not restore_idx:
+            QMessageBox.information(self, "提示", "请先勾选要恢复的数据")
+            return
+        if QMessageBox.question(self, "确认恢复", f"确认恢复 {len(restore_idx)} 条历史提单到提单表吗？") != QMessageBox.Yes:
+            return
+        for idx in sorted(restore_idx):
+            src = self.history_records[idx]
+            rec = {k: src.get(k, "") for k in FIELDS}
+            rec["checked"] = False
+            rec["created_at"] = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+            self.records.append(rec)
+        for idx in sorted(restore_idx, reverse=True):
+            self.history_records.pop(idx)
+        self.save_data()
+        self.save_history_data()
+        self.refresh_table()
+        self.refresh_history_table()
+        QMessageBox.information(self, "恢复成功", f"已恢复 {len(restore_idx)} 条数据到提单表")
+
+    def display_val(self, rec, field):
+        if field == "type_code":
+            return TYPE_MAP.get(rec.get(field, ""), "")
+        if field == "operator_code":
+            return OP_MAP.get(rec.get(field, ""), "")
+        if field == "url":
+            return first_url(rec.get(field, ""))
+        return str(rec.get(field, ""))
+
+    @staticmethod
+    def _geo_tokens_invalid(field: str, parts: list[str], rec: dict | None = None) -> list[str]:
+        if field in ("province", "exclude_province"):
+            allowed = set(PROVINCES)
+            return [p for p in parts if p not in allowed]
+        allow_cities: set[str] | None = None
+        if field == "exclude_city" and rec is not None:
+            provs = split_multi(rec.get("province", ""))
+            if provs:
+                allow_cities = set(cities_under_provinces(provs))
+        if allow_cities is not None:
+            return [p for p in parts if p not in allow_cities]
+        return [p for p in parts if p not in set(CITIES)]
+
+    @staticmethod
+    def _normalize_geo_field_value(field: str, raw: str, rec: dict | None = None) -> str | None:
+        text = str(raw or "").replace("\n", " ").replace("\r", " ").strip()
+        if not text:
+            return ""
+        parts = split_multi(text.replace("，", "|").replace(",", "|"))
+        if BillApp._geo_tokens_invalid(field, parts, rec):
+            return None
+        return "|".join(parts)
+
+    @staticmethod
+    def _city_picker_source(field: str, rec: dict) -> list[str]:
+        """地市类弹窗候选项：排除地市在已选省份时仅显示这些省下的地市。"""
+        if field == "exclude_city" and split_multi(rec.get("province", "")):
+            return cities_under_provinces(split_multi(rec.get("province", "")))
+        if field in ("city", "exclude_city"):
+            return list(CITIES)
+        raise ValueError(field)
+
+    @staticmethod
+    def _created_at_sort_key(rec: dict) -> str:
+        return str(rec.get("created_at", "") or "").strip()
+
+    @staticmethod
+    def _created_at_filter_key(raw: Any) -> str:
+        """表头筛选用：只保留 YYYY-MM-DD，同一日期去重；选项中不显示时分秒。"""
+        t = str(raw or "").strip()
+        if not t:
+            return ""
+        # 常见：YYYY-MM-DD 后接空格/T 及时间
+        if re.match(r"^\d{4}-\d{2}-\d{2}", t):
+            head = t[:10]
+            if len(t) == 10 or (len(t) > 10 and t[10] in " Tt"):
+                return head
+        if "T" in t[:32]:
+            left = t.split("T", 1)[0].strip()
+            if len(left) >= 10 and re.match(r"^\d{4}-\d{2}-\d{2}$", left[:10]):
+                return left[:10]
+        m = re.match(r"^(\d{4})[./-](\d{1,2})[./-](\d{1,2})", t)
+        if m:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            try:
+                return datetime(y, mo, d).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        try:
+            if "T" in t:
+                s = t.replace("Z", "").split("+", 1)[0].split(".", 1)[0][:19]
+                return datetime.fromisoformat(s).strftime("%Y-%m-%d")
+            if re.search(r"\d{1,2}:\d{2}", t):
+                return datetime.strptime(t[:19], "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        try:
+            return datetime.strptime(t[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        m2 = re.match(r"^(\d{4}-\d{2}-\d{2})", t)
+        if m2:
+            return m2.group(1)
+        return ""
+
+    def _main_table_sort_key(self, rec_idx: int) -> tuple:
+        """未保存（无提单时间）的草稿排在最前；同组内按下标排序（新增行插在首条可见记录之前）。"""
+        ca = self._created_at_sort_key(self.records[rec_idx])
+        if ca:
+            return (0, ca)
+        return (1, -rec_idx)
+
+    def on_bill_search_clicked(self):
+        """搜索按钮：刷新列表并清空所有表头列筛选。"""
+        self.header_filters.clear()
+        self.refresh_table()
+
+    def on_history_search_clicked(self):
+        """历史页搜索按钮：刷新并清空表头列筛选。"""
+        self.history_header_filters.clear()
+        self.refresh_history_table()
+
+    def clear_bill_search_and_filters(self):
+        self.search.setText("")
+        self.header_filters.clear()
+        self.header_sort_field = None
+        self.refresh_table()
+
+    def _sync_main_v_scroll(self, value: int, source: str):
+        if self._table_v_sync:
+            return
+        self._table_v_sync = True
+        try:
+            if source == "scroll":
+                self.table_frozen.verticalScrollBar().setValue(value)
+            else:
+                self.table.verticalScrollBar().setValue(value)
+        finally:
+            self._table_v_sync = False
+
+    def _sync_selection_main_to_frozen(self):
+        if self._table_sel_sync or self.table.selectionModel() is None:
+            return
+        self._table_sel_sync = True
+        try:
+            self.table_frozen.clearSelection()
+            for idx in self.table.selectionModel().selectedRows():
+                self.table_frozen.selectRow(idx.row())
+        finally:
+            self._table_sel_sync = False
+
+    def _sync_selection_frozen_to_main(self):
+        if self._table_sel_sync or self.table_frozen.selectionModel() is None:
+            return
+        self._table_sel_sync = True
+        try:
+            self.table.clearSelection()
+            for idx in self.table_frozen.selectionModel().selectedRows():
+                self.table.selectRow(idx.row())
+        finally:
+            self._table_sel_sync = False
+
+    def _cell_display_for_filter_main(self, rec: dict, field: str) -> str:
+        if field == "created_at":
+            return BillApp._created_at_filter_key(rec.get("created_at"))
+        if field in ("type_code", "operator_code"):
+            return self.display_val(rec, field) or str(rec.get(field, "") or "")
+        if field == "url":
+            return first_url(rec.get(field, ""))
+        return str(rec.get(field, "") or "")
+
+    def _main_row_matches_header_filters_except(self, rec_idx: int, skip_field: str | None) -> bool:
+        rec = self.records[rec_idx]
+        for field, vals in self.header_filters.items():
+            if skip_field and field == skip_field:
+                continue
+            if not vals:
+                continue
+            if field == "created_at":
+                dk = BillApp._created_at_filter_key(rec.get("created_at"))
+                allowed = {BillApp._created_at_filter_key(x) for x in vals}
+                if dk not in allowed:
+                    return False
+            elif self._cell_display_for_filter_main(rec, field) not in vals:
+                return False
+        return True
+
+    def _main_row_matches_header_filters(self, rec_idx: int) -> bool:
+        return self._main_row_matches_header_filters_except(rec_idx, None)
+
+    def _unique_display_values_main(self, field: str) -> list[str]:
+        query = self.search.text().strip().lower()
+        out: list[str] = []
+        seen: set[str] = set()
+        for i, r in enumerate(self.records):
+            if query and query not in str(r.get("task_name", "")).lower():
+                continue
+            if not self._main_row_matches_header_filters_except(i, field):
+                continue
+            dv = self._cell_display_for_filter_main(r, field)
+            if dv not in seen:
+                seen.add(dv)
+                out.append(dv)
+        if field == "created_at":
+            out = BillApp._unique_created_at_filter_options(out)
+        else:
+            out.sort(key=lambda s: (s == "", s.casefold()))
+        return out
+
+    @staticmethod
+    def _unique_created_at_filter_options(values: list[str]) -> list[str]:
+        """筛选项：仅 YYYY-MM-DD、按日期去重；空日期保留一条；日期新在前。"""
+        seen: set[str] = set()
+        norm: list[str] = []
+        for x in values:
+            k = BillApp._created_at_filter_key(x)
+            if k in seen:
+                continue
+            seen.add(k)
+            norm.append(k)
+
+        def sort_key(d: str):
+            if not d:
+                return (2, "")
+            try:
+                return (0, -datetime.strptime(d, "%Y-%m-%d").timestamp())
+            except Exception:
+                return (1, d)
+
+        norm.sort(key=sort_key)
+        return norm
+
+    def _field_for_header_section(self, mode: str, section: int) -> str | None:
+        if mode in ("main_frozen", "hist_frozen"):
+            return None if section == 0 else "task_name"
+        if mode == "main_scroll":
+            return self._main_scroll_field_for_section(section)
+        if mode == "hist_scroll":
+            return self._history_scroll_field_for_section(section)
+        return None
+
+    def _header_show_filter_btn(self, mode: str, section: int) -> bool:
+        return self._field_for_header_section(mode, section) is not None
+
+    def _close_column_filter_popup(self):
+        w = self._filter_popup
+        if w is None:
+            return
+        w.close()
+        w.deleteLater()
+        self._filter_popup = None
+
+    def _on_column_filter_popup_closed(self, dlg: "ColumnPickFilterPopup"):
+        if self._filter_popup is dlg:
+            self._filter_popup = None
+
+    def _filter_button_global_bottom_right(self, mode: str, section: int) -> QPoint | None:
+        if mode == "main_frozen":
+            h = self.table_frozen.horizontalHeader()
+        elif mode == "main_scroll":
+            h = self.table.horizontalHeader()
+        elif mode == "hist_frozen":
+            h = self.history_table_frozen.horizontalHeader()
+        elif mode == "hist_scroll":
+            h = self.history_table.horizontalHeader()
+        else:
+            return None
+        if not isinstance(h, HoverFilterHeaderView):
+            return None
+        r = h._filter_btn_rect(section)
+        return h.viewport().mapToGlobal(r.bottomRight())
+
+    def _open_header_filter_from_header(self, mode: str, section: int):
+        field = self._field_for_header_section(mode, section)
+        if not field:
+            return
+        if mode.startswith("main"):
+            opts = self._unique_display_values_main(field)
+            cur = set(self.header_filters.get(field, ()))
+        else:
+            opts = self._unique_display_values_hist(field)
+            cur = set(self.history_header_filters.get(field, ()))
+        if field == "created_at":
+            cur = {BillApp._created_at_filter_key(x) for x in cur}
+        title = HEADERS.get(field, field)
+        self._close_column_filter_popup()
+        anchor = self._filter_button_global_bottom_right(mode, section)
+        if anchor is None:
+            anchor = self.mapToGlobal(self.rect().topRight())
+        dlg = ColumnPickFilterPopup(
+            self,
+            mode,
+            field,
+            f"筛选：{title}",
+            opts,
+            cur,
+            anchor,
+            parent=self,
+        )
+        dlg.destroyed.connect(lambda *a, d=dlg: self._on_column_filter_popup_closed(d))
+        self._filter_popup = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _toggle_main_sort_for_field(self, field: str):
+        if self.header_sort_field == field:
+            if self.header_sort_order == Qt.SortOrder.AscendingOrder:
+                self.header_sort_order = Qt.SortOrder.DescendingOrder
+            else:
+                self.header_sort_field = None
+        else:
+            self.header_sort_field = field
+            self.header_sort_order = Qt.SortOrder.AscendingOrder
+        self.refresh_table()
+
+    def _on_main_frozen_header_section_clicked(self, section: int):
+        if section == 0:
+            # 由 HoverFilterHeaderView.mouseReleaseEvent 统一处理，避免与 sectionClicked 重复触发
+            return
+        self._toggle_main_sort_for_field("task_name")
+
+    def _main_scroll_field_for_section(self, section: int) -> str | None:
+        if 0 <= section < len(FIELDS) - 1:
+            return FIELDS[section + 1]
+        if section == len(FIELDS) - 1:
+            return "created_at"
+        return None
+
+    def _on_main_scroll_header_clicked(self, section: int):
+        field = self._main_scroll_field_for_section(section)
+        if not field:
+            return
+        self._toggle_main_sort_for_field(field)
+
+    def _sort_key_for_main_field(self, rec_idx: int, field: str):
+        rec = self.records[rec_idx]
+        if field == "created_at":
+            return self._created_at_sort_key(rec)
+        if field in ("quantity", "age_max", "age_min", "pv"):
+            raw = str(rec.get(field, "") or "").strip()
+            if not raw:
+                return float("-inf")
+            try:
+                return float(raw)
+            except ValueError:
+                return raw.lower()
+        return self._cell_display_for_filter_main(rec, field).lower()
+
+    def _apply_main_sort_to_filtered(self):
+        if not self.header_sort_field:
+            self.filtered_indices.sort(key=self._main_table_sort_key, reverse=True)
+        else:
+            field = self.header_sort_field
+            rev = self.header_sort_order == Qt.SortOrder.DescendingOrder
+            self.filtered_indices.sort(key=lambda i, f=field: self._sort_key_for_main_field(i, f), reverse=rev)
+
+    def _update_main_header_sort_indicator(self):
+        hf = self.table_frozen.horizontalHeader()
+        hs = self.table.horizontalHeader()
+        hf.setSortIndicatorShown(False)
+        hs.setSortIndicatorShown(False)
+        if not self.header_sort_field:
+            return
+        f = self.header_sort_field
+        if f == "task_name":
+            hf.setSortIndicatorShown(True)
+            hf.setSortIndicator(1, self.header_sort_order)
+            return
+        if f in FIELDS:
+            si = FIELDS.index(f) - 1
+            if si >= 0:
+                hs.setSortIndicatorShown(True)
+                hs.setSortIndicator(si, self.header_sort_order)
+            return
+        if f == "created_at":
+            hs.setSortIndicatorShown(True)
+            hs.setSortIndicator(len(FIELDS) - 1, self.header_sort_order)
+
+    def _update_main_header_tooltips(self):
+        for s in range(self.table_frozen.columnCount()):
+            field = self._field_for_header_section("main_frozen", s)
+            if not field:
+                continue
+            tip = HEADERS.get(field, field) + "\n单击：排序；悬停右侧 ▼ 筛选"
+            vals = self.header_filters.get(field)
+            if vals:
+                tip += f"\n已选 {len(vals)} 项"
+            it = self.table_frozen.horizontalHeaderItem(s)
+            if it:
+                it.setToolTip(tip)
+        for s in range(self.table.columnCount()):
+            field = self._main_scroll_field_for_section(s)
+            if not field:
+                continue
+            tip = HEADERS.get(field, field) + "\n单击：排序；悬停右侧 ▼ 筛选"
+            vals = self.header_filters.get(field)
+            if vals:
+                tip += f"\n已选 {len(vals)} 项"
+            it = self.table.horizontalHeaderItem(s)
+            if it:
+                it.setToolTip(tip)
+
+    def _sync_hist_v_scroll(self, value: int, source: str):
+        if self._hist_v_sync:
+            return
+        self._hist_v_sync = True
+        try:
+            if source == "scroll":
+                self.history_table_frozen.verticalScrollBar().setValue(value)
+            else:
+                self.history_table.verticalScrollBar().setValue(value)
+        finally:
+            self._hist_v_sync = False
+
+    def _sync_selection_hist_to_frozen(self):
+        if self._hist_sel_sync or self.history_table.selectionModel() is None:
+            return
+        self._hist_sel_sync = True
+        try:
+            self.history_table_frozen.clearSelection()
+            for idx in self.history_table.selectionModel().selectedRows():
+                self.history_table_frozen.selectRow(idx.row())
+        finally:
+            self._hist_sel_sync = False
+
+    def _sync_selection_hist_frozen_to_scroll(self):
+        if self._hist_sel_sync or self.history_table_frozen.selectionModel() is None:
+            return
+        self._hist_sel_sync = True
+        try:
+            self.history_table.clearSelection()
+            for idx in self.history_table_frozen.selectionModel().selectedRows():
+                self.history_table.selectRow(idx.row())
+        finally:
+            self._hist_sel_sync = False
+
+    def _cell_display_for_filter_hist(self, rec: dict, field: str) -> str:
+        if field == "deleted_at":
+            return str(rec.get("deleted_at", "") or "")
+        if field == "created_at":
+            return BillApp._created_at_filter_key(rec.get("created_at"))
+        if field in ("type_code", "operator_code"):
+            return self.display_val(rec, field) or str(rec.get(field, "") or "")
+        if field == "url":
+            return first_url(rec.get(field, ""))
+        return str(rec.get(field, "") or "")
+
+    def _history_row_matches_header_filters_except(self, rec: dict, skip_field: str | None) -> bool:
+        for field, vals in self.history_header_filters.items():
+            if skip_field and field == skip_field:
+                continue
+            if not vals:
+                continue
+            if field == "created_at":
+                dk = BillApp._created_at_filter_key(rec.get("created_at"))
+                allowed = {BillApp._created_at_filter_key(x) for x in vals}
+                if dk not in allowed:
+                    return False
+            elif self._cell_display_for_filter_hist(rec, field) not in vals:
+                return False
+        return True
+
+    def _history_row_matches_header_filters(self, rec: dict) -> bool:
+        return self._history_row_matches_header_filters_except(rec, None)
+
+    def _unique_display_values_hist(self, field: str) -> list[str]:
+        query = self.history_search.text().strip().lower()
+        out: list[str] = []
+        seen: set[str] = set()
+        for r in self.history_records:
+            if query and query not in str(r.get("task_name", "")).lower():
+                continue
+            if not self._history_row_matches_header_filters_except(r, field):
+                continue
+            dv = self._cell_display_for_filter_hist(r, field)
+            if dv not in seen:
+                seen.add(dv)
+                out.append(dv)
+        if field == "created_at":
+            out = BillApp._unique_created_at_filter_options(out)
+        else:
+            out.sort(key=lambda s: (s == "", s.casefold()))
+        return out
+
+    def _history_scroll_field_for_section(self, section: int) -> str | None:
+        if 0 <= section < HISTORY_SCROLL_COLUMNS:
+            return HISTORY_SCROLL_FIELDS[section]
+        return None
+
+    def _sort_key_history_field(self, rec: dict, field: str | None):
+        if not field:
+            return self._created_at_sort_key(rec)
+        if field == "deleted_at":
+            return str(rec.get("deleted_at", "") or "")
+        if field == "created_at":
+            return self._created_at_sort_key(rec)
+        if field in ("quantity", "age_max", "age_min", "pv"):
+            raw = str(rec.get(field, "") or "").strip()
+            if not raw:
+                return float("-inf")
+            try:
+                return float(raw)
+            except ValueError:
+                return raw.lower()
+        return self._cell_display_for_filter_hist(rec, field).lower()
+
+    def _toggle_history_sort_for_field(self, field: str):
+        if self.history_sort_field == field:
+            if self.history_sort_order == Qt.SortOrder.AscendingOrder:
+                self.history_sort_order = Qt.SortOrder.DescendingOrder
+            else:
+                self.history_sort_field = None
+        else:
+            self.history_sort_field = field
+            self.history_sort_order = Qt.SortOrder.AscendingOrder
+        self.refresh_history_table()
+
+    def _on_hist_frozen_header_section_clicked(self, section: int):
+        if section == 0:
+            return
+        self._toggle_history_sort_for_field("task_name")
+
+    def _on_history_scroll_header_clicked(self, section: int):
+        field = self._history_scroll_field_for_section(section)
+        if not field:
+            return
+        self._toggle_history_sort_for_field(field)
+
+    def _update_history_header_sort_indicator(self):
+        hf = self.history_table_frozen.horizontalHeader()
+        hs = self.history_table.horizontalHeader()
+        hf.setSortIndicatorShown(False)
+        hs.setSortIndicatorShown(False)
+        if not self.history_sort_field:
+            return
+        f = self.history_sort_field
+        if f == "task_name":
+            hf.setSortIndicatorShown(True)
+            hf.setSortIndicator(1, self.history_sort_order)
+            return
+        if f in FIELDS:
+            si = FIELDS.index(f) - 1
+            if si >= 0:
+                hs.setSortIndicatorShown(True)
+                hs.setSortIndicator(si, self.history_sort_order)
+            return
+        if f == "created_at":
+            hs.setSortIndicatorShown(True)
+            hs.setSortIndicator(len(FIELDS) - 1, self.history_sort_order)
+            return
+        if f == "deleted_at":
+            hs.setSortIndicatorShown(True)
+            hs.setSortIndicator(len(FIELDS), self.history_sort_order)
+
+    def _update_history_header_tooltips(self):
+        for s in range(self.history_table_frozen.columnCount()):
+            field = self._field_for_header_section("hist_frozen", s)
+            if not field:
+                continue
+            tip = HEADERS.get(field, field) + "\n单击：排序；悬停右侧 ▼ 筛选"
+            vals = self.history_header_filters.get(field)
+            if vals:
+                tip += f"\n已选 {len(vals)} 项"
+            it = self.history_table_frozen.horizontalHeaderItem(s)
+            if it:
+                it.setToolTip(tip)
+        for s in range(self.history_table.columnCount()):
+            field = self._history_scroll_field_for_section(s)
+            if not field:
+                continue
+            title = HEADERS.get(field, field) if field in HEADERS else field
+            tip = title + "\n单击：排序；悬停右侧 ▼ 筛选"
+            vals = self.history_header_filters.get(field)
+            if vals:
+                tip += f"\n已选 {len(vals)} 项"
+            it = self.history_table.horizontalHeaderItem(s)
+            if it:
+                it.setToolTip(tip)
+
+    def refresh_table(self):
+        self.updating_table = True
+        query = self.search.text().strip().lower()
+        self.filtered_indices = [
+            i
+            for i, r in enumerate(self.records)
+            if (not query or query in str(r.get("task_name", "")).lower()) and self._main_row_matches_header_filters(i)
+        ]
+        self._apply_main_sort_to_filtered()
+        n = len(self.filtered_indices)
+        self.table.setRowCount(n)
+        self.table_frozen.setRowCount(n)
+        for row, rec_idx in enumerate(self.filtered_indices):
+            rec = self.records[rec_idx]
+            box_wrap = QWidget()
+            box_layout = QHBoxLayout(box_wrap)
+            box_layout.setContentsMargins(0, 0, 0, 0)
+            box_layout.setAlignment(Qt.AlignCenter)
+            chk = QCheckBox()
+            chk.setChecked(bool(rec.get("checked")))
+            chk.stateChanged.connect(lambda _=0, x=rec_idx, c=chk: self.on_row_checkbox_changed(x, c.isChecked()))
+            box_layout.addWidget(chk)
+            self.table_frozen.setCellWidget(row, 0, box_wrap)
+            ph0 = QTableWidgetItem("")
+            ph0.setFlags(Qt.ItemIsEnabled)
+            self.table_frozen.setItem(row, 0, ph0)
+            tn_item = QTableWidgetItem(self.display_val(rec, "task_name"))
+            tn_item.setFlags(
+                Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsEditable
+            )
+            tn_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            if not str(rec.get("task_name", "")).strip():
+                tn_item.setToolTip("示例：客户全国YDDBDK-产品")
+            if self.field_errors.get((rec_idx, "task_name")):
+                tn_item.setBackground(QColor("#e05263"))
+                tn_item.setToolTip(self.field_error_msgs.get((rec_idx, "task_name"), "字段校验失败"))
+            self.table_frozen.setItem(row, 1, tn_item)
+            for sc, f in enumerate(FIELDS[1:]):
+                item = QTableWidgetItem(self.display_val(rec, f))
+                if f in ("url",):
+                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                elif f in ("province", "exclude_province", "city", "exclude_city"):
+                    item.setFlags(
+                        Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsEditable
+                    )
+                item.setTextAlignment(Qt.AlignCenter)
+                if self.field_errors.get((rec_idx, f)):
+                    item.setBackground(QColor("#e05263"))
+                    item.setToolTip(self.field_error_msgs.get((rec_idx, f), "字段校验失败"))
+                self.table.setItem(row, sc, item)
+                if f in ("type_code", "operator_code", "duration"):
+                    combo = QComboBox()
+                    combo.addItem("-- 请选择 --", "")
+                    if f == "type_code":
+                        for code, name in TYPE_MAP.items():
+                            combo.addItem(name, code)
+                    elif f == "operator_code":
+                        for code, name in OP_MAP.items():
+                            combo.addItem(name, code)
+                    else:
+                        for val in DURATIONS:
+                            combo.addItem(val, val)
+                    combo.setCurrentIndex(max(0, combo.findData(rec.get(f, ""))))
+                    combo.currentIndexChanged.connect(
+                        lambda _=0, x=rec_idx, ff=f, cb=combo: self.on_inline_combo_changed(x, ff, cb.currentData() or "")
+                    )
+                    style_combo_centered(combo)
+                    self.table.setCellWidget(row, sc, combo)
+            ca_item = QTableWidgetItem(str(rec.get("created_at", "")))
+            ca_item.setTextAlignment(Qt.AlignCenter)
+            ca_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.table.setItem(row, len(FIELDS) - 1, ca_item)
+            btn = QPushButton("🗑 删除")
+            btn.setObjectName("btnDanger")
+            btn.clicked.connect(lambda _=False, x=rec_idx: self.delete_row(x))
+            self.table.setCellWidget(row, MAIN_SCROLL_COLUMNS - 1, btn)
+        h = self._data_row_height
+        for r in range(n):
+            self.table.setRowHeight(r, h)
+            self.table_frozen.setRowHeight(r, h)
+        self.lbl_count.setText(f"提单数: {len(self.filtered_indices)}")
+        self.update_header_check()
+        self._update_main_header_sort_indicator()
+        self._update_main_header_tooltips()
+        self.updating_table = False
+
+    def update_header_check(self):
+        if not self.filtered_indices:
+            self.table_frozen.horizontalHeaderItem(0).setText("☐")
+            return
+        checked_count = sum(1 for i in self.filtered_indices if self.records[i].get("checked"))
+        symbol = "☐" if checked_count == 0 else ("☑" if checked_count == len(self.filtered_indices) else "◩")
+        self.table_frozen.horizontalHeaderItem(0).setText(symbol)
+
+    def on_header_clicked(self, section):
+        if section != 0:
+            return
+        if not self.filtered_indices:
+            return
+        all_checked = all(self.records[i].get("checked") for i in self.filtered_indices)
+        for i in self.filtered_indices:
+            self.records[i]["checked"] = not all_checked
+        self.save_data()
+        self.refresh_table()
+
+    def _on_frozen_header_col0_clicked(self, mode: str):
+        if mode == "main_frozen":
+            self.on_header_clicked(0)
+            return
+        if mode == "hist_frozen":
+            if not self.history_filtered_indices:
+                return
+            all_checked = all(self.history_records[i].get("checked") for i in self.history_filtered_indices)
+            for i in self.history_filtered_indices:
+                self.history_records[i]["checked"] = not all_checked
+            self.save_history_data()
+            self.refresh_history_table()
+
+    def on_cell_clicked(self, row, col):
+        if self.updating_table:
+            return
+        if row < 0 or row >= len(self.filtered_indices):
+            return
+        if col == 0:
+            rec_idx = self.filtered_indices[row]
+            new_state = not self.records[rec_idx].get("checked", False)
+            self.on_row_checkbox_changed(rec_idx, new_state)
+
+    def on_row_checkbox_changed(self, rec_idx: int, checked: bool):
+        if self.updating_table:
+            return
+        if rec_idx < 0 or rec_idx >= len(self.records):
+            return
+        self.records[rec_idx]["checked"] = bool(checked)
+        self.save_data()
+        self.refresh_table()
+
+    def on_cell_double_click(self, row, col):
+        if col <= 0 or col >= len(DISPLAY_FIELDS) - 1:
+            return
+        if col == len(FIELDS) + 1:
+            return
+        rec_idx = self.filtered_indices[row]
+        field = FIELDS[col - 1]
+        rec = self.records[rec_idx]
+        if field == "url":
+            dlg = UrlDialog(rec.get("url", ""), self)
+            if dlg.exec() == QDialog.Accepted:
+                self.apply_field_update(rec_idx, "url", dlg.value())
+            return
+        if field in ("province", "exclude_province", "city", "exclude_city"):
+            if field == "city" and rec.get("province", "").strip():
+                QMessageBox.warning(self, "提示", "已选择省份后，地市不可再选择；请先清空省份")
+                return
+            if field == "province" and rec.get("city", "").strip():
+                QMessageBox.warning(self, "提示", "已选择地市后，省份不可再选择；请先清空地市")
+                return
+            if field == "province" and split_multi(rec.get("exclude_province", "")):
+                QMessageBox.warning(self, "提示", "已填写排除省份，省份不可再编辑；请先清空排除省份")
+                return
+            if field == "city" and (
+                split_multi(rec.get("exclude_province", "")) or split_multi(rec.get("exclude_city", ""))
+            ):
+                QMessageBox.warning(self, "提示", "已填写排除省份或排除地市，地市不可再编辑；请先清空对应排除项")
+                return
+            if field == "exclude_province" and (
+                rec.get("province", "").strip() or rec.get("city", "").strip()
+            ):
+                QMessageBox.warning(self, "提示", "已选择省份或地市后，排除省份不可再选择；请先清空省份与地市")
+                return
+            if field == "exclude_city" and rec.get("city", "").strip():
+                QMessageBox.warning(self, "提示", "已选择地市后，排除地市不可再选择；请先清空地市")
+                return
+            cur_parts = split_multi(rec.get(field, ""))
+            if self._geo_tokens_invalid(field, cur_parts, rec):
+                QMessageBox.warning(self, "提示", "输入错误，请重新输入或者双击选择")
+                return
+            items = PROVINCES if "province" in field else self._city_picker_source(field, rec)
+            if field == "exclude_city" and split_multi(rec.get("province", "")) and not items:
+                QMessageBox.warning(self, "提示", "所选省份暂无地市级数据，无法选择排除地市。")
+                return
+            recent = self.picker_recent.get(field, [])
+            ordered = sorted(
+                items,
+                key=lambda x: (
+                    0 if x in split_multi(rec.get(field, "")) else 1,
+                    0 if x in recent else 1,
+                    recent.index(x) if x in recent else 999,
+                    x,
+                ),
+            )
+            dlg = MultiSelectDialog("选择", ordered, split_multi(rec.get(field, "")), self)
+            if dlg.exec() == QDialog.Accepted:
+                values = dlg.values()
+                self.update_picker_recent(field, values)
+                self.apply_field_update(rec_idx, field, "|".join(values))
+            return
+
+    def on_current_cell_changed(self, current_row, current_col, _previous_row, _previous_col):
+        if self.updating_table:
+            return
+        if current_row < 0 or current_row >= len(self.filtered_indices):
+            return
+        if current_col <= 0 or current_col >= len(DISPLAY_FIELDS) - 1:
+            return
+        if current_col == len(FIELDS) + 1:
+            return
+        field = FIELDS[current_col - 1]
+        if field == "task_name":
+            self.statusBar().showMessage("任务名格式：客户名+省份/地市/全国/几省/几市+运营商码值+类型码值+行业编码-产品名", 5000)
+
+    def on_table_context_menu(self, pos):
+        item = self.table.itemAt(pos)
+        if not item:
+            return
+        row = item.row()
+        col = item.column() + FROZEN_COLUMNS
+        if row < 0 or row >= len(self.filtered_indices):
+            return
+        if col <= 0 or col >= len(DISPLAY_FIELDS) - 1:
+            return
+        if col == len(FIELDS) + 1:
+            return
+        field = FIELDS[col - 1]
+        if field not in ("task_name", "operator_code", "type_code", "duration"):
+            return
+        rec_idx = self.filtered_indices[row]
+        rec = self.records[rec_idx]
+        menu = self.table.createStandardContextMenu()
+        action_map: dict[object, tuple[str, str]] = {}
+        if field == "task_name":
+            sample = f"客户{self.region_part(rec)}{rec.get('operator_code') or 'YD'}{rec.get('type_code') or 'DB'}{rec.get('industry_code') or 'DK'}-产品"
+            action_fill = menu.addAction("套用任务名示例")
+            action_map[action_fill] = ("task_name", sample)
+        elif field == "operator_code":
+            menu.addSeparator()
+            for code, name in OP_MAP.items():
+                act = menu.addAction(f"设置运营商：{name}（{code}）")
+                action_map[act] = ("operator_code", code)
+        elif field == "type_code":
+            menu.addSeparator()
+            for code, name in TYPE_MAP.items():
+                act = menu.addAction(f"设置类型：{name}（{code}）")
+                action_map[act] = ("type_code", code)
+        elif field == "duration":
+            menu.addSeparator()
+            for val in DURATIONS:
+                act = menu.addAction(f"设置时长：{val}")
+                action_map[act] = ("duration", val)
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen in action_map:
+            target_field, target_value = action_map[chosen]
+            self.apply_field_update(rec_idx, target_field, target_value)
+
+    def bulk_fill_selected(self):
+        selected_idx = [idx for idx, rec in enumerate(self.records) if rec.get("checked")]
+        if not selected_idx:
+            QMessageBox.information(self, "提示", "请先勾选要批量填充的记录")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("批量填充")
+        scope_combo = QComboBox(dlg)
+        scope_combo.addItem("全部已勾选记录", "all_checked")
+        scope_combo.addItem("仅当前筛选结果中已勾选", "filtered_checked")
+        field_combo = QComboBox(dlg)
+        field_combo.addItem("运营商", "operator_code")
+        field_combo.addItem("类型", "type_code")
+        field_combo.addItem("时长", "duration")
+        field_combo.addItem("行业编码", "industry_code")
+        field_combo.addItem("数量", "quantity")
+        field_combo.addItem("年龄上限", "age_max")
+        field_combo.addItem("年龄下限", "age_min")
+        field_combo.addItem("pv", "pv")
+        mode_combo = QComboBox(dlg)
+        mode_combo.addItem("批量填充", "fill")
+        mode_combo.addItem("批量清空", "clear")
+        value_combo = QComboBox(dlg)
+        value_combo.setMinimumWidth(260)
+        value_edit = QLineEdit(dlg)
+        value_edit.setMinimumWidth(260)
+
+        def render_values():
+            field = field_combo.currentData()
+            value_combo.clear()
+            value_edit.clear()
+            value_edit.hide()
+            value_combo.show()
+            if mode_combo.currentData() == "clear":
+                value_combo.setEnabled(False)
+                value_edit.setEnabled(False)
+                value_combo.addItem("（将清空所选字段）", "")
+                return
+            value_combo.setEnabled(True)
+            value_edit.setEnabled(True)
+            if field == "operator_code":
+                for code, name in OP_MAP.items():
+                    value_combo.addItem(f"{name}（{code}）", code)
+            elif field == "type_code":
+                for code, name in TYPE_MAP.items():
+                    value_combo.addItem(f"{name}（{code}）", code)
+            elif field == "duration":
+                for val in DURATIONS:
+                    value_combo.addItem(val, val)
+            elif field == "industry_code":
+                value_combo.hide()
+                value_edit.show()
+                value_edit.setPlaceholderText("请输入行业编码（字母或数字）")
+            else:
+                value_combo.hide()
+                value_edit.show()
+                value_edit.setPlaceholderText("请输入数字")
+
+        field_combo.currentIndexChanged.connect(render_values)
+        mode_combo.currentIndexChanged.connect(render_values)
+        render_values()
+        btns = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("作用范围"))
+        lay.addWidget(scope_combo)
+        lay.addWidget(QLabel("执行方式"))
+        lay.addWidget(mode_combo)
+        lay.addWidget(QLabel("填充字段"))
+        lay.addWidget(field_combo)
+        lay.addWidget(QLabel("填充值"))
+        lay.addWidget(value_combo)
+        lay.addWidget(value_edit)
+        lay.addWidget(btns)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        mode = mode_combo.currentData()
+        field = field_combo.currentData()
+        scope = scope_combo.currentData()
+        if scope == "filtered_checked":
+            visible_set = set(self.filtered_indices)
+            selected_idx = [idx for idx in selected_idx if idx in visible_set]
+            if not selected_idx:
+                QMessageBox.information(self, "提示", "当前筛选结果中没有已勾选记录")
+                return
+        if mode == "clear":
+            value = ""
+        elif field in ("industry_code", "quantity", "age_max", "age_min", "pv"):
+            value = value_edit.text().strip()
+        else:
+            value = value_combo.currentData() or ""
+        if mode == "fill" and field in ("quantity", "age_max", "age_min", "pv"):
+            if value and not value.isdigit():
+                QMessageBox.warning(self, "批量操作", "数量、年龄上下限、pv 仅支持数字")
+                return
+            if field == "quantity" and value == "0":
+                QMessageBox.warning(self, "批量操作", "数量必须大于0")
+                return
+        field_label = field_combo.currentText()
+        value_label = "清空" if mode == "clear" else (value_combo.currentText() if value_combo.isVisible() else value)
+        confirm = QMessageBox.question(
+            self,
+            "确认批量操作",
+            f"即将对 {len(selected_idx)} 条记录执行：{field_label} -> {value_label}\n确认继续吗？",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        failed: list[int] = []
+        fail_details: list[tuple[int, str, str]] = []
+        for idx in selected_idx:
+            rec = self.records[idx]
+            old_rec = dict(rec)
+            rec[field] = value
+            self.clear_error(idx, field)
+            if field in ("age_min", "age_max"):
+                self.clear_error(idx, "age_min")
+                self.clear_error(idx, "age_max")
+            self.after_field_change(rec, field)
+            ok, msg = self.validate_record(rec)
+            if not ok:
+                failed.append(idx)
+                fail_details.append((idx, field, msg))
+                self.records[idx] = old_rec
+                if "年龄上限必须大于等于年龄下限" in msg:
+                    self.mark_error(idx, "age_min", msg)
+                    self.mark_error(idx, "age_max", msg)
+                else:
+                    self.mark_error(idx, field, msg)
+        self.save_data()
+        self.refresh_table()
+        if failed:
+            self.focus_record(failed[0], field)
+            detail_lines = []
+            for rec_idx, failed_field, msg in fail_details[:8]:
+                task_name = str(self.records[rec_idx].get("task_name", "")).strip() or f"第{rec_idx + 1}行"
+                field_name = HEADERS.get(failed_field, failed_field)
+                detail_lines.append(f"- {task_name} | {field_name} | {msg}")
+            more = ""
+            if len(fail_details) > 8:
+                more = f"\n- ... 其余 {len(fail_details) - 8} 条请查看表格红框"
+            QMessageBox.warning(
+                self,
+                "批量操作",
+                "已更新 "
+                f"{len(selected_idx) - len(failed)} 条，失败 {len(failed)} 条。\n\n失败明细（最多显示8条）：\n"
+                + "\n".join(detail_lines)
+                + more,
+            )
+            return
+        QMessageBox.information(self, "批量操作", f"已更新 {len(selected_idx)} 条记录")
+
+    def focus_record(self, rec_idx: int, field: str):
+        if rec_idx not in self.filtered_indices:
+            self.search.setText("")
+            self.refresh_table()
+        if rec_idx not in self.filtered_indices:
+            return
+        row = self.filtered_indices.index(rec_idx)
+        if field == "created_at":
+            col = len(FIELDS) + 1
+        elif field in FIELDS:
+            col = FIELDS.index(field) + 1
+        else:
+            col = 1
+        if col <= 1:
+            self.table_frozen.setCurrentCell(row, col)
+            it0 = self.table_frozen.item(row, col)
+            if it0:
+                self.table_frozen.scrollToItem(it0)
+            return
+        sc = col - FROZEN_COLUMNS
+        self.table.setCurrentCell(row, sc)
+        it = self.table.item(row, sc)
+        if it:
+            self.table.scrollToItem(it)
+
+    def on_item_changed(self, item: QTableWidgetItem):
+        if self.updating_table:
+            return
+        tw = item.tableWidget()
+        base = 0 if tw is self.table_frozen else FROZEN_COLUMNS
+        row = item.row()
+        col = item.column() + base
+        if row < 0 or row >= len(self.filtered_indices):
+            return
+        rec_idx = self.filtered_indices[row]
+        rec = self.records[rec_idx]
+        if col == 0:
+            rec["checked"] = item.checkState() == Qt.Checked
+            self.save_data()
+            self.update_header_check()
+            return
+        if col >= len(DISPLAY_FIELDS) - 1:
+            return
+        if col == len(FIELDS) + 1:
+            return
+        field = FIELDS[col - 1]
+        if field in ("type_code", "operator_code", "duration", "url"):
+            return
+        if field in ("province", "exclude_province", "city", "exclude_city"):
+            raw = item.text()
+            norm = self._normalize_geo_field_value(field, raw, rec)
+            if norm is None:
+                QMessageBox.warning(self, "提示", "输入错误，请重新输入或者双击选择")
+                self.updating_table = True
+                item.setText(self.display_val(rec, field))
+                self.updating_table = False
+                return
+            self.apply_field_update(rec_idx, field, norm)
+            return
+        val = item.text().replace("\n", " ").strip()
+        self.apply_field_update(rec_idx, field, val)
+
+    def on_inline_combo_changed(self, rec_idx: int, field: str, value: str):
+        if self.updating_table:
+            return
+        if rec_idx < 0 or rec_idx >= len(self.records):
+            return
+        if str(self.records[rec_idx].get(field, "")) == str(value or ""):
+            return
+        self.apply_field_update(rec_idx, field, value or "")
+
+    def task_name_hint(self, text: str) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        if "-" not in value:
+            return "任务名建议包含 '-' 分隔产品名"
+        left = value.split("-", 1)[0]
+        parsed = self.parse_left(left)
+        if not parsed:
+            return "任务名前半段未识别到完整码值段（运营商+类型+行业编码）"
+        if not parsed.get("customer", "").strip():
+            return "任务名建议包含客户名"
+        if not parsed.get("region", "").strip():
+            return "任务名建议包含地域（省/市/全国/几省/几市）"
+        return ""
+
+    def mark_error(self, rec_idx: int, field: str, msg: str = ""):
+        self.field_errors[(rec_idx, field)] = True
+        self.field_error_msgs[(rec_idx, field)] = msg or "字段校验失败"
+
+    def clear_error(self, rec_idx: int, field: str):
+        self.field_errors.pop((rec_idx, field), None)
+        self.field_error_msgs.pop((rec_idx, field), None)
+
+    def apply_field_update(self, rec_idx: int, field: str, value: str):
+        if field == "created_at":
+            return
+        rec = self.records[rec_idx]
+        old = rec.get(field, "")
+        cleaned = value.replace("\n", " ").replace("\r", " ").strip() if field == "task_name" else value
+        if field == "task_name":
+            hint = self.task_name_hint(cleaned)
+            if hint:
+                self.statusBar().showMessage(hint, 5000)
+        rec[field] = cleaned
+        self.clear_error(rec_idx, field)
+        if field in ("age_min", "age_max"):
+            self.clear_error(rec_idx, "age_min")
+            self.clear_error(rec_idx, "age_max")
+        ok, msg = self.validate_record(rec)
+        if not ok:
+            QMessageBox.warning(self, "校验失败", msg)
+            rec[field] = old
+            if "年龄上限必须大于等于年龄下限" in msg:
+                self.mark_error(rec_idx, "age_min", msg)
+                self.mark_error(rec_idx, "age_max", msg)
+            else:
+                self.mark_error(rec_idx, field, msg)
+        else:
+            changed_ok = self.after_field_change(rec, field)
+            if field == "task_name":
+                if changed_ok:
+                    self.clear_error(rec_idx, "task_name")
+                else:
+                    if getattr(self, "_task_name_parse_user_warned", False):
+                        self._task_name_parse_user_warned = False
+                        self.mark_error(rec_idx, "task_name", "任务名码段与列表不匹配")
+                    else:
+                        parse_msg = "任务名未按规范完全解析：已保留原文本，仅同步可识别片段"
+                        self.mark_error(rec_idx, "task_name", parse_msg)
+                        self.statusBar().showMessage(parse_msg, 5000)
+        self.save_data()
+        self.refresh_table()
+
+    def validate_record(self, rec):
+        for k, title in [("quantity", "数量"), ("age_max", "年龄上限"), ("age_min", "年龄下限"), ("pv", "pv")]:
+            v = str(rec.get(k, "")).strip()
+            if v and not v.isdigit():
+                return False, f"{title} 必须是数字"
+        ok_url, url_msg = self.validate_urls(str(rec.get("url", "")))
+        if not ok_url:
+            return False, url_msg
+        if rec.get("quantity", "").strip() == "0":
+            return False, "数量必须大于0"
+        amin, amax = rec.get("age_min", "").strip(), rec.get("age_max", "").strip()
+        if amin and amax and int(amax) < int(amin):
+            return False, "年龄上限必须大于等于年龄下限"
+        return True, ""
+
+    def validate_urls(self, raw: str):
+        text = str(raw or "")
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        for idx, line in enumerate(lines, start=1):
+            if " " in line:
+                return False, f"URL 第{idx}行包含空格，请删除空格"
+            parsed = urlparse(line)
+            if parsed.scheme.lower() not in ("http", "https"):
+                return False, f"URL 第{idx}行必须以 http:// 或 https:// 开头"
+            if not parsed.netloc:
+                return False, f"URL 第{idx}行缺少域名"
+            if len(line) > 2048:
+                return False, f"URL 第{idx}行长度超过 2048"
+        return True, ""
+
+    def validate_export_record(self, rec):
+        required_fields = [
+            ("task_name", "任务名"),
+            ("type_code", "类型"),
+            ("operator_code", "运营商"),
+            ("industry_code", "行业编码"),
+            ("quantity", "数量"),
+            ("duration", "时长"),
+        ]
+        for field, title in required_fields:
+            if not str(rec.get(field, "")).strip():
+                return False, f"{title} 为必填项"
+        tn = str(rec.get("task_name", "")).strip()
+        if "-" not in tn:
+            return False, "任务名格式错误：缺少 '-' 分隔"
+        parsed = self.parse_left(tn.split("-", 1)[0])
+        if not parsed:
+            return False, "任务名格式错误：无法解析运营商/类型/行业编码"
+        if parsed["op"] != rec.get("operator_code", ""):
+            return False, "任务名中的运营商码值与运营商字段不匹配"
+        if parsed["tp"] != rec.get("type_code", ""):
+            return False, "任务名中的类型码值与类型字段不匹配"
+        if parsed["ind"] != rec.get("industry_code", ""):
+            return False, "任务名中的行业编码与行业编码字段不匹配"
+        region_from_task = parsed.get("region", "") or "全国"
+        region_from_fields = self.region_part(rec)
+        if region_from_task != region_from_fields:
+            return False, f"任务名中的地域“{region_from_task}”与字段地域“{region_from_fields}”不匹配"
+        return True, ""
+
+    def region_part(self, rec):
+        p, c = split_multi(rec.get("province", "")), split_multi(rec.get("city", ""))
+        if p and not c:
+            return p[0] if len(p) == 1 else f"{int_to_cn(len(p))}省"
+        if c and not p:
+            return c[0] if len(c) == 1 else f"{int_to_cn(len(c))}市"
+        return "全国"
+
+    def _try_parse_left_region_six(self, left: str) -> tuple[dict | None, list[str]]:
+        """地域（最前中文地域词）+ 紧随 6 位字母数字码；失败时返回 (None, 错误文案列表)。"""
+        reg = find_earliest_region_in_left(left)
+        if not reg:
+            return None, []
+        start, end, region = reg
+        tail = left[end:].lstrip()
+        if len(tail) < 6 or not re.match(r"^[A-Za-z0-9]{6}$", tail[:6]):
+            return None, []
+        code6 = tail[:6]
+        op, tp, ind = code6[0:2], code6[2:4], code6[4:6]
+        errs: list[str] = []
+        if op not in OP_MAP:
+            errs.append(f"运营商编码「{op}」输入不正确")
+        if tp not in TYPE_MAP:
+            errs.append(f"类型编码「{tp}」输入不正确")
+        customer = (left[:start] + tail[6:]).strip() or "客户"
+        if errs:
+            return None, errs
+        return {"customer": customer, "region": region, "op": op, "tp": tp, "ind": ind}, []
+
+    def parse_left_with_errors(self, left: str) -> tuple[dict | None, list[str]]:
+        left = (left or "").strip()
+        if not left:
+            return None, []
+        v2, errs = self._try_parse_left_region_six(left)
+        if errs:
+            return None, errs
+        if v2:
+            return v2, []
+        m = re.search(r"(YD|LT|DX|YX)(DB|DJ|XC|DH|DY)([A-Za-z0-9]+)$", left)
+        if not m:
+            return None, []
+        prefix = left[: m.start()]
+        region, customer = "", prefix
+        for token in sorted(PROVINCES + CITIES + ["全国"], key=len, reverse=True):
+            if prefix.endswith(token):
+                customer, region = prefix[: -len(token)], token
+                break
+        if not region:
+            rm = re.search(r"([一二两三四五六七八九十\d]+[省市])$", prefix)
+            if rm:
+                region = rm.group(1)
+                customer = prefix[: -len(region)]
+        return {"customer": customer or "客户", "region": region, "op": m.group(1), "tp": m.group(2), "ind": m.group(3)}, []
+
+    def parse_left(self, left):
+        d, _ = self.parse_left_with_errors(left)
+        return d
+
+    def build_task_name(self, rec):
+        old = rec.get("task_name", "")
+        product = old.split("-", 1)[1] if "-" in old else "产品"
+        parsed = self.parse_left(old.split("-", 1)[0]) if "-" in old else None
+        customer = parsed["customer"] if parsed else "客户"
+        return f"{customer}{self.region_part(rec)}{rec.get('operator_code') or 'YD'}{rec.get('type_code') or 'DB'}{rec.get('industry_code') or 'DK'}-{product}"
+
+    def parse_task_name(self, rec):
+        self._task_name_parse_user_warned = False
+        tn = rec.get("task_name", "")
+        if "-" not in tn:
+            return False
+        left = tn.split("-", 1)[0]
+        snap = {k: rec.get(k, "") for k in ("operator_code", "type_code", "industry_code", "province", "city")}
+        parsed, errs = self.parse_left_with_errors(left)
+        if errs:
+            for k, v in snap.items():
+                rec[k] = v
+            QMessageBox.warning(self, "任务名", "\n".join(errs))
+            self._task_name_parse_user_warned = True
+            return False
+        if not parsed:
+            return False
+        rec["operator_code"], rec["type_code"], rec["industry_code"] = parsed["op"], parsed["tp"], parsed["ind"]
+        region = parsed["region"]
+        if not region or region == "全国" or re.fullmatch(r"[一二两三四五六七八九十\d]+[省市]", region):
+            rec["province"], rec["city"] = "", ""
+        elif region in PROVINCES:
+            rec["province"], rec["city"] = region, ""
+        elif region in CITIES:
+            rec["city"], rec["province"] = region, ""
+        return True
+
+    def after_field_change(self, rec, field):
+        if field == "province" and rec.get("province", "").strip():
+            rec["city"] = ""
+            rec["exclude_province"] = ""
+            provs = split_multi(rec.get("province", ""))
+            allow = set(cities_under_provinces(provs)) if provs else set()
+            if allow:
+                rec["exclude_city"] = "|".join(x for x in split_multi(rec.get("exclude_city", "")) if x in allow)
+            else:
+                rec["exclude_city"] = ""
+        elif field == "city" and rec.get("city", "").strip():
+            rec["province"] = ""
+            rec["exclude_province"] = ""
+            rec["exclude_city"] = ""
+        if field == "exclude_province" and rec.get("exclude_province", "").strip():
+            rec["province"] = ""
+            rec["city"] = ""
+        if field == "exclude_city" and rec.get("exclude_city", "").strip():
+            rec["city"] = ""
+        if field == "task_name":
+            return self.parse_task_name(rec)
+        elif field in ("province", "city", "type_code", "operator_code", "industry_code"):
+            rec["task_name"] = self.build_task_name(rec)
+        return True
+
+    def export_customer_name(self, rec):
+        task_name = str(rec.get("task_name", "")).strip()
+        left = task_name.split("-", 1)[0] if "-" in task_name else task_name
+        parsed = self.parse_left(left) if left else None
+        if parsed and str(parsed.get("customer", "")).strip():
+            return sanitize_filename(str(parsed["customer"])[:12])
+        fallback = left[:12] if left else "客户"
+        return sanitize_filename(fallback)
+
+    def export_excel(self):
+        selected_with_index = [(idx, r) for idx, r in enumerate(self.records) if r.get("checked")]
+        if not selected_with_index:
+            QMessageBox.information(self, "提示", "请先勾选至少一条记录")
+            return
+        include_url = self.chk_print_url.isChecked()
+        selected = [x[1] for x in selected_with_index]
+        # 导出前做一次全量校验，避免写出不合规数据。
+        has_invalid = False
+        for rec_idx, rec in selected_with_index:
+            for k in ("task_name", "type_code", "operator_code", "industry_code", "quantity", "duration", "age_max", "age_min", "pv"):
+                self.clear_error(rec_idx, k)
+            ok, msg = self.validate_record(rec)
+            if ok:
+                ok, msg = self.validate_export_record(rec)
+            if ok:
+                continue
+            has_invalid = True
+            if "年龄上限必须大于等于年龄下限" in msg:
+                self.mark_error(rec_idx, "age_min", msg)
+                self.mark_error(rec_idx, "age_max", msg)
+            elif "运营商" in msg:
+                self.mark_error(rec_idx, "operator_code", msg)
+                self.mark_error(rec_idx, "task_name", msg)
+            elif "类型" in msg:
+                self.mark_error(rec_idx, "type_code", msg)
+                self.mark_error(rec_idx, "task_name", msg)
+            elif "行业编码" in msg:
+                self.mark_error(rec_idx, "industry_code", msg)
+                self.mark_error(rec_idx, "task_name", msg)
+            elif "任务名中的地域" in msg:
+                self.mark_error(rec_idx, "task_name", msg)
+                self.mark_error(rec_idx, "province", msg)
+                self.mark_error(rec_idx, "city", msg)
+            elif "数量必须大于0" in msg or "数量" in msg:
+                self.mark_error(rec_idx, "quantity", msg)
+            elif "年龄上限" in msg:
+                self.mark_error(rec_idx, "age_max", msg)
+            elif "年龄下限" in msg:
+                self.mark_error(rec_idx, "age_min", msg)
+            elif "pv" in msg:
+                self.mark_error(rec_idx, "pv", msg)
+            elif "URL" in msg:
+                self.mark_error(rec_idx, "url", msg)
+            elif "时长" in msg:
+                self.mark_error(rec_idx, "duration", msg)
+            elif "任务名" in msg:
+                self.mark_error(rec_idx, "task_name", msg)
+        if has_invalid:
+            self.refresh_table()
+            QMessageBox.warning(self, "导出失败", "选中记录存在必填缺失或任务名关联不匹配（已标红），请修正后再导出")
+            return
+        if not TEMPLATE_FILE.exists():
+            QMessageBox.warning(self, "导出失败", f"模板不存在: {TEMPLATE_FILE.name}")
+            return
+        wb = load_workbook(TEMPLATE_FILE)
+        ws = wb[wb.sheetnames[0]]
+        col_map = {"task_name": "A", "type_code": "B", "operator_code": "C", "industry_code": "D", "url": "E", "quantity": "F", "duration": "G", "age_max": "H", "age_min": "I", "pv": "J", "province": "K", "exclude_province": "L", "city": "M", "exclude_city": "N"}
+        start_row = 2
+        for r in range(start_row, ws.max_row + 1):
+            for f, c in col_map.items():
+                ws[f"{c}{r}"].value = None
+        for idx, rec in enumerate(selected):
+            rr = start_row + idx
+            for f, c in col_map.items():
+                if f == "url":
+                    raw_url = str(rec.get("url", ""))
+                    if include_url:
+                        lines = [line for line in raw_url.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+                        ws[f"{c}{rr}"] = "\r\n".join(lines)
+                    else:
+                        ws[f"{c}{rr}"] = ""
+                elif f == "type_code":
+                    ws[f"{c}{rr}"] = TYPE_MAP.get(rec.get(f, ""), "")
+                elif f == "operator_code":
+                    ws[f"{c}{rr}"] = OP_MAP.get(rec.get(f, ""), "")
+                else:
+                    ws[f"{c}{rr}"] = rec.get(f, "")
+        customer = self.export_customer_name(selected[0])
+        filename = f"{customer}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        out_file, _ = QFileDialog.getSaveFileName(self, "保存导出文件", str(APP_DIR / filename), "Excel (*.xlsx)")
+        if not out_file:
+            return
+        wb.save(out_file)
+        QMessageBox.information(self, "导出成功", f"已导出: {out_file}")
+
+
+def _show_license_expired_dialog() -> None:
+    """无控制台（pythonw）时也必须能看见提示。"""
+    box = QMessageBox()
+    box.setIcon(QMessageBox.Icon.Critical)
+    box.setWindowTitle("授权已过期")
+    box.setText(_LICENSE_EXPIRED_MSG)
+    box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+    box.exec()
+
+
+def main():
+    app = QApplication(sys.argv)
+    if not is_license_valid():
+        _show_license_expired_dialog()
+        sys.exit(0)
+    ui_font = QFont()
+    ui_font.setFamilies(["Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", "PingFang SC"])
+    ui_font.setPointSize(10)
+    ui_font.setWeight(QFont.Weight.Medium)
+    app.setFont(ui_font)
+    try:
+        win = BillApp()
+        win.show()
+    except Exception:
+        import traceback
+
+        err_path = Path(os.environ.get("TEMP", os.environ.get("TMP", "."))) / "TidanMgr_startup_error.log"
+        try:
+            err_path.write_text(traceback.format_exc(), encoding="utf-8")
+        except OSError:
+            pass
+        QMessageBox.critical(
+            None,
+            "启动失败",
+            f"程序启动异常，详情已尝试写入：\n{err_path}\n\n{traceback.format_exc()[-800:]}",
+        )
+        sys.exit(1)
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

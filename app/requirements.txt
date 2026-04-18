@@ -1,0 +1,3 @@
+openpyxl
+pyinstaller
+PySide6

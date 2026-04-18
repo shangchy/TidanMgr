@@ -1,0 +1,5 @@
+请将导出模板文件放在本目录，文件名固定为：
+template.xlsx
+
+当前程序和打包脚本都按此路径读取模板：
+app/template.xlsx
