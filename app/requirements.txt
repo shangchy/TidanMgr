@@ -1,3 +1,4 @@
 openpyxl
 pyinstaller
-PySide6
+# PySide6 6.7+ 所带 Qt 预编译库最低要求 macOS 13；锁在 6.6.x 以便 macOS 12（Monterey）仍可运行。
+PySide6>=6.5.2,<6.7.0
