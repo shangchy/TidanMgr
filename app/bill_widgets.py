@@ -10,6 +10,7 @@ from PySide6.QtGui import (
     QFont,
     QFontMetricsF,
     QGuiApplication,
+    QLinearGradient,
     QPainter,
     QPen,
     QPixmap,
@@ -39,6 +40,22 @@ from PySide6.QtWidgets import (
 )
 
 from bill_constants import PRINT_LOG_DATA_FIELDS
+
+
+def paint_frozen_select_all_header_section(
+    painter: QPainter,
+    rect: QRect,
+    *,
+    dark: bool,
+    glyph: str,
+) -> None:
+    """冻结/打印记录表首列：彩色圆角芯片 + 对号 / X（语义同全选 / 取消全选），在格内居中。"""
+    kind = glyph if glyph in ("check", "check_partial", "x", "check_muted") else "check_muted"
+    side = int(max(18, min(26, min(rect.width(), rect.height()) - 4)))
+    pm = make_header_select_chip_pixmap(kind=kind, dark=dark, size=side)
+    x = rect.left() + (rect.width() - pm.width()) // 2
+    y = rect.top() + (rect.height() - pm.height()) // 2
+    painter.drawPixmap(x, y, pm)
 
 
 def make_sidebar_logo_pixmap(*, dark: bool, size: int = 44) -> QPixmap:
@@ -96,6 +113,103 @@ def make_sidebar_logo_pixmap(*, dark: bool, size: int = 44) -> QPixmap:
         bh = 5.5 if i != 2 else 7.0
         painter.drawRect(QRectF(bx0, by - bh, bw, bh))
         bx0 += bw + 1.4
+    painter.end()
+    return pm
+
+
+def make_header_select_chip_pixmap(*, kind: str, dark: bool, size: int = 22) -> QPixmap:
+    """圆角渐变底：绿对号全选、琥珀对号部分、红 X 取消全选、灰对号不可用。"""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    rr = QRectF(1.0, 1.0, float(size) - 2.0, float(size) - 2.0)
+    rad = max(4.0, float(size) * 0.24)
+
+    if kind == "check_muted":
+        if dark:
+            c1, c2 = QColor(72, 78, 98), QColor(48, 54, 72)
+        else:
+            c1, c2 = QColor(196, 202, 216), QColor(156, 164, 180)
+    elif kind == "x":
+        if dark:
+            c1, c2 = QColor(251, 113, 133), QColor(190, 18, 60)
+        else:
+            c1, c2 = QColor(253, 164, 175), QColor(225, 29, 72)
+    elif kind == "check_partial":
+        if dark:
+            c1, c2 = QColor(251, 191, 36), QColor(217, 119, 6)
+        else:
+            c1, c2 = QColor(253, 224, 71), QColor(245, 158, 11)
+    else:
+        if dark:
+            c1, c2 = QColor(52, 211, 153), QColor(5, 150, 105)
+        else:
+            c1, c2 = QColor(110, 231, 183), QColor(22, 163, 74)
+
+    grad = QLinearGradient(rr.topLeft(), rr.bottomRight())
+    grad.setColorAt(0, c1)
+    grad.setColorAt(1, c2)
+    border_a = 50 if dark else 70
+    painter.setPen(QPen(QColor(255, 255, 255, border_a), 1.0))
+    painter.setBrush(QBrush(grad))
+    painter.drawRoundedRect(rr, rad, rad)
+
+    if kind == "check_muted":
+        sign = QColor(235, 236, 245) if dark else QColor(65, 75, 90)
+    else:
+        sign = QColor(255, 255, 255)
+    lw = max(2.0, float(size) * 0.12)
+    pen = QPen(sign, lw)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    fs = float(size)
+    if kind == "x":
+        m = fs * 0.3
+        painter.drawLine(QPointF(m, m), QPointF(fs - m, fs - m))
+        painter.drawLine(QPointF(fs - m, m), QPointF(m, fs - m))
+    else:
+        ax, ay = fs * 0.26, fs * 0.48
+        bx, by = fs * 0.4, fs * 0.62
+        cx, cy = fs * 0.74, fs * 0.32
+        painter.drawPolyline(QPolygonF([QPointF(ax, ay), QPointF(bx, by), QPointF(cx, cy)]))
+    painter.end()
+    return pm
+
+
+def make_sidebar_chevrons_pixmap(*, collapse: bool, dark: bool, size: int = 24) -> QPixmap:
+    """实心三角：未展开侧栏为 <>（尖角朝外），已展开为 ><（尖角朝内）。"""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    if dark:
+        c = QColor(186, 200, 255)
+    else:
+        c = QColor(37, 99, 235)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(c))
+    fs = float(size)
+    m = fs * 0.1
+    tw = fs * 0.26
+    mid = fs * 0.5
+    if collapse:
+        left = QPolygonF(
+            [QPointF(m, m), QPointF(m, fs - m), QPointF(m + tw * 1.35, mid)]
+        )
+        right = QPolygonF(
+            [QPointF(fs - m, m), QPointF(fs - m, fs - m), QPointF(fs - m - tw * 1.35, mid)]
+        )
+    else:
+        left = QPolygonF(
+            [QPointF(m + tw * 1.25, m), QPointF(m + tw * 1.25, fs - m), QPointF(m, mid)]
+        )
+        right = QPolygonF(
+            [QPointF(fs - m - tw * 1.25, m), QPointF(fs - m - tw * 1.25, fs - m), QPointF(fs - m, mid)]
+        )
+    painter.drawPolygon(left)
+    painter.drawPolygon(right)
     painter.end()
     return pm
 
@@ -364,6 +478,14 @@ class HoverFilterHeaderView(QHeaderView):
 
     def paintSection(self, painter: QPainter, rect: QRect, logical_index: int):
         super().paintSection(painter, rect, logical_index)
+        if logical_index == 0 and self._mode in ("main_frozen", "hist_frozen", "print_rec"):
+            info = self._bill._select_all_header_paint_info(self._mode)
+            paint_frozen_select_all_header_section(
+                painter,
+                rect,
+                dark=self._bill.theme == "dark",
+                glyph=str(info.get("glyph", "plus_muted")),
+            )
         if self._hover_section != logical_index:
             return
         if not self._bill._header_show_filter_btn(self._mode, logical_index):

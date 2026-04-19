@@ -180,6 +180,20 @@ def first_url(value: str) -> str:
     return ""
 
 
+def url_lines_for_filter(raw: Any) -> list[str]:
+    """多行 URL 拆成去重后的非空行列表；无有效行时为 [\"\"] 供筛选空单元格。"""
+    text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in text.split("\n"):
+        t = line.strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out if out else [""]
+
+
 def sanitize_filename(text: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", str(text or "")).strip() or "客户"
 

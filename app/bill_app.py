@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import shutil
 import sys
 import uuid
 from datetime import datetime
@@ -10,14 +9,16 @@ from typing import Any
 from urllib.parse import urlparse
 
 from openpyxl import load_workbook
-from PySide6.QtCore import QEvent, QObject, QModelIndex, QPoint, QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QModelIndex, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QDesktopServices,
     QFont,
     QFontMetrics,
     QFontMetricsF,
     QGuiApplication,
+    QIcon,
     QPainter,
     QPainterPath,
     QPen,
@@ -50,6 +51,7 @@ from bill_constants import (
     find_earliest_region_in_left,
     first_url,
     int_to_cn,
+    url_lines_for_filter,
     sanitize_filename,
     split_multi,
     cities_under_provinces,
@@ -72,6 +74,7 @@ from bill_widgets import (
     HoverFilterHeaderView,
     MultiSelectDialog,
     UrlCellEditor,
+    make_sidebar_chevrons_pixmap,
     make_sidebar_logo_pixmap,
     style_combo_centered,
 )
@@ -223,6 +226,8 @@ class BillApp(QMainWindow):
         sidebar_layout.addWidget(self.nav_settings)
         sidebar_layout.addStretch(1)
         root.addWidget(self.sidebar)
+        # 窗口 show 之前 sidebar.isVisible() 常为 False，故用逻辑状态驱动侧栏按钮图标/提示
+        self._sidebar_visible = True
 
         main_wrap = QWidget()
         main_wrap.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
@@ -246,8 +251,10 @@ class BillApp(QMainWindow):
         top = QHBoxLayout()
         top.setContentsMargins(16, 12, 16, 12)
         top.setSpacing(12)
-        self.btn_toggle_sidebar = QPushButton("📂 菜单")
+        self.btn_toggle_sidebar = QPushButton()
         self.btn_toggle_sidebar.setObjectName("btnGhost")
+        self.btn_toggle_sidebar.setIconSize(QSize(24, 24))
+        self.btn_toggle_sidebar.setMinimumSize(36, 30)
         self.btn_toggle_sidebar.clicked.connect(self.toggle_sidebar)
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索任务名...")
@@ -260,14 +267,14 @@ class BillApp(QMainWindow):
         btn_clear.setObjectName("btnGhost")
         btn_clear.clicked.connect(self.clear_bill_search_and_filters)
         self.chk_print_url = QCheckBox("是否打印URL")
-        self.lbl_hint = QLabel(
-            "未勾选：导出文件中 URL 列为空。勾选：仅「允许」为是的行写入 URL。"
-        )
-        self.lbl_hint.setObjectName("hintLabel")
-        # 说明在复选框下方一行区域展示；窄宽度时允许折行
-        self.lbl_hint.setWordWrap(True)
-        self.lbl_hint.setMinimumWidth(0)
-        self.lbl_hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.lbl_print_url_hint_off = QLabel("未勾选：导出文件中 URL 列为空。")
+        self.lbl_print_url_hint_on = QLabel("勾选：仅「允许」为是的行写入 URL。")
+        for lb in (self.lbl_print_url_hint_off, self.lbl_print_url_hint_on):
+            lb.setObjectName("hintLabel")
+            lb.setWordWrap(True)
+            lb.setMinimumWidth(0)
+            lb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.chk_print_url.toggled.connect(self._update_print_url_hint_lines_style)
         self.btn_print = QPushButton("🖨 打印")
         self.btn_print.setObjectName("btnAccent")
         self.btn_print.clicked.connect(self.export_excel)
@@ -288,7 +295,9 @@ class BillApp(QMainWindow):
         print_opt_layout.addWidget(
             self.chk_print_url, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
-        print_opt_layout.addWidget(self.lbl_hint, 0)
+        print_opt_layout.addWidget(self.lbl_print_url_hint_off, 0)
+        print_opt_layout.addWidget(self.lbl_print_url_hint_on, 0)
+        self._update_print_url_hint_lines_style()
         sep1 = QFrame()
         sep1.setObjectName("toolbarSep")
         sep1.setFrameShape(QFrame.VLine)
@@ -313,7 +322,8 @@ class BillApp(QMainWindow):
         split_lo.setSpacing(0)
         self.table_frozen = QTableWidget(0, FROZEN_COLUMNS)
         self.table_frozen.setObjectName("tableFrozenCol")
-        self.table_frozen.setHorizontalHeaderLabels([HEADERS["checked"], HEADERS["task_name"]])
+        # 首列勾选：表头文案由 HoverFilterHeaderView 自绘（图标+全选/取消全选），此处占位为空
+        self.table_frozen.setHorizontalHeaderLabels(["", HEADERS["task_name"]])
         self.table_frozen.verticalHeader().setVisible(False)
         self.table_frozen.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_frozen.setAlternatingRowColors(True)
@@ -357,6 +367,7 @@ class BillApp(QMainWindow):
         hdr_main_f.sectionClicked.connect(self._on_main_frozen_header_section_clicked)
         hdr_main_s.sectionClicked.connect(self._on_main_scroll_header_clicked)
         self.table.horizontalHeader().sectionResized.connect(self._on_main_scroll_column_resized_for_url)
+        self.table.horizontalHeader().sectionResized.connect(self._on_main_scroll_column_resized_sync_check_width)
         self.table_frozen.horizontalHeader().sectionResized.connect(self._on_main_frozen_section_resized)
         self.table.verticalScrollBar().valueChanged.connect(lambda v: self._sync_main_v_scroll(v, "scroll"))
         self.table_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_main_v_scroll(v, "frozen"))
@@ -412,7 +423,7 @@ class BillApp(QMainWindow):
         hist_lo.setSpacing(0)
         self.history_table_frozen = QTableWidget(0, FROZEN_COLUMNS)
         self.history_table_frozen.setObjectName("tableFrozenCol")
-        self.history_table_frozen.setHorizontalHeaderLabels([HEADERS["checked"], HEADERS["task_name"]])
+        self.history_table_frozen.setHorizontalHeaderLabels(["", HEADERS["task_name"]])
         self.history_table_frozen.verticalHeader().setVisible(False)
         self.history_table_frozen.setSelectionBehavior(QTableWidget.SelectRows)
         self.history_table_frozen.setAlternatingRowColors(True)
@@ -444,6 +455,7 @@ class BillApp(QMainWindow):
         self.history_table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         hdr_hist_f.sectionClicked.connect(self._on_hist_frozen_header_section_clicked)
         hdr_hist_s.sectionClicked.connect(self._on_history_scroll_header_clicked)
+        self.history_table.horizontalHeader().sectionResized.connect(self._on_hist_scroll_column_resized_sync_check_width)
         self.history_table_frozen.horizontalHeader().sectionResized.connect(self._on_hist_frozen_section_resized)
         self.history_table.verticalScrollBar().valueChanged.connect(lambda v: self._sync_hist_v_scroll(v, "scroll"))
         self.history_table_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_hist_v_scroll(v, "frozen"))
@@ -482,7 +494,7 @@ class BillApp(QMainWindow):
         pl_top.addWidget(self.btn_print_log_delete)
         pl_layout.addLayout(pl_top)
 
-        pl_headers = [HEADERS["checked"]] + [PRINT_LOG_HEADERS[k] for k in PRINT_LOG_DATA_FIELDS] + ["操作"]
+        pl_headers = [""] + [PRINT_LOG_HEADERS[k] for k in PRINT_LOG_DATA_FIELDS] + ["操作"]
         self.print_log_table = QTableWidget(0, PRINT_LOG_COL_COUNT)
         self.print_log_table.setObjectName("historyScrollPart")
         self.print_log_table.setHorizontalHeaderLabels(pl_headers)
@@ -537,16 +549,16 @@ class BillApp(QMainWindow):
         # 与滚动区列顺序一致：类型…行业、「允许」、URL…；长度须 >= MAIN_SCROLL_COLUMNS+1（含 col_widths[0] 给冻结任务名列）
         # 滚动区列序与 col_widths[1:] 对齐；末四列为 提单时间、打印次数、打印时间、操作（原打印相关宽顺序已随列序调整）
         col_widths = [260, 150, 150, 120, 72, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 168, 170, 72, 90, 100]
-        self.table_frozen.setColumnWidth(0, 42)
         self.table_frozen.setColumnWidth(1, col_widths[0])
         for s in range(MAIN_SCROLL_COLUMNS):
             self.table.setColumnWidth(s, col_widths[s + 1])
-        self.history_table_frozen.setColumnWidth(0, 42)
+        self._sync_main_frozen_check_column_width()
         self.history_table_frozen.setColumnWidth(1, col_widths[0])
         hist_widths = col_widths + [160]
         for s in range(HISTORY_SCROLL_COLUMNS):
             self.history_table.setColumnWidth(s, hist_widths[s + 1])
-        self.print_log_table.setColumnWidth(0, 44)
+        self._sync_hist_frozen_check_column_width()
+        self.print_log_table.setColumnWidth(0, 100)
         _pw = [300, 168, 88, 100, 88, 380, 168]
         for s, w in enumerate(_pw, start=1):
             self.print_log_table.setColumnWidth(s, w)
@@ -576,12 +588,42 @@ class BillApp(QMainWindow):
         self._bill_post_show_geo = True
         QTimer.singleShot(0, self._apply_initial_window_geometry)
 
-    def _on_main_frozen_section_resized(self, *_args):
-        """冻结区仅横向不滚动：勾选列固定宽，任务名列可调；总宽随两列之和更新。"""
+    def _sync_main_frozen_check_column_width(self):
+        """冻结首列宽与右侧滚动表中「允许」列一致。"""
         hf = self.table_frozen.horizontalHeader()
         hf.blockSignals(True)
         try:
-            w0 = max(36, self.table_frozen.columnWidth(0))
+            w = max(52, self.table.columnWidth(ALLOW_PRINT_SCROLL_COL))
+            self.table_frozen.setColumnWidth(0, w)
+        finally:
+            hf.blockSignals(False)
+        self._on_main_frozen_section_resized()
+
+    def _sync_hist_frozen_check_column_width(self):
+        hf = self.history_table_frozen.horizontalHeader()
+        hf.blockSignals(True)
+        try:
+            w = max(52, self.history_table.columnWidth(ALLOW_PRINT_SCROLL_COL))
+            self.history_table_frozen.setColumnWidth(0, w)
+        finally:
+            hf.blockSignals(False)
+        self._on_hist_frozen_section_resized()
+
+    def _on_main_scroll_column_resized_sync_check_width(self, logical_index: int, _old: int, _new: int):
+        if logical_index == ALLOW_PRINT_SCROLL_COL:
+            self._sync_main_frozen_check_column_width()
+
+    def _on_hist_scroll_column_resized_sync_check_width(self, logical_index: int, _old: int, _new: int):
+        if logical_index == ALLOW_PRINT_SCROLL_COL:
+            self._sync_hist_frozen_check_column_width()
+
+    def _on_main_frozen_section_resized(self, *_args):
+        """冻结区仅横向不滚动：首列随「允许」列宽，任务名列可调；总宽随两列之和更新。"""
+        hf = self.table_frozen.horizontalHeader()
+        hf.blockSignals(True)
+        try:
+            w_allow = max(52, self.table.columnWidth(ALLOW_PRINT_SCROLL_COL))
+            w0 = w_allow
             w1 = max(120, min(self.table_frozen.columnWidth(1), 2000))
             self.table_frozen.setColumnWidth(0, w0)
             self.table_frozen.setColumnWidth(1, w1)
@@ -593,7 +635,8 @@ class BillApp(QMainWindow):
         hf = self.history_table_frozen.horizontalHeader()
         hf.blockSignals(True)
         try:
-            w0 = max(36, self.history_table_frozen.columnWidth(0))
+            w_allow = max(52, self.history_table.columnWidth(ALLOW_PRINT_SCROLL_COL))
+            w0 = w_allow
             w1 = max(120, min(self.history_table_frozen.columnWidth(1), 2000))
             self.history_table_frozen.setColumnWidth(0, w0)
             self.history_table_frozen.setColumnWidth(1, w1)
@@ -615,6 +658,20 @@ class BillApp(QMainWindow):
     def apply_theme(self):
         self.setStyleSheet(STYLESHEET_DARK if self.theme == "dark" else STYLESHEET_LIGHT)
         self._refresh_sidebar_logo()
+        self._refresh_sidebar_toggle_button()
+        self._update_print_url_hint_lines_style()
+
+    def _refresh_sidebar_toggle_button(self):
+        """侧栏开：实心 ><（收起）；侧栏关：实心 <>（展开）。"""
+        dark = self.theme == "dark"
+        visible = bool(getattr(self, "_sidebar_visible", True))
+        pm = make_sidebar_chevrons_pixmap(collapse=visible, dark=dark, size=24)
+        self.btn_toggle_sidebar.setIcon(QIcon(pm))
+        self.btn_toggle_sidebar.setText("")
+        if visible:
+            self.btn_toggle_sidebar.setToolTip("隐藏侧栏菜单")
+        else:
+            self.btn_toggle_sidebar.setToolTip("展开侧栏菜单")
 
     def _refresh_sidebar_logo(self):
         if not hasattr(self, "_sidebar_logo_icon"):
@@ -627,9 +684,22 @@ class BillApp(QMainWindow):
         self.save_theme()
 
     def toggle_sidebar(self):
-        visible = not self.sidebar.isVisible()
-        self.sidebar.setVisible(visible)
-        self.btn_toggle_sidebar.setText("📂 菜单" if visible else "📂 展开")
+        self._sidebar_visible = not bool(getattr(self, "_sidebar_visible", True))
+        self.sidebar.setVisible(self._sidebar_visible)
+        self._refresh_sidebar_toggle_button()
+
+    def _update_print_url_hint_lines_style(self, *_args):
+        """未勾选 / 勾选说明各占一行；当前状态对应行加粗。"""
+        if not hasattr(self, "lbl_print_url_hint_off"):
+            return
+        checked = self.chk_print_url.isChecked()
+        base = self.font()
+        f_on = QFont(base)
+        f_on.setBold(True)
+        f_off = QFont(base)
+        f_off.setBold(False)
+        self.lbl_print_url_hint_off.setFont(f_on if not checked else f_off)
+        self.lbl_print_url_hint_on.setFont(f_on if checked else f_off)
 
     def _restyle_sidebar_nav(self, page: str):
         styles = {
@@ -906,13 +976,14 @@ class BillApp(QMainWindow):
         it = self.print_log_table.horizontalHeaderItem(0)
         if not it:
             return
+        info = self._select_all_header_paint_info("print_rec")
         if not self.print_log_filtered_indices:
-            it.setText("☐")
-            return
-        checked_count = sum(1 for i in self.print_log_filtered_indices if self.print_records[i].get("checked"))
-        n = len(self.print_log_filtered_indices)
-        symbol = "☐" if checked_count == 0 else ("☑" if checked_count == n else "◩")
-        it.setText(symbol)
+            it.setToolTip("当前筛选下列表为空")
+        elif info["glyph"] == "x":
+            it.setToolTip("单击：取消全选（清除当前列表中所有勾选）")
+        else:
+            it.setToolTip("单击：全选（将当前列表全部行设为勾选；部分勾选时则全选）")
+        self.print_log_table.horizontalHeader().viewport().update()
 
     def _on_print_log_header_col0_clicked(self):
         if not self.print_log_filtered_indices:
@@ -1036,9 +1107,9 @@ class BillApp(QMainWindow):
             bp = QPushButton("预览")
             bp.setObjectName("btnGhost")
             bp.clicked.connect(lambda _=False, p=pth: self.preview_print_record_file(p))
-            bd = QPushButton("下载")
+            bd = QPushButton("打开")
             bd.setObjectName("btnGhost")
-            bd.clicked.connect(lambda _=False, p=pth: self.download_print_record_file(p))
+            bd.clicked.connect(lambda _=False, p=pth: self.open_print_record_file(p))
             al.addWidget(bp)
             al.addWidget(bd)
             self.print_log_table.setCellWidget(row, 7, act)
@@ -1100,22 +1171,14 @@ class BillApp(QMainWindow):
         lo.addWidget(bb)
         dlg.exec()
 
-    def download_print_record_file(self, path: str):
+    def open_print_record_file(self, path: str):
         p = Path(path)
         if not p.is_file():
-            QMessageBox.warning(self, "下载", "文件不存在或已被移动。")
+            QMessageBox.warning(self, "打开", "文件不存在或已被移动。")
             return
-        dest, _ = QFileDialog.getSaveFileName(
-            self, "保存副本", str(Path.home() / p.name), "Excel (*.xlsx);;所有文件 (*.*)"
-        )
-        if not dest:
-            return
-        try:
-            shutil.copy2(p, dest)
-        except OSError as e:
-            QMessageBox.warning(self, "下载失败", str(e))
-            return
-        QMessageBox.information(self, "下载", f"已保存至:\n{dest}")
+        url = QUrl.fromLocalFile(str(p.resolve()))
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(self, "打开失败", "系统无法用默认应用打开该文件。")
 
     def delete_selected_print_records(self):
         to_del = [i for i, r in enumerate(self.print_records) if r.get("checked")]
@@ -1276,12 +1339,14 @@ class BillApp(QMainWindow):
         it = self.history_table_frozen.horizontalHeaderItem(0)
         if not it:
             return
+        info = self._select_all_header_paint_info("hist_frozen")
         if not self.history_filtered_indices:
-            it.setText("☐")
-            return
-        checked_count = sum(1 for i in self.history_filtered_indices if self.history_records[i].get("checked"))
-        symbol = "☐" if checked_count == 0 else ("☑" if checked_count == len(self.history_filtered_indices) else "◩")
-        it.setText(symbol)
+            it.setToolTip("当前筛选下列表为空")
+        elif info["glyph"] == "x":
+            it.setToolTip("单击：取消全选（清除当前列表中所有勾选）")
+        else:
+            it.setToolTip("单击：全选（将当前列表全部行设为勾选；部分勾选时则全选）")
+        self.history_table_frozen.horizontalHeader().viewport().update()
 
     def on_history_cell_clicked(self, row, col):
         if self.updating_table or col != 0:
@@ -1508,6 +1573,10 @@ class BillApp(QMainWindow):
                 allowed = {BillApp._created_at_filter_key(x) for x in vals}
                 if dk not in allowed:
                     return False
+            elif field == "url":
+                cell_lines = set(url_lines_for_filter(rec.get("url", "")))
+                if not (cell_lines & set(vals)):
+                    return False
             elif self._cell_display_for_filter_main(rec, field) not in vals:
                 return False
         return True
@@ -1523,6 +1592,12 @@ class BillApp(QMainWindow):
             if query and query not in str(r.get("task_name", "")).lower():
                 continue
             if not self._main_row_matches_header_filters_except(i, field):
+                continue
+            if field == "url":
+                for dv in url_lines_for_filter(r.get("url", "")):
+                    if dv not in seen:
+                        seen.add(dv)
+                        out.append(dv)
                 continue
             dv = self._cell_display_for_filter_main(r, field)
             if dv not in seen:
@@ -1826,6 +1901,10 @@ class BillApp(QMainWindow):
                 allowed = {BillApp._created_at_filter_key(x) for x in vals}
                 if dk not in allowed:
                     return False
+            elif field == "url":
+                cell_lines = set(url_lines_for_filter(rec.get("url", "")))
+                if not (cell_lines & set(vals)):
+                    return False
             elif self._cell_display_for_filter_hist(rec, field) not in vals:
                 return False
         return True
@@ -1841,6 +1920,12 @@ class BillApp(QMainWindow):
             if query and query not in str(r.get("task_name", "")).lower():
                 continue
             if not self._history_row_matches_header_filters_except(r, field):
+                continue
+            if field == "url":
+                for dv in url_lines_for_filter(r.get("url", "")):
+                    if dv not in seen:
+                        seen.add(dv)
+                        out.append(dv)
                 continue
             dv = self._cell_display_for_filter_hist(r, field)
             if dv not in seen:
@@ -2173,13 +2258,41 @@ class BillApp(QMainWindow):
         self._update_main_header_tooltips()
         self.updating_table = False
 
+    def _select_all_header_paint_info(self, mode: str) -> dict[str, Any]:
+        """冻结区/打印记录首列表头：对号 / X 芯片（绿对号全选、琥珀部分、红 X 取消、灰对号无行）。"""
+        if mode == "main_frozen":
+            indices = self.filtered_indices
+            records = self.records
+        elif mode == "hist_frozen":
+            indices = self.history_filtered_indices
+            records = self.history_records
+        elif mode == "print_rec":
+            indices = self.print_log_filtered_indices
+            records = self.print_records
+        else:
+            return {"glyph": "check_muted", "interactive": False}
+        if not indices:
+            return {"glyph": "check_muted", "interactive": False}
+        n = len(indices)
+        checked_count = sum(1 for i in indices if records[i].get("checked"))
+        if checked_count == n:
+            return {"glyph": "x", "interactive": True}
+        if checked_count == 0:
+            return {"glyph": "check", "interactive": True}
+        return {"glyph": "check_partial", "interactive": True}
+
     def update_header_check(self):
-        if not self.filtered_indices:
-            self.table_frozen.horizontalHeaderItem(0).setText("☐")
+        it = self.table_frozen.horizontalHeaderItem(0)
+        if not it:
             return
-        checked_count = sum(1 for i in self.filtered_indices if self.records[i].get("checked"))
-        symbol = "☐" if checked_count == 0 else ("☑" if checked_count == len(self.filtered_indices) else "◩")
-        self.table_frozen.horizontalHeaderItem(0).setText(symbol)
+        info = self._select_all_header_paint_info("main_frozen")
+        if not self.filtered_indices:
+            it.setToolTip("当前筛选下列表为空")
+        elif info["glyph"] == "x":
+            it.setToolTip("单击：取消全选（清除当前列表中所有勾选）")
+        else:
+            it.setToolTip("单击：全选（将当前列表全部行设为勾选；部分勾选时则全选）")
+        self.table_frozen.horizontalHeader().viewport().update()
 
     def on_header_clicked(self, section):
         if section != 0:
@@ -2609,6 +2722,15 @@ class BillApp(QMainWindow):
         self.field_errors.pop((rec_idx, field), None)
         self.field_error_msgs.pop((rec_idx, field), None)
 
+    def _clear_field_errors_for_row(self, rec_idx: int):
+        """移除该行所有单元格校验标红（用于导出前重算、避免残留背景色）。"""
+        for k in list(self.field_errors.keys()):
+            if k[0] == rec_idx:
+                self.field_errors.pop(k, None)
+        for k in list(self.field_error_msgs.keys()):
+            if k[0] == rec_idx:
+                self.field_error_msgs.pop(k, None)
+
     def _shift_field_errors_after_insert(self, insert_at: int):
         """在 insert_at 插入空行后，原索引 >= insert_at 的校验错误键整体 +1。"""
         new_err: dict[tuple[int, str], bool] = {}
@@ -2861,7 +2983,12 @@ class BillApp(QMainWindow):
         return sanitize_filename(fallback)
 
     def export_excel(self):
-        selected_with_index = [(idx, r) for idx, r in enumerate(self.records) if r.get("checked")]
+        # 与当前表格一致：按 filtered_indices 的显示顺序，仅导出当前页可见且勾选的行
+        selected_with_index: list[tuple[int, dict[str, Any]]] = []
+        for rec_idx in self.filtered_indices:
+            rec = self.records[rec_idx]
+            if rec.get("checked"):
+                selected_with_index.append((rec_idx, rec))
         if not selected_with_index:
             QMessageBox.information(self, "提示", "请先勾选至少一条记录")
             return
@@ -2870,8 +2997,7 @@ class BillApp(QMainWindow):
         # 导出前做一次全量校验，避免写出不合规数据。
         has_invalid = False
         for rec_idx, rec in selected_with_index:
-            for k in ("task_name", "type_code", "operator_code", "industry_code", "quantity", "duration", "age_max", "age_min", "pv"):
-                self.clear_error(rec_idx, k)
+            self._clear_field_errors_for_row(rec_idx)
             ok, msg = self.validate_record(rec)
             if ok:
                 ok, msg = self.validate_export_record(rec)
@@ -2912,6 +3038,7 @@ class BillApp(QMainWindow):
             self.refresh_table()
             QMessageBox.warning(self, "导出失败", "选中记录存在必填缺失或任务名关联不匹配（已标红），请修正后再导出")
             return
+        self.refresh_table()
         if not TEMPLATE_FILE.exists():
             QMessageBox.warning(self, "导出失败", f"模板不存在: {TEMPLATE_FILE.name}")
             return
@@ -2945,6 +3072,8 @@ class BillApp(QMainWindow):
         if not out_file:
             return
         wb.save(out_file)
+        for rec_idx, _ in selected_with_index:
+            self._clear_field_errors_for_row(rec_idx)
         stamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
         for rec_idx, _r in selected_with_index:
             rr = self.records[rec_idx]
