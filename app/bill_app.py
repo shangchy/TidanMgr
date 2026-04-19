@@ -66,6 +66,7 @@ from bill_paths import (
     TEMPLATE_FILE,
     THEME_FILE,
     is_license_valid,
+    license_check_diagnostics,
 )
 from bill_theme import STYLESHEET_DARK, STYLESHEET_LIGHT
 from bill_widgets import (
@@ -3131,6 +3132,8 @@ def _show_license_expired_dialog(parent: QWidget | None = None) -> None:
     box.setIcon(QMessageBox.Icon.Critical)
     box.setWindowTitle("授权已过期")
     box.setText(LICENSE_EXPIRED_MSG)
+    _ok, diag = license_check_diagnostics()
+    box.setInformativeText(f"授权诊断：{diag}")
     box.setStandardButtons(QMessageBox.StandardButton.Ok)
     box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
     box.exec()

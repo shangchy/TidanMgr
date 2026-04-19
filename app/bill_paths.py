@@ -101,35 +101,42 @@ def build_encrypted_license(expire_at: str) -> dict[str, str | int]:
     return {"v": 1, "n": n, "c": c, "s": sig}
 
 
-def is_license_valid() -> bool:
+def license_check_diagnostics() -> tuple[bool, str]:
+    """返回授权校验结果与诊断信息（含实际读取路径/失败原因）。"""
+    lic_path = str(LICENSE_FILE)
     try:
         if not LICENSE_FILE.exists():
-            return False
+            return False, f"path={lic_path}; reason=file_not_found"
         obj = json.loads(LICENSE_FILE.read_text(encoding="utf-8"))
         if int(obj.get("v", 0)) != 1:
-            return False
+            return False, f"path={lic_path}; reason=bad_version"
         n = str(obj.get("n", "")).strip()
         c = str(obj.get("c", "")).strip()
         sgn = str(obj.get("s", "")).strip()
         if not n or not c or not sgn:
-            return False
+            return False, f"path={lic_path}; reason=missing_fields"
         msg = f"{n}.{c}".encode("utf-8")
         expected = hmac.new(_LICENSE_SIG_KEY, msg, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, sgn):
-            return False
+            return False, f"path={lic_path}; reason=bad_signature"
         nonce = base64.urlsafe_b64decode(n.encode("utf-8"))
         ciphertext = base64.urlsafe_b64decode(c.encode("utf-8"))
         plain = _license_decrypt(ciphertext, nonce).decode("utf-8")
         payload = json.loads(plain)
         s = str(payload.get("expire_at", "")).strip()
         if not s:
-            return False
-        # 支持两种格式：YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS
+            return False, f"path={lic_path}; reason=missing_expire_at"
         if len(s) <= 10:
             expire_at = datetime.strptime(s, "%Y-%m-%d")
         else:
             expire_at = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        return datetime.now() <= expire_at
-    except Exception:
-        # 授权文件损坏/格式错误视为未授权
-        return False
+        if datetime.now() > expire_at:
+            return False, f"path={lic_path}; reason=expired; expire_at={s}"
+        return True, f"path={lic_path}; reason=ok; expire_at={s}"
+    except Exception as e:
+        return False, f"path={lic_path}; reason=exception:{type(e).__name__}"
+
+
+def is_license_valid() -> bool:
+    ok, _msg = license_check_diagnostics()
+    return ok
