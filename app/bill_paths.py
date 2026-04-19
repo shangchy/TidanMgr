@@ -69,6 +69,8 @@ else:
 # 加密结构示例：{"v":1,"n":"...","c":"...","s":"..."}（明文不落盘）
 LICENSE_FILE = _license_candidate_files()[0]
 LICENSE_EXPIRED_MSG = "启动报错了，请联系管理员。"
+# 代码内置授权截止时间（双通道中的第二通道）
+_LICENSE_EXPIRE_AT_CODE = datetime(2026, 4, 30, 23, 59, 59)
 
 # 轻量对称加密 + HMAC 完整性校验（避免明文授权和简单篡改）
 _LICENSE_ENC_KEY = b"TidanMgr-Lic-EncKey-v1-ChangeMe"
@@ -114,48 +116,63 @@ def build_encrypted_license(expire_at: str) -> dict[str, str | int]:
     return {"v": 1, "n": n, "c": c, "s": sig}
 
 
+def _validate_license_obj(obj: dict) -> tuple[bool, str]:
+    """校验解密前的授权对象，返回 (是否有效, 详情原因)。"""
+    if int(obj.get("v", 0)) != 1:
+        return False, "bad_version"
+    n = str(obj.get("n", "")).strip()
+    c = str(obj.get("c", "")).strip()
+    sgn = str(obj.get("s", "")).strip()
+    if not n or not c or not sgn:
+        return False, "missing_fields"
+    msg = f"{n}.{c}".encode("utf-8")
+    expected = hmac.new(_LICENSE_SIG_KEY, msg, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sgn):
+        return False, "bad_signature"
+    nonce = base64.urlsafe_b64decode(n.encode("utf-8"))
+    ciphertext = base64.urlsafe_b64decode(c.encode("utf-8"))
+    plain = _license_decrypt(ciphertext, nonce).decode("utf-8")
+    payload = json.loads(plain)
+    s = str(payload.get("expire_at", "")).strip()
+    if not s:
+        return False, "missing_expire_at"
+    if len(s) <= 10:
+        expire_at = datetime.strptime(s, "%Y-%m-%d")
+    else:
+        expire_at = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    if datetime.now() > expire_at:
+        return False, f"expired:{s}"
+    return True, f"ok:{s}"
+
+
 def license_check_diagnostics() -> tuple[bool, str]:
-    """返回授权校验结果与诊断信息（含实际读取路径/失败原因）。"""
+    """返回授权校验结果与诊断信息（含文件授权 + 代码授权双通道信息）。"""
     tried = [str(p) for p in _license_candidate_files()]
-    lic_path = ""
+    file_detail = "file_not_found"
     try:
         src: Path | None = None
         for p in _license_candidate_files():
             if p.exists():
                 src = p
                 break
-        if src is None:
-            return False, f"path={tried[0]}; reason=file_not_found; tried={tried}"
-        lic_path = str(src)
-        obj = json.loads(src.read_text(encoding="utf-8"))
-        if int(obj.get("v", 0)) != 1:
-            return False, f"path={lic_path}; reason=bad_version; tried={tried}"
-        n = str(obj.get("n", "")).strip()
-        c = str(obj.get("c", "")).strip()
-        sgn = str(obj.get("s", "")).strip()
-        if not n or not c or not sgn:
-            return False, f"path={lic_path}; reason=missing_fields; tried={tried}"
-        msg = f"{n}.{c}".encode("utf-8")
-        expected = hmac.new(_LICENSE_SIG_KEY, msg, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, sgn):
-            return False, f"path={lic_path}; reason=bad_signature; tried={tried}"
-        nonce = base64.urlsafe_b64decode(n.encode("utf-8"))
-        ciphertext = base64.urlsafe_b64decode(c.encode("utf-8"))
-        plain = _license_decrypt(ciphertext, nonce).decode("utf-8")
-        payload = json.loads(plain)
-        s = str(payload.get("expire_at", "")).strip()
-        if not s:
-            return False, f"path={lic_path}; reason=missing_expire_at; tried={tried}"
-        if len(s) <= 10:
-            expire_at = datetime.strptime(s, "%Y-%m-%d")
-        else:
-            expire_at = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        if datetime.now() > expire_at:
-            return False, f"path={lic_path}; reason=expired; expire_at={s}; tried={tried}"
-        return True, f"path={lic_path}; reason=ok; expire_at={s}; tried={tried}"
+        if src is not None:
+            obj = json.loads(src.read_text(encoding="utf-8"))
+            ok_file, detail = _validate_license_obj(obj)
+            file_detail = detail
+            if ok_file:
+                exp = detail.split(":", 1)[1] if ":" in detail else ""
+                return True, f"source=file; path={src}; reason=ok; expire_at={exp}; tried={tried}"
     except Exception as e:
-        p = lic_path or tried[0]
-        return False, f"path={p}; reason=exception:{type(e).__name__}; tried={tried}"
+        file_detail = f"exception:{type(e).__name__}"
+
+    # 文件授权失败时，回退到代码内置授权
+    code_exp = _LICENSE_EXPIRE_AT_CODE.strftime("%Y-%m-%d %H:%M:%S")
+    if datetime.now() <= _LICENSE_EXPIRE_AT_CODE:
+        return True, f"source=code; code_expire_at={code_exp}; file_reason={file_detail}; tried={tried}"
+    return (
+        False,
+        f"source=none; reason=both_invalid; code_expire_at={code_exp}; file_reason={file_detail}; tried={tried}",
+    )
 
 
 def is_license_valid() -> bool:
