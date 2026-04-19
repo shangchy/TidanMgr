@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import shutil
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,7 +27,54 @@ from PySide6.QtGui import (
     QPolygonF,
 )
 
+from bill_constants import (
+    ALLOW_PRINT_SCROLL_COL,
+    ALLOW_PRINT_URL_DISPLAY_COL,
+    CITIES,
+    FROZEN_COLUMNS,
+    DISPLAY_FIELDS,
+    DURATIONS,
+    FIELDS,
+    HEADERS,
+    HISTORY_SCROLL_COLUMNS,
+    HISTORY_SCROLL_FIELDS,
+    MAIN_SCROLL_COLUMNS,
+    OP_MAP,
+    PRINT_LOG_COL_COUNT,
+    PRINT_LOG_DATA_FIELDS,
+    PRINT_LOG_HEADERS,
+    PROVINCE_TO_CITIES,
+    PROVINCES,
+    TYPE_MAP,
+    coerce_allow_print_url,
+    find_earliest_region_in_left,
+    first_url,
+    int_to_cn,
+    sanitize_filename,
+    split_multi,
+    cities_under_provinces,
+)
+from bill_paths import (
+    APP_DIR,
+    DATA_FILE,
+    HISTORY_FILE,
+    LICENSE_EXPIRED_MSG,
+    PICKER_RECENT_FILE,
+    PRINT_RECORDS_FILE,
+    TEMPLATE_FILE,
+    THEME_FILE,
+    is_license_valid,
+)
 from bill_theme import STYLESHEET_DARK, STYLESHEET_LIGHT
+from bill_widgets import (
+    AllowPrintUrlCellDelegate,
+    ColumnPickFilterPopup,
+    HoverFilterHeaderView,
+    MultiSelectDialog,
+    UrlCellEditor,
+    make_sidebar_logo_pixmap,
+    style_combo_centered,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -42,627 +91,16 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QStatusBar,
     QStackedWidget,
-    QStyle,
-    QStyleOptionViewItem,
-    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
-
-
-def make_sidebar_logo_pixmap(*, dark: bool, size: int = 44) -> QPixmap:
-    """侧栏小图标：单据 + 折角 + 行线，贴合提单/表格管理场景。"""
-    pm = QPixmap(size, size)
-    pm.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pm)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    m = 4.0
-    body = QRectF(m, m + 1.0, size - 2 * m, size - 2 * m - 2.0)
-    if dark:
-        paper = QColor(26, 32, 48)
-        edge = QColor(118, 142, 210)
-        fold_fill = QColor(42, 50, 72)
-        fold_edge = QColor(88, 104, 150)
-        line_c = QColor(168, 184, 228, 200)
-        bar_c = QColor(140, 168, 255, 220)
-    else:
-        paper = QColor(255, 255, 255)
-        edge = QColor(37, 99, 235)
-        fold_fill = QColor(226, 232, 240)
-        fold_edge = QColor(148, 163, 184)
-        line_c = QColor(71, 85, 105, 220)
-        bar_c = QColor(37, 99, 235, 230)
-    fs = min(13.0, body.width() * 0.32)
-    main_rect = QRectF(body.left(), body.top(), body.width() - fs * 0.55, body.height())
-    path = QPainterPath()
-    path.addRoundedRect(main_rect, 3.5, 3.5)
-    painter.fillPath(path, QBrush(paper))
-    painter.strokePath(path, QPen(edge, 1.2))
-    fold = QPolygonF(
-        [
-            QPointF(main_rect.right(), main_rect.top()),
-            QPointF(body.right(), main_rect.top()),
-            QPointF(body.right(), main_rect.top() + fs),
-            QPointF(main_rect.right() - fs * 0.2, main_rect.top() + fs * 0.85),
-        ]
-    )
-    painter.setPen(QPen(fold_edge, 1.0))
-    painter.setBrush(QBrush(fold_fill))
-    painter.drawPolygon(fold)
-    lx0 = main_rect.left() + 5
-    lx1 = main_rect.right() - 5
-    y = main_rect.top() + 11
-    painter.setPen(QPen(line_c, 1.05))
-    for _ in range(3):
-        painter.drawLine(QPointF(lx0, y), QPointF(lx1, y))
-        y += 5.5
-    bx0 = main_rect.left() + 6
-    by = main_rect.bottom() - 7
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QBrush(bar_c))
-    for i in range(5):
-        bw = 1.6 if i % 2 == 0 else 1.0
-        bh = 5.5 if i != 2 else 7.0
-        painter.drawRect(QRectF(bx0, by - bh, bw, bh))
-        bx0 += bw + 1.4
-    painter.end()
-    return pm
-
-
-def _app_dir() -> Path:
-    """可写数据目录：开发为脚本目录；Windows 打包为 exe 同级；macOS 打包为应用支持库（或便携目录）。"""
-    if not getattr(sys, "frozen", False):
-        return Path(__file__).resolve().parent
-    if sys.platform == "darwin":
-        portable = os.environ.get("TIDANMGR_PORTABLE", "").strip().lower() in ("1", "true", "yes")
-        if portable:
-            macos = Path(sys.executable).resolve().parent
-            bundle = macos.parent.parent
-            data = bundle.parent / "TidanMgrData"
-            data.mkdir(parents=True, exist_ok=True)
-            return data
-        support = Path.home() / "Library" / "Application Support" / "TidanMgr"
-        support.mkdir(parents=True, exist_ok=True)
-        return support
-    return Path(sys.executable).resolve().parent
-
-
-APP_DIR = _app_dir()
-DATA_FILE = APP_DIR / "data.json"
-HISTORY_FILE = APP_DIR / "history_data.json"
-THEME_FILE = APP_DIR / "theme.json"
-PICKER_RECENT_FILE = APP_DIR / "picker_recent.json"
-# 打包时模板随 --add-data 放入 _MEIPASS；未打包时放在 app 目录
-if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-    _bundled_tpl = Path(sys._MEIPASS) / "template.xlsx"
-    TEMPLATE_FILE = _bundled_tpl if _bundled_tpl.exists() else (APP_DIR / "template.xlsx")
-else:
-    TEMPLATE_FILE = APP_DIR / "template.xlsx"
-
-# 本地时间：此时间之后授权失效（2026-04-30 23:00:00 及之前可用）
-_LICENSE_EXPIRE_AT = datetime(2026, 4, 30, 23, 0, 0)
-_LICENSE_EXPIRED_MSG = "授权已过期，请联系管理员。"
-
-
-def is_license_valid() -> bool:
-    return datetime.now() <= _LICENSE_EXPIRE_AT
-
-
-FIELDS = [
-    "task_name",
-    "type_code",
-    "operator_code",
-    "industry_code",
-    "allow_print_url",
-    "url",
-    "quantity",
-    "duration",
-    "age_max",
-    "age_min",
-    "pv",
-    "province",
-    "exclude_province",
-    "city",
-    "exclude_city",
-]
-DISPLAY_FIELDS = ["checked"] + FIELDS + ["created_at", "action"]
-HEADERS = {
-    "checked": "☐",
-    "task_name": "任务名",
-    "type_code": "类型",
-    "operator_code": "运营商",
-    "industry_code": "行业编码",
-    "allow_print_url": "允许",
-    "url": "URL",
-    "quantity": "数量",
-    "duration": "时长",
-    "age_max": "年龄上限",
-    "age_min": "年龄下限",
-    "pv": "pv",
-    "province": "省份",
-    "exclude_province": "排除省份",
-    "city": "地市",
-    "exclude_city": "排除地市",
-    "created_at": "提单时间",
-    "action": "操作",
-}
-
-
-def coerce_allow_print_url(raw: Any) -> bool:
-    """是否允许导出 URL；缺省为 True（兼容旧数据）。"""
-    if raw is None or raw == "":
-        return True
-    if isinstance(raw, bool):
-        return raw
-    s = str(raw).strip().lower()
-    if s in ("0", "false", "no", "否"):
-        return False
-    if s in ("1", "true", "yes", "是"):
-        return True
-    return True
-
-
-FROZEN_COLUMNS = 2
-# 「允许」列在右侧滚动表中的列索引；逻辑列号 = 滚动列 + 冻结列数
-ALLOW_PRINT_SCROLL_COL = FIELDS.index("allow_print_url") - 1
-ALLOW_PRINT_URL_DISPLAY_COL = ALLOW_PRINT_SCROLL_COL + FROZEN_COLUMNS
-MAIN_SCROLL_COLUMNS = len(DISPLAY_FIELDS) - FROZEN_COLUMNS
-# 历史滚动区：与主表相同字段列 + 提单时间 + 删除时间，不含「操作」列
-HISTORY_SCROLL_FIELDS = FIELDS[1:] + ["created_at", "deleted_at"]
-HISTORY_SCROLL_COLUMNS = len(HISTORY_SCROLL_FIELDS)
-
-TYPE_MAP = {"DB": "dpi-白", "DJ": "106", "XC": "小程序", "DH": "dpi-灰", "DY": "抖音"}
-OP_MAP = {"YD": "移动", "LT": "联通", "DX": "电信", "YX": "移动|电信"}
-DURATIONS = ["一天", "本周", "长期"]
-PROVINCES = [
-    "北京", "天津", "上海", "重庆", "河北", "山西", "辽宁", "吉林", "黑龙江",
-    "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南", "湖北", "湖南",
-    "广东", "海南", "四川", "贵州", "云南", "陕西", "甘肃", "青海", "台湾",
-    "内蒙古", "广西", "西藏", "宁夏", "新疆", "香港", "澳门",
-]
-CITIES = [
-    "石家庄", "唐山", "秦皇岛", "邯郸", "邢台", "保定", "张家口", "承德", "沧州", "廊坊", "衡水",
-    "太原", "大同", "阳泉", "长治", "晋城", "朔州", "晋中", "运城", "忻州", "临汾", "吕梁",
-    "沈阳", "大连", "鞍山", "抚顺", "本溪", "丹东", "锦州", "营口", "阜新", "辽阳", "盘锦", "铁岭", "朝阳", "葫芦岛",
-    "长春", "吉林", "四平", "辽源", "通化", "白山", "松原", "白城",
-    "哈尔滨", "齐齐哈尔", "鸡西", "鹤岗", "双鸭山", "大庆", "伊春", "佳木斯", "七台河", "牡丹江", "黑河", "绥化",
-    "南京", "无锡", "徐州", "常州", "苏州", "南通", "连云港", "淮安", "盐城", "扬州", "镇江", "泰州", "宿迁",
-    "杭州", "宁波", "温州", "嘉兴", "湖州", "绍兴", "金华", "衢州", "舟山", "台州", "丽水",
-    "合肥", "芜湖", "蚌埠", "淮南", "马鞍山", "淮北", "铜陵", "安庆", "黄山", "滁州", "阜阳", "宿州", "六安", "亳州", "池州", "宣城",
-    "福州", "厦门", "莆田", "三明", "泉州", "漳州", "南平", "龙岩", "宁德",
-    "南昌", "景德镇", "萍乡", "九江", "新余", "鹰潭", "赣州", "吉安", "宜春", "抚州", "上饶",
-    "济南", "青岛", "淄博", "枣庄", "东营", "烟台", "潍坊", "济宁", "泰安", "威海", "日照", "临沂", "德州", "聊城", "滨州", "菏泽",
-]
-
-# CITIES 按省级行政区连续分段，与 PROVINCES 中「河北」起至「山东」顺序一一对应（其余省暂无地市表数据）
-_PROVINCE_CITY_BLOCK_NAMES = PROVINCES[4:15]
-_PROVINCE_CITY_BLOCK_SIZES = [11, 11, 14, 8, 12, 13, 11, 16, 9, 11, 16]
-
-
-def _build_province_to_cities() -> dict[str, tuple[str, ...]]:
-    d: dict[str, tuple[str, ...]] = {}
-    i = 0
-    for name, n in zip(_PROVINCE_CITY_BLOCK_NAMES, _PROVINCE_CITY_BLOCK_SIZES):
-        d[name] = tuple(CITIES[i : i + n])
-        i += n
-    assert i == len(CITIES), "PROVINCE_CITY_BLOCK_SIZES 与 CITIES 总长度不一致"
-    return d
-
-
-PROVINCE_TO_CITIES = _build_province_to_cities()
-
-
-def cities_under_provinces(provinces: list[str]) -> list[str]:
-    """已选省份下的地市并集，顺序与 CITIES 全局顺序一致。"""
-    union: set[str] = set()
-    for p in provinces:
-        union.update(PROVINCE_TO_CITIES.get(p, ()))
-    return [c for c in CITIES if c in union]
-
-
-def split_multi(value: str) -> list[str]:
-    return [x.strip() for x in str(value or "").split("|") if x.strip()]
-
-
-# 任务名前半段：从前到后第一个「地域」中文词 + 紧随其后的 6 位字母数字（运营商2+类型2+行业2）
-_REGION_NAME_TOKENS = sorted(set(PROVINCES + CITIES + ["全国"]), key=len, reverse=True)
-_REGION_NUM_RE = re.compile(r"^([一二两三四五六七八九十]+省|[一二两三四五六七八九十]+市|\d+省|\d+市)")
-
-
-def find_earliest_region_in_left(left: str) -> tuple[int, int, str] | None:
-    """返回 (起始下标, 结束下标不含, 地域词)。取最靠前起点；同起点取长匹配。"""
-    n = len(left)
-    best: tuple[int, int, str] | None = None
-    for start in range(n):
-        ch = left[start]
-        if not ("\u4e00" <= ch <= "\u9fff"):
-            continue
-        cand: str | None = None
-        for tok in _REGION_NAME_TOKENS:
-            if start + len(tok) <= n and left[start : start + len(tok)] == tok:
-                cand = tok
-                break
-        if cand is None:
-            m = _REGION_NUM_RE.match(left[start:])
-            if m:
-                cand = m.group(1)
-        if not cand:
-            continue
-        end = start + len(cand)
-        if best is None or start < best[0] or (start == best[0] and len(cand) > len(best[2])):
-            best = (start, end, cand)
-    return best
-
-
-def first_url(value: str) -> str:
-    if not value:
-        return ""
-    for line in str(value).splitlines():
-        clean = line.strip()
-        if clean:
-            return clean
-    return ""
-
-
-def sanitize_filename(text: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]+', "_", str(text or "")).strip() or "客户"
-
-
-def int_to_cn(n: int) -> str:
-    return {1: "一", 2: "两", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}.get(n, str(n))
-
-
-class _ComboLineEditPopupFilter(QObject):
-    """可编辑且 lineEdit 只读时，点文字区域默认不弹列表；左键按下时打开下拉。"""
-
-    def __init__(self, combo: QComboBox):
-        super().__init__(combo)
-        self._combo = combo
-
-    def eventFilter(self, watched, event):
-        if (
-            event.type() == QEvent.Type.MouseButtonPress
-            and event.button() == Qt.LeftButton
-            and watched is self._combo.lineEdit()
-        ):
-            self._combo.showPopup()
-        return False
-
-
-def style_combo_centered(combo: QComboBox):
-    combo.setEditable(True)
-    le = combo.lineEdit()
-    if le:
-        le.setReadOnly(True)
-        le.setAlignment(Qt.AlignCenter)
-        le.installEventFilter(_ComboLineEditPopupFilter(combo))
-
-
-class ColumnPickFilterPopup(QDialog):
-    """列筛选：无确定/取消；勾选即写回并刷新；Qt.Popup 点击表格外关闭。勾选状态用 _selected 维护以便搜索时保留。"""
-
-    def __init__(
-        self,
-        bill: "BillApp",
-        mode: str,
-        field: str,
-        title: str,
-        options: list[str],
-        selected: set[str],
-        anchor_bottom_right: QPoint,
-        parent: QWidget | None = None,
-    ):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_DeleteOnClose, True)
-        self.setWindowFlags(Qt.Dialog | Qt.Popup)
-        self.setWindowTitle(title)
-        self.resize(360, 440)
-        self._bill = bill
-        self._mode = mode
-        self._field = field
-        self._options = list(options)
-        self._anchor_br = QPoint(anchor_bottom_right)
-        self._suppress_list = False
-        opt_set = set(options)
-        self._selected = set(selected) & opt_set if selected else set()
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("搜索选项...")
-        self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QListWidget.NoSelection)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-        layout.addWidget(self.search)
-        layout.addWidget(self.list_widget, 1)
-        self.search.textChanged.connect(self._render)
-        self.list_widget.itemChanged.connect(self._on_item_changed)
-        self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
-        self._render()
-
-    def _on_item_double_clicked(self, item: QListWidgetItem):
-        if item.checkState() == Qt.CheckState.Checked:
-            item.setCheckState(Qt.CheckState.Unchecked)
-        else:
-            item.setCheckState(Qt.CheckState.Checked)
-
-    def _position_near_anchor(self):
-        """弹窗左上角与筛选按钮右下角对齐，并限制在可用屏幕内。"""
-        self.adjustSize()
-        fg = self.frameGeometry()
-        w, h = fg.width(), fg.height()
-        x = self._anchor_br.x()
-        y = self._anchor_br.y()
-        scr = QGuiApplication.screenAt(self._anchor_br)
-        if scr is None:
-            scr = QApplication.primaryScreen()
-        ag = scr.availableGeometry() if scr else QRect()
-        if ag.width() > 0:
-            x = max(ag.left(), min(x, ag.right() - w + 1))
-            y = max(ag.top(), min(y, ag.bottom() - h + 1))
-        self.move(x, y)
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        QTimer.singleShot(0, self._position_near_anchor)
-
-    def _on_item_changed(self, item: QListWidgetItem):
-        if self._suppress_list:
-            return
-        t = item.text()
-        if item.checkState() == Qt.CheckState.Checked:
-            self._selected.add(t)
-        else:
-            self._selected.discard(t)
-        self._apply_to_bill()
-
-    def _apply_to_bill(self):
-        sel = set(self._selected)
-        if self._field == "created_at":
-            sel = {BillApp._created_at_filter_key(x) for x in sel}
-        full = {BillApp._created_at_filter_key(x) for x in self._options} if self._field == "created_at" else set(self._options)
-        target = self._bill.header_filters if self._mode.startswith("main") else self._bill.history_header_filters
-        if not sel or sel == full:
-            target.pop(self._field, None)
-        else:
-            target[self._field] = sel
-        if self._mode.startswith("main"):
-            self._bill.refresh_table()
-        else:
-            self._bill.refresh_history_table()
-
-    def _render(self):
-        self._suppress_list = True
-        self.list_widget.blockSignals(True)
-        try:
-            kw = self.search.text().strip().lower()
-            self.list_widget.clear()
-            for x in self._options:
-                if kw and kw not in x.lower():
-                    continue
-                it = QListWidgetItem(x)
-                it.setFlags(
-                    Qt.ItemFlag.ItemIsEnabled
-                    | Qt.ItemFlag.ItemIsSelectable
-                    | Qt.ItemFlag.ItemIsUserCheckable
-                )
-                it.setCheckState(Qt.CheckState.Checked if x in self._selected else Qt.CheckState.Unchecked)
-                self.list_widget.addItem(it)
-        finally:
-            self.list_widget.blockSignals(False)
-            self._suppress_list = False
-
-
-class HoverFilterHeaderView(QHeaderView):
-    """表头悬停时在右侧显示筛选三角；点击三角打开多选筛选。"""
-
-    BTN_W = 20
-
-    def __init__(self, parent_table: QTableWidget, bill: "BillApp", mode: str):
-        super().__init__(Qt.Orientation.Horizontal, parent_table)
-        self._table = parent_table
-        self._bill = bill
-        self._mode = mode
-        self._hover_section = -1
-        self.setMouseTracking(True)
-        self.setDefaultAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-
-    def leaveEvent(self, event):
-        self._hover_section = -1
-        self.viewport().update()
-        super().leaveEvent(event)
-
-    def mouseMoveEvent(self, event):
-        idx = self.logicalIndexAt(event.position().toPoint())
-        if idx != self._hover_section:
-            self._hover_section = idx
-            self.viewport().update()
-        super().mouseMoveEvent(event)
-
-    def _filter_btn_rect(self, logical_index: int) -> QRect:
-        pos = self.sectionViewportPosition(logical_index)
-        w = self.sectionSize(logical_index)
-        h = self.height()
-        return QRect(pos + w - self.BTN_W, 0, self.BTN_W, h)
-
-    def _hit_filter_btn(self, pos: QPoint) -> int:
-        idx = self.logicalIndexAt(pos)
-        if idx < 0 or not self._bill._header_show_filter_btn(self._mode, idx):
-            return -1
-        r = self._filter_btn_rect(idx)
-        if r.contains(pos):
-            return idx
-        return -1
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.position().toPoint()
-            fi = self._hit_filter_btn(pos)
-            if fi >= 0:
-                self._bill._open_header_filter_from_header(self._mode, fi)
-                event.accept()
-                return
-            idx = self.logicalIndexAt(pos)
-            # 冻结首列勾选表头：自定义 HeaderView 下 sectionClicked 可能不触发，在此显式处理全选/取消全选
-            if idx == 0 and self._mode in ("main_frozen", "hist_frozen"):
-                self._bill._on_frozen_header_col0_clicked(self._mode)
-                event.accept()
-                return
-        super().mouseReleaseEvent(event)
-
-    def paintSection(self, painter: QPainter, rect: QRect, logical_index: int):
-        super().paintSection(painter, rect, logical_index)
-        if self._hover_section != logical_index:
-            return
-        if not self._bill._header_show_filter_btn(self._mode, logical_index):
-            return
-        tri = QRect(rect.right() - self.BTN_W + 4, rect.center().y() - 4, 10, 8)
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        c = self.palette().color(self.foregroundRole())
-        painter.setPen(QPen(c, 1.2))
-        painter.setBrush(QBrush(c))
-        cx, top, bot = tri.center().x(), tri.top() + 1, tri.bottom() - 1
-        painter.drawPolygon(
-            QPolygon([QPoint(cx, bot), QPoint(tri.left() + 1, top), QPoint(tri.right() - 1, top)])
-        )
-        painter.restore()
-
-
-class MultiSelectDialog(QDialog):
-    """省份/地市等多选：仅双击行切换选中（单击不改变勾选）。"""
-
-    def __init__(self, title: str, items: list[str], selected: list[str], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(320, 420)
-        self._items = items
-        self._state_all: set[str] = set(selected)
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("搜索...")
-        hint = QLabel("双击行：选中或取消")
-        hint.setObjectName("hintLabel")
-        self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QListWidget.SingleSelection)
-        self.list_widget.itemDoubleClicked.connect(self._on_row_double_clicked)
-        self.btns = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.search)
-        layout.addWidget(hint)
-        layout.addWidget(self.list_widget)
-        layout.addWidget(self.btns)
-        self.search.textChanged.connect(self._render)
-        self.btns.accepted.connect(self.accept)
-        self.btns.rejected.connect(self.reject)
-        self._render()
-
-    @staticmethod
-    def _row_label(x: str, checked: bool) -> str:
-        return ("☑ " if checked else "☐ ") + x
-
-    def _on_row_double_clicked(self, item: QListWidgetItem):
-        x = str(item.data(Qt.UserRole))
-        if x in self._state_all:
-            self._state_all.discard(x)
-        else:
-            self._state_all.add(x)
-        item.setText(self._row_label(x, x in self._state_all))
-
-    def _render(self):
-        keyword = self.search.text().strip().lower()
-        self.list_widget.clear()
-        for x in self._items:
-            if keyword and keyword not in x.lower():
-                continue
-            checked = x in self._state_all
-            item = QListWidgetItem(self._row_label(x, checked))
-            item.setData(Qt.UserRole, x)
-            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.list_widget.addItem(item)
-        for i in range(self.list_widget.count()):
-            it = self.list_widget.item(i)
-            name = str(it.data(Qt.UserRole))
-            if name in self._state_all:
-                self.list_widget.setCurrentRow(i)
-                self.list_widget.scrollToItem(it)
-                break
-
-    def values(self):
-        return [x for x in self._items if x in self._state_all]
-
-
-class UrlDialog(QDialog):
-    def __init__(self, value: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("编辑URL（多行）")
-        self.resize(520, 360)
-        self.editor = QTextEdit()
-        self.editor.setPlainText(value or "")
-        btns = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.editor)
-        layout.addWidget(btns)
-
-    def value(self):
-        return self.editor.toPlainText().strip()
-
-
-class AllowPrintUrlCellDelegate(QStyledItemDelegate):
-    """「允许」列：单元格为表格默认底色；中间绘制浅色圆形图标，「是/否」在圆内居中。"""
-
-    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
-        opt = QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-        text = (opt.text or "").strip() or str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip() or "是"
-        yes = text == "是"
-        rect = option.rect
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        pal = opt.palette
-        if opt.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(rect, pal.brush(QPalette.ColorRole.Highlight))
-        elif opt.features & QStyleOptionViewItem.ViewItemFeature.Alternate:
-            painter.fillRect(rect, pal.brush(QPalette.ColorRole.AlternateBase))
-        else:
-            painter.fillRect(rect, pal.brush(QPalette.ColorRole.Base))
-
-        margin = 6
-        d = min(rect.width(), rect.height()) - 2 * margin
-        d = max(24, min(int(d), 38))
-        cx, cy = rect.center().x(), rect.center().y()
-        disc = QRect(int(cx - d / 2), int(cy - d / 2), d, d)
-        if yes:
-            fill = QColor(200, 232, 204)
-            border = QColor(165, 210, 172)
-            pen_text = QColor(52, 118, 68)
-        else:
-            fill = QColor(222, 222, 230)
-            border = QColor(198, 198, 208)
-            pen_text = QColor(92, 92, 108)
-        painter.setBrush(fill)
-        painter.setPen(QPen(border, 1))
-        painter.drawEllipse(disc)
-
-        f = QFont(opt.font)
-        f.setBold(True)
-        for _ in range(4):
-            fm = QFontMetricsF(f)
-            if fm.horizontalAdvance(text) <= d - 8 and fm.height() <= d - 6:
-                break
-            f.setPointSizeF(max(7.5, f.pointSizeF() - 0.5))
-        painter.setFont(f)
-        painter.setPen(pen_text)
-        painter.drawText(disc, Qt.AlignmentFlag.AlignCenter, text)
-        painter.restore()
 
 
 class BillApp(QMainWindow):
@@ -670,7 +108,6 @@ class BillApp(QMainWindow):
         super().__init__()
         self.setObjectName("BillAppMain")
         self.setWindowTitle("提单管理")
-        self.resize(1500, 860)
         self.records: list[dict[str, Any]] = []
         self.history_records: list[dict[str, Any]] = []
         self.history_filtered_indices: list[int] = []
@@ -689,30 +126,47 @@ class BillApp(QMainWindow):
         self.history_header_filters: dict[str, set[str]] = {}
         self.history_sort_field: str | None = None
         self.history_sort_order = Qt.SortOrder.AscendingOrder
+        self.print_records: list[dict[str, Any]] = []
+        self.print_log_filtered_indices: list[int] = []
+        self.print_header_filters: dict[str, set[str]] = {}
+        self.print_sort_field: str | None = "printed_at"
+        self.print_sort_order = Qt.SortOrder.DescendingOrder
         self._hist_v_sync = False
         self._hist_sel_sync = False
         self._filter_popup: ColumnPickFilterPopup | None = None
         self._license_timer = QTimer(self)
         self._license_timer.timeout.connect(self._check_license_and_exit_if_needed)
-        self._license_timer.start(30_000)
+        self._license_timer.start(10_000)
+        QTimer.singleShot(0, self._check_license_and_exit_if_needed)
+        # 须在 _setup_ui 之前：建表时会触发列宽/URL 行高回调，依赖本属性
+        _fm0 = QFontMetrics(self.font())
+        self._data_row_height = max(44, int((_fm0.height() + max(_fm0.leading(), 0)) * 1.5) + 14)
         self._setup_ui()
-        fm = QFontMetrics(self.font())
-        self._data_row_height = max(44, int((fm.height() + max(fm.leading(), 0)) * 1.5) + 14)
         self.load_data()
         self.load_history_data()
+        self.load_print_records()
         self.load_picker_recent()
         self.apply_theme()
+        fm = QFontMetrics(self.font())
+        self._data_row_height = max(44, int((fm.height() + max(fm.leading(), 0)) * 1.5) + 14)
         self.refresh_table()
+        # 刷新后子控件尺寸提示已稳定，再套一次初始几何（避免宽表把窗口最小宽度撑满）
+        self._apply_initial_window_geometry()
+        cw = self.centralWidget()
+        if cw is not None:
+            cw.setMinimumWidth(0)
 
     def _check_license_and_exit_if_needed(self):
         if is_license_valid():
             return
         self._license_timer.stop()
-        _show_license_expired_dialog()
+        _show_license_expired_dialog(self)
         QApplication.quit()
+        sys.exit(0)
 
     def _setup_ui(self):
         center = QWidget(self)
+        center.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setCentralWidget(center)
         root = QHBoxLayout(center)
         root.setContentsMargins(0, 0, 0, 0)
@@ -751,6 +205,9 @@ class BillApp(QMainWindow):
         self.nav_history = QPushButton("🕘  历史提单表")
         self.nav_history.setObjectName("navNormal")
         self.nav_history.clicked.connect(self.show_history_page)
+        self.nav_print_records = QPushButton("📋  打印记录")
+        self.nav_print_records.setObjectName("navNormal")
+        self.nav_print_records.clicked.connect(self.show_print_records_page)
         self.nav_settings = QPushButton("⚙️  设置")
         self.nav_settings.setObjectName("navNormal")
         self.nav_settings.clicked.connect(self.show_settings_page)
@@ -760,6 +217,7 @@ class BillApp(QMainWindow):
         sidebar_layout.addWidget(self.sidebar_brand)
         sidebar_layout.addWidget(self.nav_bill)
         sidebar_layout.addWidget(self.nav_history)
+        sidebar_layout.addWidget(self.nav_print_records)
         sidebar_layout.addWidget(divider)
         sidebar_layout.addWidget(side_item_sub1)
         sidebar_layout.addWidget(self.nav_settings)
@@ -767,17 +225,21 @@ class BillApp(QMainWindow):
         root.addWidget(self.sidebar)
 
         main_wrap = QWidget()
+        main_wrap.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         main_layout = QVBoxLayout(main_wrap)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         self.content_stack = QStackedWidget()
         self.content_stack.setObjectName("contentStack")
         self.content_stack.setAutoFillBackground(True)
+        # 水平 Ignored：避免 QStackedWidget 与各页「最宽子控件」累加成超大窗口最小宽度
+        self.content_stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         main_layout.addWidget(self.content_stack, 1)
 
         bill_page = QWidget()
         bill_page.setObjectName("stackBillPage")
         bill_page.setAutoFillBackground(True)
+        bill_page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         bill_page_layout = QVBoxLayout(bill_page)
         bill_page_layout.setContentsMargins(0, 0, 0, 0)
         bill_page_layout.setSpacing(0)
@@ -799,9 +261,13 @@ class BillApp(QMainWindow):
         btn_clear.clicked.connect(self.clear_bill_search_and_filters)
         self.chk_print_url = QCheckBox("是否打印URL")
         self.lbl_hint = QLabel(
-            "未勾选：不写 URL | 勾选：仅对「允许」列勾选的行写入 URL；未勾「允许」的行不写 URL"
+            "未勾选：导出文件中 URL 列为空。勾选：仅「允许」为是的行写入 URL。"
         )
         self.lbl_hint.setObjectName("hintLabel")
+        # 说明在复选框下方一行区域展示；窄宽度时允许折行
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setMinimumWidth(0)
+        self.lbl_hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.btn_print = QPushButton("🖨 打印")
         self.btn_print.setObjectName("btnAccent")
         self.btn_print.clicked.connect(self.export_excel)
@@ -811,14 +277,18 @@ class BillApp(QMainWindow):
         self.btn_bulk_fill = QPushButton("📋 批量填充")
         self.btn_bulk_fill.setObjectName("btnAccent")
         self.btn_bulk_fill.clicked.connect(self.bulk_fill_selected)
+        self.btn_bulk_fill.setParent(bill_page)
+        self.btn_bulk_fill.hide()
         self.btn_delete_sel = QPushButton("🗑 删除选中")
         self.btn_delete_sel.setObjectName("btnDanger")
         self.btn_delete_sel.clicked.connect(self.delete_selected)
         print_opt_layout = QVBoxLayout()
         print_opt_layout.setContentsMargins(0, 0, 0, 0)
         print_opt_layout.setSpacing(2)
-        print_opt_layout.addWidget(self.chk_print_url)
-        print_opt_layout.addWidget(self.lbl_hint)
+        print_opt_layout.addWidget(
+            self.chk_print_url, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        print_opt_layout.addWidget(self.lbl_hint, 0)
         sep1 = QFrame()
         sep1.setObjectName("toolbarSep")
         sep1.setFrameShape(QFrame.VLine)
@@ -828,15 +298,16 @@ class BillApp(QMainWindow):
         for w in [self.btn_toggle_sidebar, self.search, btn_search, btn_clear]:
             top.addWidget(w)
         top.addWidget(sep1)
-        top.addLayout(print_opt_layout)
+        top.addLayout(print_opt_layout, 1)
         top.addWidget(sep2)
-        for w in [self.btn_print, self.btn_add, self.btn_bulk_fill]:
+        for w in [self.btn_print, self.btn_add]:
             top.addWidget(w)
         top.addStretch(1)
         bill_page_layout.addLayout(top)
 
         table_split = QWidget()
         table_split.setObjectName("tableSplit")
+        table_split.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         split_lo = QHBoxLayout(table_split)
         split_lo.setContentsMargins(0, 0, 0, 0)
         split_lo.setSpacing(0)
@@ -877,12 +348,16 @@ class BillApp(QMainWindow):
         self.table_frozen.setHorizontalHeader(hdr_main_f)
         self.table.setHorizontalHeader(hdr_main_s)
         hdr_main_f.setSectionResizeMode(0, QHeaderView.Fixed)
-        hdr_main_f.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr_main_f.setSectionResizeMode(1, QHeaderView.Interactive)
         hdr_main_s.setSectionResizeMode(QHeaderView.Interactive)
         self.table.setItemDelegateForColumn(ALLOW_PRINT_SCROLL_COL, AllowPrintUrlCellDelegate(self.table))
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        # 列总宽很大时，勿把整表宽度当作窗口最小宽度，否则初始宽度无效且无法横向缩小
+        self.table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         hdr_main_f.sectionClicked.connect(self._on_main_frozen_header_section_clicked)
         hdr_main_s.sectionClicked.connect(self._on_main_scroll_header_clicked)
+        self.table.horizontalHeader().sectionResized.connect(self._on_main_scroll_column_resized_for_url)
+        self.table_frozen.horizontalHeader().sectionResized.connect(self._on_main_frozen_section_resized)
         self.table.verticalScrollBar().valueChanged.connect(lambda v: self._sync_main_v_scroll(v, "scroll"))
         self.table_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_main_v_scroll(v, "frozen"))
         self.table.itemSelectionChanged.connect(self._sync_selection_main_to_frozen)
@@ -890,6 +365,7 @@ class BillApp(QMainWindow):
         split_lo.addWidget(self.table_frozen, 0)
         split_lo.addWidget(self.table, 1)
         table_wrap = QWidget()
+        table_wrap.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         table_layout = QVBoxLayout(table_wrap)
         table_layout.setContentsMargins(16, 10, 16, 16)
         table_layout.setSpacing(8)
@@ -904,13 +380,11 @@ class BillApp(QMainWindow):
         history_page = QWidget()
         history_page.setObjectName("stackHistoryPage")
         history_page.setAutoFillBackground(True)
+        history_page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         history_layout = QVBoxLayout(history_page)
         history_layout.setContentsMargins(16, 12, 16, 16)
         history_layout.setSpacing(10)
         history_top = QHBoxLayout()
-        history_title = QLabel("历史提单列表（只读）")
-        history_title.setObjectName("sectionTitle")
-        history_top.addWidget(history_title)
         self.history_search = QLineEdit()
         self.history_search.setPlaceholderText("搜索任务名...")
         self.history_search.setFixedWidth(220)
@@ -932,6 +406,7 @@ class BillApp(QMainWindow):
         history_layout.addLayout(history_top)
         hist_split = QWidget()
         hist_split.setObjectName("historyTableSplit")
+        hist_split.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         hist_lo = QHBoxLayout(hist_split)
         hist_lo.setContentsMargins(0, 0, 0, 0)
         hist_lo.setSpacing(0)
@@ -962,12 +437,14 @@ class BillApp(QMainWindow):
         self.history_table_frozen.setHorizontalHeader(hdr_hist_f)
         self.history_table.setHorizontalHeader(hdr_hist_s)
         hdr_hist_f.setSectionResizeMode(0, QHeaderView.Fixed)
-        hdr_hist_f.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr_hist_f.setSectionResizeMode(1, QHeaderView.Interactive)
         hdr_hist_s.setSectionResizeMode(QHeaderView.Interactive)
         self.history_table.setItemDelegateForColumn(ALLOW_PRINT_SCROLL_COL, AllowPrintUrlCellDelegate(self.history_table))
         self.history_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.history_table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         hdr_hist_f.sectionClicked.connect(self._on_hist_frozen_header_section_clicked)
         hdr_hist_s.sectionClicked.connect(self._on_history_scroll_header_clicked)
+        self.history_table_frozen.horizontalHeader().sectionResized.connect(self._on_hist_frozen_section_resized)
         self.history_table.verticalScrollBar().valueChanged.connect(lambda v: self._sync_hist_v_scroll(v, "scroll"))
         self.history_table_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_hist_v_scroll(v, "frozen"))
         self.history_table.itemSelectionChanged.connect(self._sync_selection_hist_to_frozen)
@@ -976,6 +453,52 @@ class BillApp(QMainWindow):
         hist_lo.addWidget(self.history_table, 1)
         history_layout.addWidget(hist_split, 1)
         self.content_stack.addWidget(history_page)
+
+        print_log_page = QWidget()
+        print_log_page.setObjectName("stackPrintRecordsPage")
+        print_log_page.setAutoFillBackground(True)
+        print_log_page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        pl_layout = QVBoxLayout(print_log_page)
+        pl_layout.setContentsMargins(16, 12, 16, 16)
+        pl_layout.setSpacing(10)
+        pl_top = QHBoxLayout()
+        self.print_log_search = QLineEdit()
+        self.print_log_search.setPlaceholderText("搜索文件名或路径...")
+        self.print_log_search.setFixedWidth(260)
+        self.print_log_search.textChanged.connect(self.refresh_print_records_table)
+        btn_pl_search = QPushButton("🔍 搜索")
+        btn_pl_search.setObjectName("btnGhost")
+        btn_pl_search.clicked.connect(self.on_print_log_search_clicked)
+        btn_pl_clear = QPushButton("🔄 清空筛选")
+        btn_pl_clear.setObjectName("btnGhost")
+        btn_pl_clear.clicked.connect(self.clear_print_log_search_and_filters)
+        self.btn_print_log_delete = QPushButton("🗑 批量删除选中")
+        self.btn_print_log_delete.setObjectName("btnDanger")
+        self.btn_print_log_delete.clicked.connect(self.delete_selected_print_records)
+        pl_top.addWidget(self.print_log_search)
+        pl_top.addWidget(btn_pl_search)
+        pl_top.addWidget(btn_pl_clear)
+        pl_top.addStretch(1)
+        pl_top.addWidget(self.btn_print_log_delete)
+        pl_layout.addLayout(pl_top)
+
+        pl_headers = [HEADERS["checked"]] + [PRINT_LOG_HEADERS[k] for k in PRINT_LOG_DATA_FIELDS] + ["操作"]
+        self.print_log_table = QTableWidget(0, PRINT_LOG_COL_COUNT)
+        self.print_log_table.setObjectName("historyScrollPart")
+        self.print_log_table.setHorizontalHeaderLabels(pl_headers)
+        self.print_log_table.verticalHeader().setVisible(False)
+        self.print_log_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.print_log_table.setAlternatingRowColors(True)
+        self.print_log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.print_log_table.cellClicked.connect(self.on_print_log_cell_clicked)
+        hdr_print = HoverFilterHeaderView(self.print_log_table, self, "print_rec")
+        self.print_log_table.setHorizontalHeader(hdr_print)
+        hdr_print.setSectionResizeMode(QHeaderView.Interactive)
+        hdr_print.sectionClicked.connect(self._on_print_rec_header_section_clicked)
+        self.print_log_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.print_log_table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        pl_layout.addWidget(self.print_log_table, 1)
+        self.content_stack.addWidget(print_log_page)
 
         settings_page = QWidget()
         settings_page.setObjectName("stackSettingsPage")
@@ -1012,19 +535,71 @@ class BillApp(QMainWindow):
         self.show_bill_page()
 
         # 与滚动区列顺序一致：类型…行业、「允许」、URL…；长度须 >= MAIN_SCROLL_COLUMNS+1（含 col_widths[0] 给冻结任务名列）
-        col_widths = [310, 150, 150, 120, 72, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 170, 90]
+        # 滚动区列序与 col_widths[1:] 对齐；末四列为 提单时间、打印次数、打印时间、操作（原打印相关宽顺序已随列序调整）
+        col_widths = [260, 150, 150, 120, 72, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 168, 170, 72, 90, 100]
         self.table_frozen.setColumnWidth(0, 42)
         self.table_frozen.setColumnWidth(1, col_widths[0])
-        self.table_frozen.setFixedWidth(42 + col_widths[0])
         for s in range(MAIN_SCROLL_COLUMNS):
             self.table.setColumnWidth(s, col_widths[s + 1])
         self.history_table_frozen.setColumnWidth(0, 42)
         self.history_table_frozen.setColumnWidth(1, col_widths[0])
-        self.history_table_frozen.setFixedWidth(42 + col_widths[0])
         hist_widths = col_widths + [160]
         for s in range(HISTORY_SCROLL_COLUMNS):
             self.history_table.setColumnWidth(s, hist_widths[s + 1])
+        self.print_log_table.setColumnWidth(0, 44)
+        _pw = [300, 168, 88, 100, 88, 380, 168]
+        for s, w in enumerate(_pw, start=1):
+            self.print_log_table.setColumnWidth(s, w)
         self.table_frozen.itemChanged.connect(self.on_item_changed)
+        self._apply_initial_window_geometry()
+        self._on_main_frozen_section_resized()
+        self._on_hist_frozen_section_resized()
+
+    def _apply_initial_window_geometry(self):
+        """初始窗口宽度 1500；高度为可用区估算值再加 50（无屏信息时 910）；窗口可自由拉伸。"""
+        w, h = 1500, 910
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            ag = screen.availableGeometry()
+            h = max(520, min(int(ag.height() * 0.88), ag.height() - 8)) + 50
+            h = min(h, ag.height() - 8)
+            x = ag.left() + max(0, (ag.width() - w) // 2)
+            y = ag.top() + max(0, (ag.height() - h) // 2)
+            self.setGeometry(x, y, w, h)
+        # 统一再设客户区宽高，避免最小宽度约束导致实际宽度大于目标值
+        self.resize(w, h)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "_bill_post_show_geo", False):
+            return
+        self._bill_post_show_geo = True
+        QTimer.singleShot(0, self._apply_initial_window_geometry)
+
+    def _on_main_frozen_section_resized(self, *_args):
+        """冻结区仅横向不滚动：勾选列固定宽，任务名列可调；总宽随两列之和更新。"""
+        hf = self.table_frozen.horizontalHeader()
+        hf.blockSignals(True)
+        try:
+            w0 = max(36, self.table_frozen.columnWidth(0))
+            w1 = max(120, min(self.table_frozen.columnWidth(1), 2000))
+            self.table_frozen.setColumnWidth(0, w0)
+            self.table_frozen.setColumnWidth(1, w1)
+            self.table_frozen.setFixedWidth(w0 + w1)
+        finally:
+            hf.blockSignals(False)
+
+    def _on_hist_frozen_section_resized(self, *_args):
+        hf = self.history_table_frozen.horizontalHeader()
+        hf.blockSignals(True)
+        try:
+            w0 = max(36, self.history_table_frozen.columnWidth(0))
+            w1 = max(120, min(self.history_table_frozen.columnWidth(1), 2000))
+            self.history_table_frozen.setColumnWidth(0, w0)
+            self.history_table_frozen.setColumnWidth(1, w1)
+            self.history_table_frozen.setFixedWidth(w0 + w1)
+        finally:
+            hf.blockSignals(False)
 
     def load_theme(self):
         if THEME_FILE.exists():
@@ -1056,26 +631,39 @@ class BillApp(QMainWindow):
         self.sidebar.setVisible(visible)
         self.btn_toggle_sidebar.setText("📂 菜单" if visible else "📂 展开")
 
+    def _restyle_sidebar_nav(self, page: str):
+        styles = {
+            "bill": ("navActive", "navNormal", "navNormal", "navNormal"),
+            "history": ("navNormal", "navActive", "navNormal", "navNormal"),
+            "print": ("navNormal", "navNormal", "navActive", "navNormal"),
+            "settings": ("navNormal", "navNormal", "navNormal", "navActive"),
+        }
+        names = styles[page]
+        for w, oname in zip((self.nav_bill, self.nav_history, self.nav_print_records, self.nav_settings), names):
+            w.setObjectName(oname)
+            w.style().unpolish(w)
+            w.style().polish(w)
+
     def show_bill_page(self):
         self.content_stack.setCurrentIndex(0)
-        self.nav_bill.setObjectName("navActive")
-        self.nav_history.setObjectName("navNormal")
-        self.nav_settings.setObjectName("navNormal")
+        self._restyle_sidebar_nav("bill")
         self.apply_theme()
 
     def show_history_page(self):
         self.content_stack.setCurrentIndex(1)
-        self.nav_bill.setObjectName("navNormal")
-        self.nav_history.setObjectName("navActive")
-        self.nav_settings.setObjectName("navNormal")
+        self._restyle_sidebar_nav("history")
         self.refresh_history_table()
         self.apply_theme()
 
-    def show_settings_page(self):
+    def show_print_records_page(self):
         self.content_stack.setCurrentIndex(2)
-        self.nav_bill.setObjectName("navNormal")
-        self.nav_history.setObjectName("navNormal")
-        self.nav_settings.setObjectName("navActive")
+        self._restyle_sidebar_nav("print")
+        self.refresh_print_records_table()
+        self.apply_theme()
+
+    def show_settings_page(self):
+        self.content_stack.setCurrentIndex(3)
+        self._restyle_sidebar_nav("settings")
         self.apply_theme()
 
     def update_time(self):
@@ -1084,6 +672,8 @@ class BillApp(QMainWindow):
     def default_record(self):
         d = {k: "" for k in FIELDS} | {"checked": False, "created_at": ""}
         d["allow_print_url"] = True
+        d["print_count"] = 0
+        d["last_printed_at"] = ""
         return d
 
     def load_data(self):
@@ -1095,6 +685,13 @@ class BillApp(QMainWindow):
         for rec in self.records:
             rec.setdefault("created_at", "")
             rec["allow_print_url"] = coerce_allow_print_url(rec.get("allow_print_url"))
+            rec.setdefault("print_count", 0)
+            try:
+                rec["print_count"] = int(rec.get("print_count", 0) or 0)
+            except (TypeError, ValueError):
+                rec["print_count"] = 0
+            rec.setdefault("last_printed_at", "")
+            rec["last_printed_at"] = str(rec.get("last_printed_at", "") or "")
         if not self.records:
             self.records = [self.default_record()]
 
@@ -1109,6 +706,13 @@ class BillApp(QMainWindow):
             rec.setdefault("deleted_at", "")
             rec.setdefault("created_at", "")
             rec["allow_print_url"] = coerce_allow_print_url(rec.get("allow_print_url"))
+            rec.setdefault("print_count", 0)
+            try:
+                rec["print_count"] = int(rec.get("print_count", 0) or 0)
+            except (TypeError, ValueError):
+                rec["print_count"] = 0
+            rec.setdefault("last_printed_at", "")
+            rec["last_printed_at"] = str(rec.get("last_printed_at", "") or "")
 
     def load_picker_recent(self):
         if PICKER_RECENT_FILE.exists():
@@ -1140,9 +744,402 @@ class BillApp(QMainWindow):
         HISTORY_FILE.write_text(json.dumps(self.history_records, ensure_ascii=False, indent=2), encoding="utf-8")
         self.lbl_save.setText("已自动保存")
 
+    def load_print_records(self):
+        if PRINT_RECORDS_FILE.exists():
+            try:
+                raw = json.loads(PRINT_RECORDS_FILE.read_text(encoding="utf-8"))
+                rows = [x for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
+            except Exception:
+                rows = []
+        else:
+            rows = []
+        for rec in rows:
+            rec.setdefault("id", str(uuid.uuid4()))
+            rec.setdefault("path", "")
+            p = str(rec.get("path", "") or "").strip()
+            if p:
+                rec["path"] = p
+            fn = str(rec.get("filename", "") or "").strip()
+            if not fn and p:
+                rec["filename"] = os.path.basename(p)
+            elif not fn:
+                rec["filename"] = "导出.xlsx"
+            try:
+                rec["row_count"] = int(rec.get("row_count", 0) or 0)
+            except (TypeError, ValueError):
+                rec["row_count"] = 0
+            if "include_print_url" not in rec:
+                rec["include_print_url"] = False
+            else:
+                rec["include_print_url"] = bool(rec.get("include_print_url"))
+        self.print_records = [r for r in rows if str(r.get("path", "") or "").strip()]
+
+    def save_print_records(self):
+        clean = [{k: v for k, v in r.items() if k != "checked"} for r in self.print_records]
+        PRINT_RECORDS_FILE.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.lbl_save.setText("已自动保存")
+
+    @staticmethod
+    def _print_record_file_ok(rec: dict) -> bool:
+        p = str(rec.get("path", "") or "").strip()
+        if not p:
+            return False
+        try:
+            return Path(p).is_file()
+        except OSError:
+            return False
+
+    def _print_cell_display_for_filter(self, rec: dict, field: str) -> str:
+        if field == "row_count":
+            return str(int(rec.get("row_count", 0) or 0))
+        if field == "include_print_url":
+            return "是" if rec.get("include_print_url") else "否"
+        if field == "file_exists":
+            return "存在" if self._print_record_file_ok(rec) else "缺失"
+        if field == "filename":
+            return str(rec.get("filename", "") or "")
+        if field == "printed_at":
+            return BillApp._created_at_filter_key(rec.get("printed_at"))
+        if field == "path":
+            return str(rec.get("path", "") or "")
+        return ""
+
+    def _print_row_matches_header_filters_except(self, rec: dict, skip_field: str | None) -> bool:
+        for field, vals in self.print_header_filters.items():
+            if skip_field and field == skip_field:
+                continue
+            if not vals:
+                continue
+            if field == "printed_at":
+                dk = BillApp._created_at_filter_key(rec.get("printed_at"))
+                allowed = {BillApp._created_at_filter_key(x) for x in vals}
+                if dk not in allowed:
+                    return False
+            elif self._print_cell_display_for_filter(rec, field) not in vals:
+                return False
+        return True
+
+    def _print_row_matches_header_filters(self, rec: dict) -> bool:
+        return self._print_row_matches_header_filters_except(rec, None)
+
+    def _unique_display_values_print(self, field: str) -> list[str]:
+        query = self.print_log_search.text().strip().lower()
+        out: list[str] = []
+        seen: set[str] = set()
+        for r in self.print_records:
+            if query:
+                fn = str(r.get("filename", "")).lower()
+                pt = str(r.get("path", "")).lower()
+                if query not in fn and query not in pt:
+                    continue
+            if not self._print_row_matches_header_filters_except(r, field):
+                continue
+            dv = self._print_cell_display_for_filter(r, field)
+            if dv not in seen:
+                seen.add(dv)
+                out.append(dv)
+        if field == "printed_at":
+            out = BillApp._unique_created_at_filter_options(out)
+        else:
+            out.sort(key=lambda s: (s == "", s.casefold()))
+        return out
+
+    def _sort_key_print_field(self, rec: dict, field: str) -> Any:
+        if field == "row_count":
+            try:
+                return int(rec.get("row_count", 0) or 0)
+            except (TypeError, ValueError):
+                return -1
+        if field == "include_print_url":
+            return 1 if rec.get("include_print_url") else 0
+        if field == "file_exists":
+            return 1 if self._print_record_file_ok(rec) else 0
+        if field == "printed_at":
+            return str(rec.get("printed_at", "") or "").strip()
+        if field == "filename":
+            return str(rec.get("filename", "") or "").lower()
+        if field == "path":
+            return str(rec.get("path", "") or "").lower()
+        return ""
+
+    def _toggle_print_sort_for_field(self, field: str):
+        if self.print_sort_field == field:
+            if self.print_sort_order == Qt.SortOrder.AscendingOrder:
+                self.print_sort_order = Qt.SortOrder.DescendingOrder
+            else:
+                self.print_sort_field = None
+        else:
+            self.print_sort_field = field
+            self.print_sort_order = Qt.SortOrder.AscendingOrder
+        self.refresh_print_records_table()
+
+    def _on_print_rec_header_section_clicked(self, section: int):
+        if section < 1 or section > len(PRINT_LOG_DATA_FIELDS):
+            return
+        field = PRINT_LOG_DATA_FIELDS[section - 1]
+        self._toggle_print_sort_for_field(field)
+
+    def _update_print_log_header_sort_indicator(self):
+        h = self.print_log_table.horizontalHeader()
+        h.setSortIndicatorShown(False)
+        if not self.print_sort_field or self.print_sort_field not in PRINT_LOG_DATA_FIELDS:
+            return
+        si = PRINT_LOG_DATA_FIELDS.index(self.print_sort_field) + 1
+        h.setSortIndicatorShown(True)
+        h.setSortIndicator(si, self.print_sort_order)
+
+    def _update_print_log_header_tooltips(self):
+        for s in range(self.print_log_table.columnCount()):
+            field = self._field_for_header_section("print_rec", s)
+            if not field:
+                continue
+            title = PRINT_LOG_HEADERS.get(field, field)
+            tip = title + "\n单击：排序；悬停右侧 ▼ 筛选"
+            vals = self.print_header_filters.get(field)
+            if vals:
+                tip += f"\n已选 {len(vals)} 项"
+            it = self.print_log_table.horizontalHeaderItem(s)
+            if it:
+                it.setToolTip(tip)
+
+    def update_print_log_header_check(self):
+        it = self.print_log_table.horizontalHeaderItem(0)
+        if not it:
+            return
+        if not self.print_log_filtered_indices:
+            it.setText("☐")
+            return
+        checked_count = sum(1 for i in self.print_log_filtered_indices if self.print_records[i].get("checked"))
+        n = len(self.print_log_filtered_indices)
+        symbol = "☐" if checked_count == 0 else ("☑" if checked_count == n else "◩")
+        it.setText(symbol)
+
+    def _on_print_log_header_col0_clicked(self):
+        if not self.print_log_filtered_indices:
+            return
+        all_checked = all(self.print_records[i].get("checked") for i in self.print_log_filtered_indices)
+        for i in self.print_log_filtered_indices:
+            self.print_records[i]["checked"] = not all_checked
+        self.refresh_print_records_table()
+
+    def on_print_log_cell_clicked(self, row: int, col: int):
+        if self.updating_table or col != 0:
+            return
+        if row < 0 or row >= len(self.print_log_filtered_indices):
+            return
+        rec_idx = self.print_log_filtered_indices[row]
+        cur = bool(self.print_records[rec_idx].get("checked"))
+        self.print_records[rec_idx]["checked"] = not cur
+        self.refresh_print_records_table()
+
+    def on_print_log_checkbox_changed(self, rec_idx: int, checked: bool):
+        if self.updating_table:
+            return
+        if 0 <= rec_idx < len(self.print_records):
+            self.print_records[rec_idx]["checked"] = bool(checked)
+            self.refresh_print_records_table()
+
+    def on_print_log_search_clicked(self):
+        self.print_header_filters.clear()
+        self.refresh_print_records_table()
+
+    def clear_print_log_search_and_filters(self):
+        self.print_log_search.setText("")
+        self.print_header_filters.clear()
+        self.print_sort_field = "printed_at"
+        self.print_sort_order = Qt.SortOrder.DescendingOrder
+        self.refresh_print_records_table()
+
+    def refresh_print_records_table(self):
+        self.updating_table = True
+        query = self.print_log_search.text().strip().lower()
+        self.print_log_filtered_indices = [
+            i
+            for i, r in enumerate(self.print_records)
+            if (
+                not query
+                or query in str(r.get("filename", "")).lower()
+                or query in str(r.get("path", "")).lower()
+            )
+            and self._print_row_matches_header_filters(r)
+        ]
+        if not self.print_sort_field:
+            self.print_log_filtered_indices.sort(
+                key=lambda i: str(self.print_records[i].get("printed_at", "") or ""), reverse=True
+            )
+        else:
+            f = self.print_sort_field
+            rev = self.print_sort_order == Qt.SortOrder.DescendingOrder
+            self.print_log_filtered_indices.sort(
+                key=lambda i, ff=f: self._sort_key_print_field(self.print_records[i], ff), reverse=rev
+            )
+        n = len(self.print_log_filtered_indices)
+        self.print_log_table.setRowCount(n)
+        h = self._data_row_height
+        for row, rec_idx in enumerate(self.print_log_filtered_indices):
+            rec = self.print_records[rec_idx]
+            box_wrap = QWidget()
+            box_layout = QHBoxLayout(box_wrap)
+            box_layout.setContentsMargins(0, 0, 0, 0)
+            box_layout.setAlignment(Qt.AlignCenter)
+            chk = QCheckBox()
+            chk.setChecked(bool(rec.get("checked")))
+            chk.stateChanged.connect(lambda _s, x=rec_idx, c=chk: self.on_print_log_checkbox_changed(x, c.isChecked()))
+            box_layout.addWidget(chk)
+            self.print_log_table.setCellWidget(row, 0, box_wrap)
+            ph0 = QTableWidgetItem("")
+            ph0.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.print_log_table.setItem(row, 0, ph0)
+
+            fn = str(rec.get("filename", "") or "")
+            it_fn = QTableWidgetItem(fn)
+            it_fn.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            it_fn.setToolTip(fn)
+            it_fn.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.print_log_table.setItem(row, 1, it_fn)
+
+            it_time = QTableWidgetItem(str(rec.get("printed_at", "") or ""))
+            it_time.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            it_time.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.print_log_table.setItem(row, 2, it_time)
+
+            rc = int(rec.get("row_count", 0) or 0)
+            it_rc = QTableWidgetItem(str(rc))
+            it_rc.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            it_rc.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.print_log_table.setItem(row, 3, it_rc)
+
+            iurl = QTableWidgetItem("是" if rec.get("include_print_url") else "否")
+            iurl.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            iurl.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.print_log_table.setItem(row, 4, iurl)
+
+            ok = self._print_record_file_ok(rec)
+            st = QTableWidgetItem("存在" if ok else "缺失")
+            st.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            st.setForeground(QColor("#2e8b57" if ok else "#c93042"))
+            st.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.print_log_table.setItem(row, 5, st)
+
+            pth = str(rec.get("path", "") or "")
+            disp = pth if len(pth) <= 64 else pth[:30] + "…" + pth[-28:]
+            it_p = QTableWidgetItem(disp)
+            it_p.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            it_p.setToolTip(pth)
+            it_p.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.print_log_table.setItem(row, 6, it_p)
+
+            act = QWidget()
+            al = QHBoxLayout(act)
+            al.setContentsMargins(4, 2, 4, 2)
+            al.setSpacing(6)
+            bp = QPushButton("预览")
+            bp.setObjectName("btnGhost")
+            bp.clicked.connect(lambda _=False, p=pth: self.preview_print_record_file(p))
+            bd = QPushButton("下载")
+            bd.setObjectName("btnGhost")
+            bd.clicked.connect(lambda _=False, p=pth: self.download_print_record_file(p))
+            al.addWidget(bp)
+            al.addWidget(bd)
+            self.print_log_table.setCellWidget(row, 7, act)
+
+        for r in range(n):
+            self.print_log_table.setRowHeight(r, h)
+        self._update_print_log_header_sort_indicator()
+        self._update_print_log_header_tooltips()
+        self.update_print_log_header_check()
+        self.updating_table = False
+
+    def preview_print_record_file(self, path: str):
+        p = Path(path)
+        if not p.is_file():
+            QMessageBox.warning(self, "预览", "文件不存在或已被移动，可勾选后批量删除无效记录。")
+            return
+        if p.suffix.lower() != ".xlsx":
+            QMessageBox.information(self, "预览", "暂仅支持预览 .xlsx 表格内容。")
+            return
+        hint = ""
+        try:
+            wb = load_workbook(str(p), read_only=True, data_only=True)
+            try:
+                ws = wb[wb.sheetnames[0]]
+                max_rows = min(int(ws.max_row or 1), 200)
+                max_cols = min(int(ws.max_column or 1), 64)
+                lines: list[str] = []
+                for row in ws.iter_rows(min_row=1, max_row=max_rows, max_col=max_cols, values_only=True):
+                    cells: list[str] = []
+                    for v in row:
+                        if v is None:
+                            cells.append("")
+                        else:
+                            cells.append(str(v).replace("\t", " ").replace("\n", " "))
+                    lines.append("\t".join(cells))
+                text = "\n".join(lines)
+                if (ws.max_row or 0) > 200:
+                    hint = f"\n\n…（仅显示前 200 行，共 {ws.max_row} 行）"
+            finally:
+                wb.close()
+        except Exception as e:
+            QMessageBox.warning(self, "预览失败", str(e))
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"预览 — {p.name}")
+        dlg.resize(960, 720)
+        dlg.setMinimumSize(640, 400)
+        te = QPlainTextEdit()
+        te.setReadOnly(True)
+        te.setPlainText(text + hint)
+        te.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        te.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        te.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        lo = QVBoxLayout(dlg)
+        lo.setContentsMargins(8, 8, 8, 8)
+        lo.addWidget(te, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject)
+        lo.addWidget(bb)
+        dlg.exec()
+
+    def download_print_record_file(self, path: str):
+        p = Path(path)
+        if not p.is_file():
+            QMessageBox.warning(self, "下载", "文件不存在或已被移动。")
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "保存副本", str(Path.home() / p.name), "Excel (*.xlsx);;所有文件 (*.*)"
+        )
+        if not dest:
+            return
+        try:
+            shutil.copy2(p, dest)
+        except OSError as e:
+            QMessageBox.warning(self, "下载失败", str(e))
+            return
+        QMessageBox.information(self, "下载", f"已保存至:\n{dest}")
+
+    def delete_selected_print_records(self):
+        to_del = [i for i, r in enumerate(self.print_records) if r.get("checked")]
+        if not to_del:
+            QMessageBox.information(self, "提示", "请先勾选要删除的打印记录")
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "确认删除",
+                f"将删除 {len(to_del)} 条打印记录。仅从列表移除记录，不会删除磁盘上的 Excel 文件。",
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        for idx in sorted(to_del, reverse=True):
+            self.print_records.pop(idx)
+        self.save_print_records()
+        self.refresh_print_records_table()
+
     def add_row(self):
         insert_at = self.filtered_indices[0] if self.filtered_indices else 0
         self.records.insert(insert_at, self.default_record())
+        self._shift_field_errors_after_insert(insert_at)
         self.save_data()
         self.refresh_table()
 
@@ -1163,6 +1160,7 @@ class BillApp(QMainWindow):
             if self.is_row_saved(rec):
                 self.archive_record(rec)
             self.records.pop(idx)
+            self._shift_field_errors_after_delete(idx)
         self.save_data()
         self.save_history_data()
         self.refresh_table()
@@ -1178,6 +1176,7 @@ class BillApp(QMainWindow):
         if self.is_row_saved(rec):
             self.archive_record(rec)
         self.records.pop(idx)
+        self._shift_field_errors_after_delete(idx)
         self.save_data()
         self.save_history_data()
         self.refresh_table()
@@ -1252,10 +1251,18 @@ class BillApp(QMainWindow):
             ca_hist.setTextAlignment(Qt.AlignCenter)
             ca_hist.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.history_table.setItem(row, len(FIELDS) - 1, ca_hist)
+            pc_hist = QTableWidgetItem(str(int(rec.get("print_count", 0) or 0)))
+            pc_hist.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            pc_hist.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.history_table.setItem(row, len(FIELDS), pc_hist)
+            pt_hist = QTableWidgetItem(str(rec.get("last_printed_at", "") or ""))
+            pt_hist.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            pt_hist.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.history_table.setItem(row, len(FIELDS) + 1, pt_hist)
             deleted_item = QTableWidgetItem(str(rec.get("deleted_at", "")))
             deleted_item.setTextAlignment(Qt.AlignCenter)
             deleted_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.history_table.setItem(row, len(FIELDS), deleted_item)
+            self.history_table.setItem(row, len(FIELDS) + 2, deleted_item)
         h = self._data_row_height
         for r in range(n):
             self.history_table.setRowHeight(r, h)
@@ -1304,6 +1311,11 @@ class BillApp(QMainWindow):
             src = self.history_records[idx]
             rec = {k: src.get(k, "") for k in FIELDS}
             rec["allow_print_url"] = coerce_allow_print_url(src.get("allow_print_url"))
+            try:
+                rec["print_count"] = int(src.get("print_count", 0) or 0)
+            except (TypeError, ValueError):
+                rec["print_count"] = 0
+            rec["last_printed_at"] = str(src.get("last_printed_at", "") or "")
             rec["checked"] = False
             rec["created_at"] = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
             self.records.append(rec)
@@ -1324,6 +1336,10 @@ class BillApp(QMainWindow):
             return "是" if coerce_allow_print_url(rec.get("allow_print_url")) else "否"
         if field == "url":
             return first_url(rec.get(field, ""))
+        if field == "print_count":
+            return str(int(rec.get("print_count", 0) or 0))
+        if field == "last_printed_at":
+            return str(rec.get("last_printed_at", "") or "")
         return str(rec.get(field, ""))
 
     @staticmethod
@@ -1365,7 +1381,8 @@ class BillApp(QMainWindow):
 
     @staticmethod
     def _created_at_filter_key(raw: Any) -> str:
-        """表头筛选用：只保留 YYYY-MM-DD，同一日期去重；选项中不显示时分秒。"""
+        """表头筛选用：只保留 YYYY-MM-DD，同一日期去重；选项中不显示时分秒。
+        亦用于「打印时间」last_printed_at / 打印记录 printed_at（支持 YYYY/MM/DD …）。"""
         t = str(raw or "").strip()
         if not t:
             return ""
@@ -1462,6 +1479,10 @@ class BillApp(QMainWindow):
     def _cell_display_for_filter_main(self, rec: dict, field: str) -> str:
         if field == "created_at":
             return BillApp._created_at_filter_key(rec.get("created_at"))
+        if field == "print_count":
+            return str(int(rec.get("print_count", 0) or 0))
+        if field == "last_printed_at":
+            return BillApp._created_at_filter_key(rec.get("last_printed_at"))
         if field in ("type_code", "operator_code"):
             return self.display_val(rec, field) or str(rec.get(field, "") or "")
         if field == "allow_print_url":
@@ -1479,6 +1500,11 @@ class BillApp(QMainWindow):
                 continue
             if field == "created_at":
                 dk = BillApp._created_at_filter_key(rec.get("created_at"))
+                allowed = {BillApp._created_at_filter_key(x) for x in vals}
+                if dk not in allowed:
+                    return False
+            elif field == "last_printed_at":
+                dk = BillApp._created_at_filter_key(rec.get("last_printed_at"))
                 allowed = {BillApp._created_at_filter_key(x) for x in vals}
                 if dk not in allowed:
                     return False
@@ -1503,6 +1529,8 @@ class BillApp(QMainWindow):
                 seen.add(dv)
                 out.append(dv)
         if field == "created_at":
+            out = BillApp._unique_created_at_filter_options(out)
+        elif field == "last_printed_at":
             out = BillApp._unique_created_at_filter_options(out)
         else:
             out.sort(key=lambda s: (s == "", s.casefold()))
@@ -1534,6 +1562,10 @@ class BillApp(QMainWindow):
     def _field_for_header_section(self, mode: str, section: int) -> str | None:
         if mode in ("main_frozen", "hist_frozen"):
             return None if section == 0 else "task_name"
+        if mode == "print_rec":
+            if section == 0 or section > len(PRINT_LOG_DATA_FIELDS):
+                return None
+            return PRINT_LOG_DATA_FIELDS[section - 1]
         if mode == "main_scroll":
             return self._main_scroll_field_for_section(section)
         if mode == "hist_scroll":
@@ -1564,6 +1596,8 @@ class BillApp(QMainWindow):
             h = self.history_table_frozen.horizontalHeader()
         elif mode == "hist_scroll":
             h = self.history_table.horizontalHeader()
+        elif mode == "print_rec":
+            h = self.print_log_table.horizontalHeader()
         else:
             return None
         if not isinstance(h, HoverFilterHeaderView):
@@ -1578,10 +1612,13 @@ class BillApp(QMainWindow):
         if mode.startswith("main"):
             opts = self._unique_display_values_main(field)
             cur = set(self.header_filters.get(field, ()))
+        elif mode.startswith("print"):
+            opts = self._unique_display_values_print(field)
+            cur = set(self.print_header_filters.get(field, ()))
         else:
             opts = self._unique_display_values_hist(field)
             cur = set(self.history_header_filters.get(field, ()))
-        if field == "created_at":
+        if field in ("created_at", "last_printed_at", "printed_at"):
             cur = {BillApp._created_at_filter_key(x) for x in cur}
         title = HEADERS.get(field, field)
         self._close_column_filter_popup()
@@ -1626,6 +1663,10 @@ class BillApp(QMainWindow):
             return FIELDS[section + 1]
         if section == len(FIELDS) - 1:
             return "created_at"
+        if section == len(FIELDS):
+            return "print_count"
+        if section == len(FIELDS) + 1:
+            return "last_printed_at"
         return None
 
     def _on_main_scroll_header_clicked(self, section: int):
@@ -1638,6 +1679,13 @@ class BillApp(QMainWindow):
         rec = self.records[rec_idx]
         if field == "created_at":
             return self._created_at_sort_key(rec)
+        if field == "print_count":
+            try:
+                return int(rec.get("print_count", 0) or 0)
+            except (TypeError, ValueError):
+                return -1
+        if field == "last_printed_at":
+            return str(rec.get("last_printed_at", "") or "").strip()
         if field in ("quantity", "age_max", "age_min", "pv"):
             raw = str(rec.get(field, "") or "").strip()
             if not raw:
@@ -1677,6 +1725,15 @@ class BillApp(QMainWindow):
         if f == "created_at":
             hs.setSortIndicatorShown(True)
             hs.setSortIndicator(len(FIELDS) - 1, self.header_sort_order)
+            return
+        if f == "print_count":
+            hs.setSortIndicatorShown(True)
+            hs.setSortIndicator(len(FIELDS), self.header_sort_order)
+            return
+        if f == "last_printed_at":
+            hs.setSortIndicatorShown(True)
+            hs.setSortIndicator(len(FIELDS) + 1, self.header_sort_order)
+            return
 
     def _update_main_header_tooltips(self):
         for s in range(self.table_frozen.columnCount()):
@@ -1739,6 +1796,10 @@ class BillApp(QMainWindow):
     def _cell_display_for_filter_hist(self, rec: dict, field: str) -> str:
         if field == "deleted_at":
             return str(rec.get("deleted_at", "") or "")
+        if field == "print_count":
+            return str(int(rec.get("print_count", 0) or 0))
+        if field == "last_printed_at":
+            return BillApp._created_at_filter_key(rec.get("last_printed_at"))
         if field == "created_at":
             return BillApp._created_at_filter_key(rec.get("created_at"))
         if field in ("type_code", "operator_code"):
@@ -1757,6 +1818,11 @@ class BillApp(QMainWindow):
                 continue
             if field == "created_at":
                 dk = BillApp._created_at_filter_key(rec.get("created_at"))
+                allowed = {BillApp._created_at_filter_key(x) for x in vals}
+                if dk not in allowed:
+                    return False
+            elif field == "last_printed_at":
+                dk = BillApp._created_at_filter_key(rec.get("last_printed_at"))
                 allowed = {BillApp._created_at_filter_key(x) for x in vals}
                 if dk not in allowed:
                     return False
@@ -1782,6 +1848,8 @@ class BillApp(QMainWindow):
                 out.append(dv)
         if field == "created_at":
             out = BillApp._unique_created_at_filter_options(out)
+        elif field == "last_printed_at":
+            out = BillApp._unique_created_at_filter_options(out)
         else:
             out.sort(key=lambda s: (s == "", s.casefold()))
         return out
@@ -1798,6 +1866,13 @@ class BillApp(QMainWindow):
             return str(rec.get("deleted_at", "") or "")
         if field == "created_at":
             return self._created_at_sort_key(rec)
+        if field == "print_count":
+            try:
+                return int(rec.get("print_count", 0) or 0)
+            except (TypeError, ValueError):
+                return -1
+        if field == "last_printed_at":
+            return str(rec.get("last_printed_at", "") or "").strip()
         if field in ("quantity", "age_max", "age_min", "pv"):
             raw = str(rec.get(field, "") or "").strip()
             if not raw:
@@ -1852,9 +1927,17 @@ class BillApp(QMainWindow):
             hs.setSortIndicatorShown(True)
             hs.setSortIndicator(len(FIELDS) - 1, self.history_sort_order)
             return
-        if f == "deleted_at":
+        if f == "print_count":
             hs.setSortIndicatorShown(True)
             hs.setSortIndicator(len(FIELDS), self.history_sort_order)
+            return
+        if f == "last_printed_at":
+            hs.setSortIndicatorShown(True)
+            hs.setSortIndicator(len(FIELDS) + 1, self.history_sort_order)
+            return
+        if f == "deleted_at":
+            hs.setSortIndicatorShown(True)
+            hs.setSortIndicator(len(FIELDS) + 2, self.history_sort_order)
 
     def _update_history_header_tooltips(self):
         for s in range(self.history_table_frozen.columnCount()):
@@ -1881,6 +1964,83 @@ class BillApp(QMainWindow):
             if it:
                 it.setToolTip(tip)
 
+    def _url_cell_editor_display_height(self) -> int:
+        """URL 编辑框固定单行高度；不换行、无滚动条，用左右方向键移动光标查看超出部分。"""
+        fm = QFontMetrics(self.table.font())
+        inner = fm.height() + 8
+        return max(26, min(self._data_row_height - 4, inner))
+
+    def _url_plain_editor_at(self, row: int, url_col: int) -> QPlainTextEdit | None:
+        """URL 列可能为外层垂直居中容器 + UrlCellEditor。"""
+        w = self.table.cellWidget(row, url_col)
+        if w is None:
+            return None
+        if isinstance(w, QPlainTextEdit) and w.objectName() == "urlCellEditor":
+            return w
+        ed = w.findChild(QPlainTextEdit, "urlCellEditor")
+        return ed if isinstance(ed, QPlainTextEdit) else None
+
+    def _on_main_scroll_column_resized_for_url(self, logical_index: int, _old_size: int, _new_size: int):
+        url_sc = FIELDS.index("url") - 1
+        if logical_index != url_sc:
+            return
+        self._reflow_all_url_row_heights()
+
+    def _reflow_all_url_row_heights(self):
+        """URL 列宽变化后，统一为单行框高（不随内容增高）。"""
+        if self.updating_table:
+            return
+        url_sc = FIELDS.index("url") - 1
+        nh = self._url_cell_editor_display_height()
+        rh = self._data_row_height
+        for row in range(self.table.rowCount()):
+            wgt = self._url_plain_editor_at(row, url_sc)
+            if wgt is None:
+                continue
+            wgt.blockSignals(True)
+            wgt.setFixedHeight(nh)
+            wgt.blockSignals(False)
+            self.table.setRowHeight(row, rh)
+            self.table_frozen.setRowHeight(row, rh)
+
+    @staticmethod
+    def _url_editor_stylesheet(has_error: bool) -> str:
+        border = "#e05263" if has_error else "rgba(148,163,184,0.35)"
+        return (
+            f"QPlainTextEdit#urlCellEditor {{ border: 1px solid {border}; border-radius: 4px; padding: 2px; }}"
+        )
+
+    def _on_url_cell_text_changed(self, rec_idx: int, ed: QPlainTextEdit):
+        if self.updating_table:
+            return
+        if rec_idx < 0 or rec_idx >= len(self.records):
+            return
+        txt = ed.toPlainText()
+        if self.records[rec_idx].get("url", "") == txt:
+            return
+        self.records[rec_idx]["url"] = txt
+        ok, msg = self.validate_record(self.records[rec_idx])
+        self.clear_error(rec_idx, "url")
+        if not ok and "URL" in msg:
+            self.mark_error(rec_idx, "url", msg)
+            ed.setStyleSheet(self._url_editor_stylesheet(True))
+        else:
+            ed.setStyleSheet(self._url_editor_stylesheet(False))
+        self.save_data()
+
+    def _on_url_cell_focus_out(self, rec_idx: int, ed: QPlainTextEdit):
+        """URL 失焦时若不符合规则则弹窗提示（输入过程中仅用红框，不弹窗）。"""
+        if self.updating_table:
+            return
+        if rec_idx < 0 or rec_idx >= len(self.records):
+            return
+        if str(self.records[rec_idx].get("url", "")) != ed.toPlainText():
+            return
+        ok, msg = self.validate_urls(ed.toPlainText())
+        if ok:
+            return
+        QMessageBox.warning(self, "URL 校验失败", msg or "URL 格式不正确")
+
     def refresh_table(self):
         self.updating_table = True
         query = self.search.text().strip().lower()
@@ -1893,8 +2053,10 @@ class BillApp(QMainWindow):
         n = len(self.filtered_indices)
         self.table.setRowCount(n)
         self.table_frozen.setRowCount(n)
+        per_row_heights: list[int] = []
         for row, rec_idx in enumerate(self.filtered_indices):
             rec = self.records[rec_idx]
+            row_max_h = self._data_row_height
             box_wrap = QWidget()
             box_layout = QHBoxLayout(box_wrap)
             box_layout.setContentsMargins(0, 0, 0, 0)
@@ -1932,10 +2094,33 @@ class BillApp(QMainWindow):
                     aw_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                     self.table.setItem(row, sc, aw_item)
                     continue
+                if f == "url":
+                    raw_u = str(rec.get("url", ""))
+                    pte = UrlCellEditor(self, rec_idx)
+                    pte.setFrameShape(QFrame.Shape.NoFrame)
+                    pte.setTabChangesFocus(True)
+                    pte.setFont(QFont(self.table.font()))
+                    pte.blockSignals(True)
+                    pte.setPlainText(raw_u)
+                    pte.blockSignals(False)
+                    pte.setFixedHeight(self._url_cell_editor_display_height())
+                    pte.textChanged.connect(lambda ri=rec_idx, ed=pte: self._on_url_cell_text_changed(ri, ed))
+                    pte.setStyleSheet(self._url_editor_stylesheet(bool(self.field_errors.get((rec_idx, "url")))))
+                    ph_url = QTableWidgetItem()
+                    ph_url.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    self.table.setItem(row, sc, ph_url)
+                    url_wrap = QWidget()
+                    url_wrap.setObjectName("urlCellWrap")
+                    url_lo = QVBoxLayout(url_wrap)
+                    url_lo.setContentsMargins(0, 0, 0, 0)
+                    url_lo.setSpacing(0)
+                    url_lo.addStretch(1)
+                    url_lo.addWidget(pte)
+                    url_lo.addStretch(1)
+                    self.table.setCellWidget(row, sc, url_wrap)
+                    continue
                 item = QTableWidgetItem(self.display_val(rec, f))
-                if f in ("url",):
-                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                elif f in ("province", "exclude_province", "city", "exclude_city"):
+                if f in ("province", "exclude_province", "city", "exclude_city"):
                     item.setFlags(
                         Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsEditable
                     )
@@ -1966,14 +2151,22 @@ class BillApp(QMainWindow):
             ca_item.setTextAlignment(Qt.AlignCenter)
             ca_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.table.setItem(row, len(FIELDS) - 1, ca_item)
+            pc_item = QTableWidgetItem(str(int(rec.get("print_count", 0) or 0)))
+            pc_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            pc_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.table.setItem(row, len(FIELDS), pc_item)
+            pt_item = QTableWidgetItem(str(rec.get("last_printed_at", "") or ""))
+            pt_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            pt_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.table.setItem(row, len(FIELDS) + 1, pt_item)
             btn = QPushButton("🗑 删除")
             btn.setObjectName("btnDanger")
             btn.clicked.connect(lambda _=False, x=rec_idx: self.delete_row(x))
             self.table.setCellWidget(row, MAIN_SCROLL_COLUMNS - 1, btn)
-        h = self._data_row_height
-        for r in range(n):
-            self.table.setRowHeight(r, h)
-            self.table_frozen.setRowHeight(r, h)
+            per_row_heights.append(row_max_h)
+        for r, rh in enumerate(per_row_heights):
+            self.table.setRowHeight(r, rh)
+            self.table_frozen.setRowHeight(r, rh)
         self.lbl_count.setText(f"提单数: {len(self.filtered_indices)}")
         self.update_header_check()
         self._update_main_header_sort_indicator()
@@ -2041,10 +2234,11 @@ class BillApp(QMainWindow):
     def on_cell_double_click(self, row, col):
         if col <= 0 or col >= len(DISPLAY_FIELDS) - 1:
             return
-        if col == len(FIELDS) + 1:
+        name = DISPLAY_FIELDS[col]
+        if name in ("print_count", "last_printed_at", "created_at", "action"):
             return
         rec_idx = self.filtered_indices[row]
-        field = FIELDS[col - 1]
+        field = name
         rec = self.records[rec_idx]
         if field == "allow_print_url":
             cur = coerce_allow_print_url(rec.get("allow_print_url"))
@@ -2053,9 +2247,10 @@ class BillApp(QMainWindow):
             self.refresh_table()
             return
         if field == "url":
-            dlg = UrlDialog(rec.get("url", ""), self)
-            if dlg.exec() == QDialog.Accepted:
-                self.apply_field_update(rec_idx, "url", dlg.value())
+            sc = FIELDS.index("url") - 1
+            ed = self._url_plain_editor_at(row, sc)
+            if ed is not None:
+                ed.setFocus()
             return
         if field in ("province", "exclude_province", "city", "exclude_city"):
             if field == "city" and rec.get("province", "").strip():
@@ -2112,25 +2307,27 @@ class BillApp(QMainWindow):
             return
         if current_col <= 0 or current_col >= len(DISPLAY_FIELDS) - 1:
             return
-        if current_col == len(FIELDS) + 1:
+        name = DISPLAY_FIELDS[current_col]
+        if name in ("print_count", "last_printed_at", "created_at", "action"):
             return
-        field = FIELDS[current_col - 1]
+        field = name
         if field == "task_name":
             self.statusBar().showMessage("任务名格式：客户名+省份/地市/全国/几省/几市+运营商码值+类型码值+行业编码-产品名", 5000)
 
     def on_table_context_menu(self, pos):
-        item = self.table.itemAt(pos)
-        if not item:
+        idx = self.table.indexAt(pos)
+        if not idx.isValid():
             return
-        row = item.row()
-        col = item.column() + FROZEN_COLUMNS
+        row = idx.row()
+        col = idx.column() + FROZEN_COLUMNS
         if row < 0 or row >= len(self.filtered_indices):
             return
         if col <= 0 or col >= len(DISPLAY_FIELDS) - 1:
             return
-        if col == len(FIELDS) + 1:
+        name = DISPLAY_FIELDS[col]
+        if name in ("print_count", "last_printed_at", "created_at", "action"):
             return
-        field = FIELDS[col - 1]
+        field = name
         if field not in ("task_name", "operator_code", "type_code", "duration"):
             return
         rec_idx = self.filtered_indices[row]
@@ -2320,11 +2517,9 @@ class BillApp(QMainWindow):
         if rec_idx not in self.filtered_indices:
             return
         row = self.filtered_indices.index(rec_idx)
-        if field == "created_at":
-            col = len(FIELDS) + 1
-        elif field in FIELDS:
-            col = FIELDS.index(field) + 1
-        else:
+        try:
+            col = DISPLAY_FIELDS.index(field)
+        except ValueError:
             col = 1
         if col <= 1:
             self.table_frozen.setCurrentCell(row, col)
@@ -2334,6 +2529,11 @@ class BillApp(QMainWindow):
             return
         sc = col - FROZEN_COLUMNS
         self.table.setCurrentCell(row, sc)
+        w = self._url_plain_editor_at(row, sc)
+        if isinstance(w, QPlainTextEdit):
+            self.table.scrollTo(self.table.model().index(row, sc))
+            w.setFocus()
+            return
         it = self.table.item(row, sc)
         if it:
             self.table.scrollToItem(it)
@@ -2356,9 +2556,10 @@ class BillApp(QMainWindow):
             return
         if col >= len(DISPLAY_FIELDS) - 1:
             return
-        if col == len(FIELDS) + 1:
+        name = DISPLAY_FIELDS[col]
+        if name in ("print_count", "last_printed_at", "created_at", "checked"):
             return
-        field = FIELDS[col - 1]
+        field = name
         if field in ("type_code", "operator_code", "duration", "url", "allow_print_url"):
             return
         if field in ("province", "exclude_province", "city", "exclude_city"):
@@ -2408,8 +2609,34 @@ class BillApp(QMainWindow):
         self.field_errors.pop((rec_idx, field), None)
         self.field_error_msgs.pop((rec_idx, field), None)
 
+    def _shift_field_errors_after_insert(self, insert_at: int):
+        """在 insert_at 插入空行后，原索引 >= insert_at 的校验错误键整体 +1。"""
+        new_err: dict[tuple[int, str], bool] = {}
+        new_msg: dict[tuple[int, str], str] = {}
+        for (ri, f), v in self.field_errors.items():
+            new_err[(ri + 1 if ri >= insert_at else ri, f)] = v
+        for (ri, f), v in self.field_error_msgs.items():
+            new_msg[(ri + 1 if ri >= insert_at else ri, f)] = v
+        self.field_errors = new_err
+        self.field_error_msgs = new_msg
+
+    def _shift_field_errors_after_delete(self, deleted_idx: int):
+        """删除 deleted_idx 行后：去掉该行错误；原索引 > deleted_idx 的键整体 -1。"""
+        new_err: dict[tuple[int, str], bool] = {}
+        new_msg: dict[tuple[int, str], str] = {}
+        for (ri, f), v in self.field_errors.items():
+            if ri == deleted_idx:
+                continue
+            new_err[(ri - 1 if ri > deleted_idx else ri, f)] = v
+        for (ri, f), v in self.field_error_msgs.items():
+            if ri == deleted_idx:
+                continue
+            new_msg[(ri - 1 if ri > deleted_idx else ri, f)] = v
+        self.field_errors = new_err
+        self.field_error_msgs = new_msg
+
     def apply_field_update(self, rec_idx: int, field: str, value: str):
-        if field == "created_at":
+        if field in ("created_at", "print_count", "last_printed_at"):
             return
         rec = self.records[rec_idx]
         old = rec.get(field, "")
@@ -2718,15 +2945,40 @@ class BillApp(QMainWindow):
         if not out_file:
             return
         wb.save(out_file)
+        stamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        for rec_idx, _r in selected_with_index:
+            rr = self.records[rec_idx]
+            try:
+                c = int(rr.get("print_count", 0) or 0)
+            except (TypeError, ValueError):
+                c = 0
+            rr["print_count"] = c + 1
+            rr["last_printed_at"] = stamp
+        self.save_data()
+        self.refresh_table()
+        self.print_records.insert(
+            0,
+            {
+                "id": str(uuid.uuid4()),
+                "path": out_file,
+                "filename": os.path.basename(out_file),
+                "printed_at": stamp,
+                "row_count": len(selected),
+                "include_print_url": include_url,
+            },
+        )
+        self.save_print_records()
+        if self.content_stack.currentIndex() == 2:
+            self.refresh_print_records_table()
         QMessageBox.information(self, "导出成功", f"已导出: {out_file}")
 
 
-def _show_license_expired_dialog() -> None:
-    """无控制台（pythonw）时也必须能看见提示。"""
-    box = QMessageBox()
+def _show_license_expired_dialog(parent: QWidget | None = None) -> None:
+    """无控制台（pythonw）时也必须能看见提示；运行中过期时 parent 为主窗口。"""
+    box = QMessageBox(parent)
     box.setIcon(QMessageBox.Icon.Critical)
     box.setWindowTitle("授权已过期")
-    box.setText(_LICENSE_EXPIRED_MSG)
+    box.setText(LICENSE_EXPIRED_MSG)
     box.setStandardButtons(QMessageBox.StandardButton.Ok)
     box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
     box.exec()

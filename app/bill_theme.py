@@ -59,6 +59,37 @@ QPushButton#navNormal:hover {
   font-size: 16px;
   font-weight: 700;
 }
+QPushButton#navSub {
+  text-align: left;
+  padding: 9px 14px 9px 26px;
+  margin: 0px 0px 0px 6px;
+  font-size: 14px;
+  font-weight: 600;
+  background-color: transparent;
+  color: rgba(210, 216, 232, 0.92);
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: 6px;
+}
+QPushButton#navSub:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+  color: #ffffff;
+}
+QPushButton#navSubActive {
+  text-align: left;
+  padding: 9px 14px 9px 26px;
+  margin: 0px 0px 0px 6px;
+  font-size: 14px;
+  font-weight: 700;
+  background-color: rgba(124, 158, 255, 0.12);
+  color: #ffffff;
+  border: none;
+  border-left: 2px solid #a8bfff;
+  border-radius: 6px;
+}
+QPushButton#navSubActive:hover {
+  background-color: rgba(124, 158, 255, 0.18);
+}
 #sideDivider {
   background-color: rgba(255, 255, 255, 0.1);
   max-height: 1px;
@@ -83,7 +114,7 @@ QTableWidget#tableScrollPart, QTableWidget#historyScrollPart {
   background-color: #141820;
   border-left: 1px solid rgba(255, 255, 255, 0.05);
 }
-#stackBillPage, #stackHistoryPage, #stackSettingsPage {
+#stackBillPage, #stackHistoryPage, #stackPrintRecordsPage, #stackSettingsPage {
   background-color: #141820;
 }
 
@@ -309,6 +340,37 @@ QPushButton#navNormal:hover {
   font-size: 16px;
   font-weight: 700;
 }
+QPushButton#navSub {
+  text-align: left;
+  padding: 9px 14px 9px 26px;
+  margin: 0px 0px 0px 6px;
+  font-size: 14px;
+  font-weight: 600;
+  background-color: transparent;
+  color: rgba(51, 65, 85, 0.95);
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: 6px;
+}
+QPushButton#navSub:hover {
+  background-color: rgba(15, 23, 42, 0.06);
+  color: #000000;
+}
+QPushButton#navSubActive {
+  text-align: left;
+  padding: 9px 14px 9px 26px;
+  margin: 0px 0px 0px 6px;
+  font-size: 14px;
+  font-weight: 700;
+  background-color: rgba(37, 99, 235, 0.1);
+  color: #000000;
+  border: none;
+  border-left: 2px solid #2563eb;
+  border-radius: 6px;
+}
+QPushButton#navSubActive:hover {
+  background-color: rgba(37, 99, 235, 0.14);
+}
 #sideDivider {
   background-color: rgba(15, 23, 42, 0.12);
   max-height: 1px;
@@ -333,7 +395,7 @@ QTableWidget#tableScrollPart, QTableWidget#historyScrollPart {
   background-color: #f6f7fb;
   border-left: 1px solid rgba(15, 23, 42, 0.06);
 }
-#stackBillPage, #stackHistoryPage, #stackSettingsPage {
+#stackBillPage, #stackHistoryPage, #stackPrintRecordsPage, #stackSettingsPage {
   background-color: #f6f7fb;
 }
 
