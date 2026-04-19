@@ -42,6 +42,68 @@ from PySide6.QtWidgets import (
 from bill_constants import PRINT_LOG_DATA_FIELDS
 
 
+def _draw_header_select_chip(painter: QPainter, chip: QRectF, *, kind: str, dark: bool) -> None:
+    """在 chip 矩形内直接绘制圆角渐变芯片 + 对号 / X（避免 macOS 上 drawPixmap 与表头样式合成不显示）。"""
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    rr = QRectF(chip.left() + 1.0, chip.top() + 1.0, chip.width() - 2.0, chip.height() - 2.0)
+    s = min(rr.width(), rr.height())
+    rad = max(4.0, s * 0.24)
+
+    if kind == "check_muted":
+        if dark:
+            c1, c2 = QColor(72, 78, 98), QColor(48, 54, 72)
+        else:
+            c1, c2 = QColor(196, 202, 216), QColor(156, 164, 180)
+    elif kind == "x":
+        if dark:
+            c1, c2 = QColor(251, 113, 133), QColor(190, 18, 60)
+        else:
+            c1, c2 = QColor(253, 164, 175), QColor(225, 29, 72)
+    elif kind == "check_partial":
+        if dark:
+            c1, c2 = QColor(251, 191, 36), QColor(217, 119, 6)
+        else:
+            c1, c2 = QColor(253, 224, 71), QColor(245, 158, 11)
+    else:
+        if dark:
+            c1, c2 = QColor(52, 211, 153), QColor(5, 150, 105)
+        else:
+            c1, c2 = QColor(110, 231, 183), QColor(22, 163, 74)
+
+    grad = QLinearGradient(rr.topLeft(), rr.bottomRight())
+    grad.setColorAt(0, c1)
+    grad.setColorAt(1, c2)
+    border_a = 50 if dark else 70
+    painter.setPen(QPen(QColor(255, 255, 255, border_a), 1.0))
+    painter.setBrush(QBrush(grad))
+    painter.drawRoundedRect(rr, rad, rad)
+
+    if kind == "check_muted":
+        sign = QColor(235, 236, 245) if dark else QColor(65, 75, 90)
+    else:
+        sign = QColor(255, 255, 255)
+    lw = max(2.0, s * 0.12)
+    pen = QPen(sign, lw)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    if kind == "x":
+        m = s * 0.3
+        painter.drawLine(QPointF(rr.left() + m, rr.top() + m), QPointF(rr.right() - m, rr.bottom() - m))
+        painter.drawLine(QPointF(rr.right() - m, rr.top() + m), QPointF(rr.left() + m, rr.bottom() - m))
+    else:
+        ax = rr.left() + rr.width() * 0.26
+        ay = rr.top() + rr.height() * 0.48
+        bx = rr.left() + rr.width() * 0.4
+        by = rr.top() + rr.height() * 0.62
+        cx = rr.left() + rr.width() * 0.74
+        cy = rr.top() + rr.height() * 0.32
+        painter.drawPolyline(QPolygonF([QPointF(ax, ay), QPointF(bx, by), QPointF(cx, cy)]))
+    painter.restore()
+
+
 def paint_frozen_select_all_header_section(
     painter: QPainter,
     rect: QRect,
@@ -49,13 +111,13 @@ def paint_frozen_select_all_header_section(
     dark: bool,
     glyph: str,
 ) -> None:
-    """冻结/打印记录表首列：彩色圆角芯片 + 对号 / X（语义同全选 / 取消全选），在格内居中。"""
+    """冻结/打印记录表首列：彩色圆角芯片 + 对号 / X，在格内居中。"""
     kind = glyph if glyph in ("check", "check_partial", "x", "check_muted") else "check_muted"
-    side = int(max(18, min(26, min(rect.width(), rect.height()) - 4)))
-    pm = make_header_select_chip_pixmap(kind=kind, dark=dark, size=side)
-    x = rect.left() + (rect.width() - pm.width()) // 2
-    y = rect.top() + (rect.height() - pm.height()) // 2
-    painter.drawPixmap(x, y, pm)
+    side = float(max(18, min(26, min(rect.width(), rect.height()) - 4)))
+    x = rect.left() + (rect.width() - side) / 2.0
+    y = rect.top() + (rect.height() - side) / 2.0
+    chip = QRectF(x, y, side, side)
+    _draw_header_select_chip(painter, chip, kind=kind, dark=dark)
 
 
 def make_sidebar_logo_pixmap(*, dark: bool, size: int = 44) -> QPixmap:
@@ -118,62 +180,11 @@ def make_sidebar_logo_pixmap(*, dark: bool, size: int = 44) -> QPixmap:
 
 
 def make_header_select_chip_pixmap(*, kind: str, dark: bool, size: int = 22) -> QPixmap:
-    """圆角渐变底：绿对号全选、琥珀对号部分、红 X 取消全选、灰对号不可用。"""
+    """圆角渐变芯片的离屏图（侧栏等如需 pixmap 可用）；表头冻结列优先用 _draw_header_select_chip 直接画。"""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    rr = QRectF(1.0, 1.0, float(size) - 2.0, float(size) - 2.0)
-    rad = max(4.0, float(size) * 0.24)
-
-    if kind == "check_muted":
-        if dark:
-            c1, c2 = QColor(72, 78, 98), QColor(48, 54, 72)
-        else:
-            c1, c2 = QColor(196, 202, 216), QColor(156, 164, 180)
-    elif kind == "x":
-        if dark:
-            c1, c2 = QColor(251, 113, 133), QColor(190, 18, 60)
-        else:
-            c1, c2 = QColor(253, 164, 175), QColor(225, 29, 72)
-    elif kind == "check_partial":
-        if dark:
-            c1, c2 = QColor(251, 191, 36), QColor(217, 119, 6)
-        else:
-            c1, c2 = QColor(253, 224, 71), QColor(245, 158, 11)
-    else:
-        if dark:
-            c1, c2 = QColor(52, 211, 153), QColor(5, 150, 105)
-        else:
-            c1, c2 = QColor(110, 231, 183), QColor(22, 163, 74)
-
-    grad = QLinearGradient(rr.topLeft(), rr.bottomRight())
-    grad.setColorAt(0, c1)
-    grad.setColorAt(1, c2)
-    border_a = 50 if dark else 70
-    painter.setPen(QPen(QColor(255, 255, 255, border_a), 1.0))
-    painter.setBrush(QBrush(grad))
-    painter.drawRoundedRect(rr, rad, rad)
-
-    if kind == "check_muted":
-        sign = QColor(235, 236, 245) if dark else QColor(65, 75, 90)
-    else:
-        sign = QColor(255, 255, 255)
-    lw = max(2.0, float(size) * 0.12)
-    pen = QPen(sign, lw)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    painter.setPen(pen)
-    fs = float(size)
-    if kind == "x":
-        m = fs * 0.3
-        painter.drawLine(QPointF(m, m), QPointF(fs - m, fs - m))
-        painter.drawLine(QPointF(fs - m, m), QPointF(m, fs - m))
-    else:
-        ax, ay = fs * 0.26, fs * 0.48
-        bx, by = fs * 0.4, fs * 0.62
-        cx, cy = fs * 0.74, fs * 0.32
-        painter.drawPolyline(QPolygonF([QPointF(ax, ay), QPointF(bx, by), QPointF(cx, cy)]))
+    _draw_header_select_chip(painter, QRectF(0, 0, float(size), float(size)), kind=kind, dark=dark)
     painter.end()
     return pm
 
@@ -480,12 +491,16 @@ class HoverFilterHeaderView(QHeaderView):
         super().paintSection(painter, rect, logical_index)
         if logical_index == 0 and self._mode in ("main_frozen", "hist_frozen", "print_rec"):
             info = self._bill._select_all_header_paint_info(self._mode)
+            painter.save()
+            painter.setOpacity(1.0)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             paint_frozen_select_all_header_section(
                 painter,
                 rect,
                 dark=self._bill.theme == "dark",
-                glyph=str(info.get("glyph", "plus_muted")),
+                glyph=str(info.get("glyph", "check_muted")),
             )
+            painter.restore()
         if self._hover_section != logical_index:
             return
         if not self._bill._header_show_filter_btn(self._mode, logical_index):

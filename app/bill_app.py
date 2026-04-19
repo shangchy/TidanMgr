@@ -558,7 +558,6 @@ class BillApp(QMainWindow):
         for s in range(HISTORY_SCROLL_COLUMNS):
             self.history_table.setColumnWidth(s, hist_widths[s + 1])
         self._sync_hist_frozen_check_column_width()
-        self.print_log_table.setColumnWidth(0, 100)
         _pw = [300, 168, 88, 100, 88, 380, 168]
         for s, w in enumerate(_pw, start=1):
             self.print_log_table.setColumnWidth(s, w)
@@ -568,8 +567,8 @@ class BillApp(QMainWindow):
         self._on_hist_frozen_section_resized()
 
     def _apply_initial_window_geometry(self):
-        """初始窗口宽度 1500；高度为可用区估算值再加 50（无屏信息时 910）；窗口可自由拉伸。"""
-        w, h = 1500, 910
+        """初始窗口宽度 1350；高度为可用区估算值再加 50（无屏信息时 910）；窗口可自由拉伸。"""
+        w, h = 1350, 910
         screen = QGuiApplication.primaryScreen()
         if screen is not None:
             ag = screen.availableGeometry()
@@ -598,6 +597,12 @@ class BillApp(QMainWindow):
         finally:
             hf.blockSignals(False)
         self._on_main_frozen_section_resized()
+        self._sync_print_log_check_column_width()
+
+    def _sync_print_log_check_column_width(self):
+        """打印记录表首列宽与提单页冻结勾选列（「允许」列宽）一致。"""
+        w = max(52, self.table.columnWidth(ALLOW_PRINT_SCROLL_COL))
+        self.print_log_table.setColumnWidth(0, w)
 
     def _sync_hist_frozen_check_column_width(self):
         hf = self.history_table_frozen.horizontalHeader()
