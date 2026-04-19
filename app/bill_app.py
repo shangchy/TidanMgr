@@ -271,9 +271,9 @@ class BillApp(QMainWindow):
         self.lbl_print_url_hint_on = QLabel("勾选：仅「允许」为是的行写入 URL。")
         for lb in (self.lbl_print_url_hint_off, self.lbl_print_url_hint_on):
             lb.setObjectName("hintLabel")
-            lb.setWordWrap(True)
-            lb.setMinimumWidth(0)
-            lb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            lb.setWordWrap(False)
+            lb.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.chk_print_url.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.chk_print_url.toggled.connect(self._update_print_url_hint_lines_style)
         self.btn_print = QPushButton("🖨 打印")
         self.btn_print.setObjectName("btnAccent")
@@ -289,7 +289,9 @@ class BillApp(QMainWindow):
         self.btn_delete_sel = QPushButton("🗑 删除选中")
         self.btn_delete_sel.setObjectName("btnDanger")
         self.btn_delete_sel.clicked.connect(self.delete_selected)
-        print_opt_layout = QVBoxLayout()
+        self.print_url_block = QWidget()
+        self.print_url_block.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        print_opt_layout = QVBoxLayout(self.print_url_block)
         print_opt_layout.setContentsMargins(0, 0, 0, 0)
         print_opt_layout.setSpacing(2)
         print_opt_layout.addWidget(
@@ -307,7 +309,7 @@ class BillApp(QMainWindow):
         for w in [self.btn_toggle_sidebar, self.search, btn_search, btn_clear]:
             top.addWidget(w)
         top.addWidget(sep1)
-        top.addLayout(print_opt_layout, 1)
+        top.addWidget(self.print_url_block, 0)
         top.addWidget(sep2)
         for w in [self.btn_print, self.btn_add]:
             top.addWidget(w)
@@ -410,7 +412,7 @@ class BillApp(QMainWindow):
         history_top.addWidget(btn_history_search)
         history_top.addWidget(btn_history_clear)
         history_top.addStretch(1)
-        self.btn_restore_selected = QPushButton("↩ 恢复选中到提单表")
+        self.btn_restore_selected = QPushButton("↩ 恢复选中")
         self.btn_restore_selected.setObjectName("btnAccent")
         self.btn_restore_selected.clicked.connect(self.restore_selected_history)
         history_top.addWidget(self.btn_restore_selected)
@@ -484,7 +486,7 @@ class BillApp(QMainWindow):
         btn_pl_clear = QPushButton("🔄 清空筛选")
         btn_pl_clear.setObjectName("btnGhost")
         btn_pl_clear.clicked.connect(self.clear_print_log_search_and_filters)
-        self.btn_print_log_delete = QPushButton("🗑 批量删除选中")
+        self.btn_print_log_delete = QPushButton("🗑 删除选中")
         self.btn_print_log_delete.setObjectName("btnDanger")
         self.btn_print_log_delete.clicked.connect(self.delete_selected_print_records)
         pl_top.addWidget(self.print_log_search)
@@ -665,6 +667,7 @@ class BillApp(QMainWindow):
         self._refresh_sidebar_logo()
         self._refresh_sidebar_toggle_button()
         self._update_print_url_hint_lines_style()
+        QTimer.singleShot(0, self._sync_print_url_block_width)
 
     def _refresh_sidebar_toggle_button(self):
         """侧栏开：实心 ><（收起）；侧栏关：实心 <>（展开）。"""
@@ -705,6 +708,21 @@ class BillApp(QMainWindow):
         f_off.setBold(False)
         self.lbl_print_url_hint_off.setFont(f_on if not checked else f_off)
         self.lbl_print_url_hint_on.setFont(f_on if checked else f_off)
+        self._sync_print_url_block_width()
+
+    def _sync_print_url_block_width(self) -> None:
+        """整块「是否打印URL」+ 两行说明固定为内容宽度，不换行、不随工具栏横向拉伸。"""
+        if not hasattr(self, "print_url_block"):
+            return
+        for w in (self.chk_print_url, self.lbl_print_url_hint_off, self.lbl_print_url_hint_on):
+            w.updateGeometry()
+        w = max(
+            self.chk_print_url.sizeHint().width(),
+            self.lbl_print_url_hint_off.sizeHint().width(),
+            self.lbl_print_url_hint_on.sizeHint().width(),
+        )
+        pad = 8
+        self.print_url_block.setFixedWidth(max(1, w + pad))
 
     def _restyle_sidebar_nav(self, page: str):
         styles = {

@@ -1,4 +1,8 @@
 """应用数据目录、模板路径与授权校验（与 UI 分离，便于打包路径一致）。"""
+import base64
+import hashlib
+import hmac
+import json
 import os
 import sys
 from datetime import datetime
@@ -23,6 +27,18 @@ def _app_dir() -> Path:
     return Path(sys.executable).resolve().parent
 
 
+def _license_dir() -> Path:
+    """授权文件目录：与可执行程序同路径（Win: exe 同级；macOS: .app 同级目录）。"""
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).resolve().parent
+    exe = Path(sys.executable).resolve()
+    if sys.platform == "darwin":
+        # .../<Name>.app/Contents/MacOS/<exe> -> 取 <Name>.app 的上级目录
+        app_bundle = exe.parent.parent.parent
+        return app_bundle.parent
+    return exe.parent
+
+
 APP_DIR = _app_dir()
 DATA_FILE = APP_DIR / "data.json"
 HISTORY_FILE = APP_DIR / "history_data.json"
@@ -36,10 +52,84 @@ if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
 else:
     TEMPLATE_FILE = APP_DIR / "template.xlsx"
 
-# 本地时间：此时间之后授权失效（2026-04-30 23:00:00 及之前可用）
-_LICENSE_EXPIRE_AT = datetime(2026, 4, 30, 23, 0, 0)
-LICENSE_EXPIRED_MSG = "授权已到期，请联系管理员。\n程序将自动退出。"
+# 授权文件（独立于部署包）：到期后只需替换该文件即可续期
+# 加密结构示例：{"v":1,"n":"...","c":"...","s":"..."}（明文不落盘）
+LICENSE_FILE = _license_dir() / "license.json"
+LICENSE_EXPIRED_MSG = "授权已到期，请联系管理员。"
+
+# 轻量对称加密 + HMAC 完整性校验（避免明文授权和简单篡改）
+_LICENSE_ENC_KEY = b"TidanMgr-Lic-EncKey-v1-ChangeMe"
+_LICENSE_SIG_KEY = b"TidanMgr-Lic-SigKey-v1-ChangeMe"
+
+
+def _license_keystream(nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        block = hashlib.sha256(_LICENSE_ENC_KEY + nonce + counter.to_bytes(4, "big")).digest()
+        out.extend(block)
+        counter += 1
+    return bytes(out[:length])
+
+
+def _license_decrypt(ciphertext: bytes, nonce: bytes) -> bytes:
+    ks = _license_keystream(nonce, len(ciphertext))
+    return bytes(c ^ k for c, k in zip(ciphertext, ks))
+
+
+def _license_encrypt(plaintext: bytes, nonce: bytes) -> bytes:
+    ks = _license_keystream(nonce, len(plaintext))
+    return bytes(p ^ k for p, k in zip(plaintext, ks))
+
+
+def build_encrypted_license(expire_at: str) -> dict[str, str | int]:
+    """构造加密授权对象，expire_at 支持 YYYY-MM-DD / YYYY-MM-DD HH:MM:SS。"""
+    s = str(expire_at or "").strip()
+    if not s:
+        raise ValueError("expire_at is required")
+    if len(s) <= 10:
+        datetime.strptime(s, "%Y-%m-%d")
+    else:
+        datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    payload = json.dumps({"expire_at": s}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    nonce = os.urandom(16)
+    ciphertext = _license_encrypt(payload, nonce)
+    n = base64.urlsafe_b64encode(nonce).decode("utf-8")
+    c = base64.urlsafe_b64encode(ciphertext).decode("utf-8")
+    msg = f"{n}.{c}".encode("utf-8")
+    sig = hmac.new(_LICENSE_SIG_KEY, msg, hashlib.sha256).hexdigest()
+    return {"v": 1, "n": n, "c": c, "s": sig}
 
 
 def is_license_valid() -> bool:
-    return datetime.now() <= _LICENSE_EXPIRE_AT
+    try:
+        if not LICENSE_FILE.exists():
+            return False
+        obj = json.loads(LICENSE_FILE.read_text(encoding="utf-8"))
+        if int(obj.get("v", 0)) != 1:
+            return False
+        n = str(obj.get("n", "")).strip()
+        c = str(obj.get("c", "")).strip()
+        sgn = str(obj.get("s", "")).strip()
+        if not n or not c or not sgn:
+            return False
+        msg = f"{n}.{c}".encode("utf-8")
+        expected = hmac.new(_LICENSE_SIG_KEY, msg, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sgn):
+            return False
+        nonce = base64.urlsafe_b64decode(n.encode("utf-8"))
+        ciphertext = base64.urlsafe_b64decode(c.encode("utf-8"))
+        plain = _license_decrypt(ciphertext, nonce).decode("utf-8")
+        payload = json.loads(plain)
+        s = str(payload.get("expire_at", "")).strip()
+        if not s:
+            return False
+        # 支持两种格式：YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS
+        if len(s) <= 10:
+            expire_at = datetime.strptime(s, "%Y-%m-%d")
+        else:
+            expire_at = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return datetime.now() <= expire_at
+    except Exception:
+        # 授权文件损坏/格式错误视为未授权
+        return False

@@ -10,6 +10,7 @@ from PySide6.QtGui import (
     QFont,
     QFontMetricsF,
     QGuiApplication,
+    QIcon,
     QLinearGradient,
     QPainter,
     QPen,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QSizePolicy,
     QStyle,
+    QStyleOptionHeader,
     QStyleOptionViewItem,
     QStyledItemDelegate,
     QTableWidget,
@@ -488,10 +490,20 @@ class HoverFilterHeaderView(QHeaderView):
         super().mouseReleaseEvent(event)
 
     def paintSection(self, painter: QPainter, rect: QRect, logical_index: int):
-        super().paintSection(painter, rect, logical_index)
-        if logical_index == 0 and self._mode in ("main_frozen", "hist_frozen", "print_rec"):
+        chip_modes = ("main_frozen", "hist_frozen", "print_rec")
+        if logical_index == 0 and self._mode in chip_modes:
+            # macOS：super().paintSection 走原生后常使后续 QPainter 绘制无效；用 CE_Header + endNativePainting 再画芯片。
+            opt = QStyleOptionHeader()
+            self.initStyleOptionForIndex(opt, logical_index)
+            opt.rect = QRect(rect)
+            opt.text = ""
+            opt.icon = QIcon()
+            opt.sortIndicator = QStyleOptionHeader.SortIndicator.None_
+            self.style().drawControl(QStyle.ControlElement.CE_Header, opt, painter, self)
+            painter.endNativePainting()
             info = self._bill._select_all_header_paint_info(self._mode)
             painter.save()
+            painter.setClipRect(rect)
             painter.setOpacity(1.0)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
             paint_frozen_select_all_header_section(
@@ -501,6 +513,11 @@ class HoverFilterHeaderView(QHeaderView):
                 glyph=str(info.get("glyph", "check_muted")),
             )
             painter.restore()
+        else:
+            super().paintSection(painter, rect, logical_index)
+            if sys.platform == "darwin":
+                painter.endNativePainting()
+
         if self._hover_section != logical_index:
             return
         if not self._bill._header_show_filter_btn(self._mode, logical_index):
