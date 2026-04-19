@@ -39,6 +39,19 @@ def _license_dir() -> Path:
     return exe.parent
 
 
+def _license_candidate_files() -> list[Path]:
+    """授权文件候选路径（按优先级）。"""
+    primary = _license_dir() / "license.json"
+    candidates: list[Path] = [primary]
+    if sys.platform == "darwin":
+        # 兼容 AppTranslocation：被系统搬运运行时，同级目录会变成随机临时目录。
+        # 回退到固定可写目录，便于用户更新授权而无需关心 translocation 路径。
+        fallback = Path.home() / "Library" / "Application Support" / "TidanMgr" / "license.json"
+        if fallback != primary:
+            candidates.append(fallback)
+    return candidates
+
+
 APP_DIR = _app_dir()
 DATA_FILE = APP_DIR / "data.json"
 HISTORY_FILE = APP_DIR / "history_data.json"
@@ -54,8 +67,8 @@ else:
 
 # 授权文件（独立于部署包）：到期后只需替换该文件即可续期
 # 加密结构示例：{"v":1,"n":"...","c":"...","s":"..."}（明文不落盘）
-LICENSE_FILE = _license_dir() / "license.json"
-LICENSE_EXPIRED_MSG = "授权已到期，请联系管理员。"
+LICENSE_FILE = _license_candidate_files()[0]
+LICENSE_EXPIRED_MSG = "启动报错了，请联系管理员。"
 
 # 轻量对称加密 + HMAC 完整性校验（避免明文授权和简单篡改）
 _LICENSE_ENC_KEY = b"TidanMgr-Lic-EncKey-v1-ChangeMe"
@@ -103,38 +116,46 @@ def build_encrypted_license(expire_at: str) -> dict[str, str | int]:
 
 def license_check_diagnostics() -> tuple[bool, str]:
     """返回授权校验结果与诊断信息（含实际读取路径/失败原因）。"""
-    lic_path = str(LICENSE_FILE)
+    tried = [str(p) for p in _license_candidate_files()]
+    lic_path = ""
     try:
-        if not LICENSE_FILE.exists():
-            return False, f"path={lic_path}; reason=file_not_found"
-        obj = json.loads(LICENSE_FILE.read_text(encoding="utf-8"))
+        src: Path | None = None
+        for p in _license_candidate_files():
+            if p.exists():
+                src = p
+                break
+        if src is None:
+            return False, f"path={tried[0]}; reason=file_not_found; tried={tried}"
+        lic_path = str(src)
+        obj = json.loads(src.read_text(encoding="utf-8"))
         if int(obj.get("v", 0)) != 1:
-            return False, f"path={lic_path}; reason=bad_version"
+            return False, f"path={lic_path}; reason=bad_version; tried={tried}"
         n = str(obj.get("n", "")).strip()
         c = str(obj.get("c", "")).strip()
         sgn = str(obj.get("s", "")).strip()
         if not n or not c or not sgn:
-            return False, f"path={lic_path}; reason=missing_fields"
+            return False, f"path={lic_path}; reason=missing_fields; tried={tried}"
         msg = f"{n}.{c}".encode("utf-8")
         expected = hmac.new(_LICENSE_SIG_KEY, msg, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, sgn):
-            return False, f"path={lic_path}; reason=bad_signature"
+            return False, f"path={lic_path}; reason=bad_signature; tried={tried}"
         nonce = base64.urlsafe_b64decode(n.encode("utf-8"))
         ciphertext = base64.urlsafe_b64decode(c.encode("utf-8"))
         plain = _license_decrypt(ciphertext, nonce).decode("utf-8")
         payload = json.loads(plain)
         s = str(payload.get("expire_at", "")).strip()
         if not s:
-            return False, f"path={lic_path}; reason=missing_expire_at"
+            return False, f"path={lic_path}; reason=missing_expire_at; tried={tried}"
         if len(s) <= 10:
             expire_at = datetime.strptime(s, "%Y-%m-%d")
         else:
             expire_at = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
         if datetime.now() > expire_at:
-            return False, f"path={lic_path}; reason=expired; expire_at={s}"
-        return True, f"path={lic_path}; reason=ok; expire_at={s}"
+            return False, f"path={lic_path}; reason=expired; expire_at={s}; tried={tried}"
+        return True, f"path={lic_path}; reason=ok; expire_at={s}; tried={tried}"
     except Exception as e:
-        return False, f"path={lic_path}; reason=exception:{type(e).__name__}"
+        p = lic_path or tried[0]
+        return False, f"path={p}; reason=exception:{type(e).__name__}; tried={tried}"
 
 
 def is_license_valid() -> bool:
