@@ -3041,7 +3041,12 @@ class BillApp(QMainWindow):
                     ws[f"{c}{rr}"] = rec.get(f, "")
         customer = self.export_customer_name(selected[0])
         filename = f"{customer}_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else APP_DIR
+        # macOS 打包后可执行目录通常位于 .app 包内，且可能被 App Translocation 挂载为只读；
+        # 因此 macOS 统一落到 APP_DIR（Application Support/便携目录），其他平台保持原策略。
+        if sys.platform == "darwin":
+            base_dir = APP_DIR
+        else:
+            base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else APP_DIR
         date_dir = base_dir / datetime.now().strftime("%Y%m%d")
         try:
             date_dir.mkdir(parents=True, exist_ok=True)
