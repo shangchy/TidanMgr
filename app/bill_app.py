@@ -81,6 +81,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -3053,17 +3054,23 @@ class BillApp(QMainWindow):
         except OSError as e:
             QMessageBox.warning(self, "导出失败", f"创建目录失败：\n{date_dir}\n\n{e}")
             return
-        out_path = date_dir / filename
-        if out_path.exists():
-            stem = out_path.stem
-            suffix = out_path.suffix
-            i = 1
-            while True:
-                candidate = date_dir / f"{stem}_{i:02d}{suffix}"
-                if not candidate.exists():
-                    out_path = candidate
-                    break
-                i += 1
+        default_out = date_dir / filename
+        out_file, _ = QFileDialog.getSaveFileName(
+            self,
+            "选择保存位置并命名文件",
+            str(default_out),
+            "Excel (*.xlsx)",
+        )
+        if not out_file:
+            return
+        out_path = Path(out_file)
+        if out_path.suffix.lower() != ".xlsx":
+            out_path = out_path.with_suffix(".xlsx")
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "导出失败", f"创建目录失败：\n{out_path.parent}\n\n{e}")
+            return
         try:
             wb.save(str(out_path))
         except OSError as e:
