@@ -36,9 +36,8 @@ if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
 else:
     TEMPLATE_FILE = APP_DIR / "template.xlsx"
 
-# 本地时间：此时间之后授权失效（2026-04-30 23:00:00 及之前可用）
-_LICENSE_EXPIRE_AT = datetime(2026, 4, 30, 23, 0, 0)
-LICENSE_EXPIRED_MSG = "授权已到期，请联系管理员。\n程序将自动退出。"
+_LICENSE_EXPIRE_AT = datetime(2026, 12, 31, 23, 0, 0)
+LICENSE_EXPIRED_MSG = "程序启动异常，请联系管理员。"
 
 
 def is_license_valid() -> bool:

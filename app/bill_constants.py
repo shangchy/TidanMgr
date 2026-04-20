@@ -71,6 +71,7 @@ HISTORY_SCROLL_COLUMNS = len(HISTORY_SCROLL_FIELDS)
 
 PRINT_LOG_DATA_FIELDS = [
     "filename",
+    "source",
     "printed_at",
     "row_count",
     "include_print_url",
@@ -79,11 +80,12 @@ PRINT_LOG_DATA_FIELDS = [
 ]
 PRINT_LOG_HEADERS = {
     "filename": "文件名",
-    "printed_at": "打印时间",
+    "source": "来源",
+    "printed_at": "创建时间",
     "row_count": "数据条数",
-    "include_print_url": "打印URL列",
-    "file_exists": "文件状态",
-    "path": "保存路径",
+    "include_print_url": "打印URL",
+    "file_exists": "状态",
+    "path": "路径",
 }
 PRINT_LOG_COL_COUNT = 1 + len(PRINT_LOG_DATA_FIELDS) + 1
 

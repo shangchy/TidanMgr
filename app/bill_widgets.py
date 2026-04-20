@@ -42,60 +42,86 @@ from bill_constants import PRINT_LOG_DATA_FIELDS
 
 
 def make_sidebar_logo_pixmap(*, dark: bool, size: int = 44) -> QPixmap:
-    """侧栏小图标：单据 + 折角 + 行线，贴合提单/表格管理场景。"""
+    """侧栏小图标：高效办公（看板+勾选+闪电）风格。"""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    m = 4.0
-    body = QRectF(m, m + 1.0, size - 2 * m, size - 2 * m - 2.0)
+    m = 3.5
+    body = QRectF(m, m, size - 2 * m, size - 2 * m)
     if dark:
-        paper = QColor(26, 32, 48)
-        edge = QColor(118, 142, 210)
-        fold_fill = QColor(42, 50, 72)
-        fold_edge = QColor(88, 104, 150)
-        line_c = QColor(168, 184, 228, 200)
-        bar_c = QColor(140, 168, 255, 220)
+        panel_fill = QColor(23, 30, 46)
+        panel_edge = QColor(104, 138, 220)
+        tile_fill = QColor(38, 48, 72)
+        tile_edge = QColor(82, 108, 166)
+        text_c = QColor(178, 196, 238, 220)
+        ok_fill = QColor(44, 166, 116)
+        ok_edge = QColor(105, 214, 170)
+        bolt_fill = QColor(255, 206, 84)
+        bolt_edge = QColor(255, 227, 152)
     else:
-        paper = QColor(255, 255, 255)
-        edge = QColor(37, 99, 235)
-        fold_fill = QColor(226, 232, 240)
-        fold_edge = QColor(148, 163, 184)
-        line_c = QColor(71, 85, 105, 220)
-        bar_c = QColor(37, 99, 235, 230)
-    fs = min(13.0, body.width() * 0.32)
-    main_rect = QRectF(body.left(), body.top(), body.width() - fs * 0.55, body.height())
-    path = QPainterPath()
-    path.addRoundedRect(main_rect, 3.5, 3.5)
-    painter.fillPath(path, QBrush(paper))
-    painter.strokePath(path, QPen(edge, 1.2))
-    fold = QPolygonF(
+        panel_fill = QColor(246, 250, 255)
+        panel_edge = QColor(37, 99, 235)
+        tile_fill = QColor(231, 240, 255)
+        tile_edge = QColor(156, 191, 242)
+        text_c = QColor(55, 84, 152, 220)
+        ok_fill = QColor(30, 174, 114)
+        ok_edge = QColor(127, 219, 180)
+        bolt_fill = QColor(251, 191, 36)
+        bolt_edge = QColor(245, 158, 11)
+
+    # 外层面板
+    panel_path = QPainterPath()
+    panel_path.addRoundedRect(body, 7.0, 7.0)
+    painter.fillPath(panel_path, QBrush(panel_fill))
+    painter.strokePath(panel_path, QPen(panel_edge, 1.2))
+
+    # 左侧任务块
+    tile = QRectF(body.left() + 4.5, body.top() + 5.0, body.width() * 0.60, body.height() - 10.0)
+    tile_path = QPainterPath()
+    tile_path.addRoundedRect(tile, 5.0, 5.0)
+    painter.fillPath(tile_path, QBrush(tile_fill))
+    painter.strokePath(tile_path, QPen(tile_edge, 1.0))
+
+    # 勾选圆标（表示“已完成”）
+    d = min(11.0, tile.height() * 0.35)
+    disc = QRectF(tile.left() + 4.0, tile.top() + 4.0, d, d)
+    painter.setBrush(QBrush(ok_fill))
+    painter.setPen(QPen(ok_edge, 1.0))
+    painter.drawEllipse(disc)
+    painter.setPen(QPen(QColor(255, 255, 255), 1.4))
+    p1 = QPointF(disc.left() + d * 0.25, disc.top() + d * 0.56)
+    p2 = QPointF(disc.left() + d * 0.45, disc.top() + d * 0.74)
+    p3 = QPointF(disc.left() + d * 0.78, disc.top() + d * 0.34)
+    painter.drawLine(p1, p2)
+    painter.drawLine(p2, p3)
+
+    # 任务行
+    painter.setPen(QPen(text_c, 1.0))
+    lx0 = disc.right() + 3.0
+    lx1 = tile.right() - 4.0
+    y0 = disc.top() + d * 0.35
+    for i in range(3):
+        y = y0 + i * 5.0
+        painter.drawLine(QPointF(lx0, y), QPointF(lx1 - i * 3.5, y))
+
+    # 右侧闪电（表示效率）
+    bx = body.right() - 11.5
+    by = body.center().y()
+    bolt = QPolygonF(
         [
-            QPointF(main_rect.right(), main_rect.top()),
-            QPointF(body.right(), main_rect.top()),
-            QPointF(body.right(), main_rect.top() + fs),
-            QPointF(main_rect.right() - fs * 0.2, main_rect.top() + fs * 0.85),
+            QPointF(bx - 2.0, by - 8.5),
+            QPointF(bx + 3.0, by - 8.5),
+            QPointF(bx + 0.6, by - 2.0),
+            QPointF(bx + 6.0, by - 2.0),
+            QPointF(bx - 3.2, by + 8.5),
+            QPointF(bx - 0.4, by + 1.5),
+            QPointF(bx - 5.4, by + 1.5),
         ]
     )
-    painter.setPen(QPen(fold_edge, 1.0))
-    painter.setBrush(QBrush(fold_fill))
-    painter.drawPolygon(fold)
-    lx0 = main_rect.left() + 5
-    lx1 = main_rect.right() - 5
-    y = main_rect.top() + 11
-    painter.setPen(QPen(line_c, 1.05))
-    for _ in range(3):
-        painter.drawLine(QPointF(lx0, y), QPointF(lx1, y))
-        y += 5.5
-    bx0 = main_rect.left() + 6
-    by = main_rect.bottom() - 7
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QBrush(bar_c))
-    for i in range(5):
-        bw = 1.6 if i % 2 == 0 else 1.0
-        bh = 5.5 if i != 2 else 7.0
-        painter.drawRect(QRectF(bx0, by - bh, bw, bh))
-        bx0 += bw + 1.4
+    painter.setBrush(QBrush(bolt_fill))
+    painter.setPen(QPen(bolt_edge, 1.0))
+    painter.drawPolygon(bolt)
     painter.end()
     return pm
 
@@ -243,7 +269,11 @@ class ColumnPickFilterPopup(QDialog):
             else (
                 self._bill.print_header_filters
                 if self._mode.startswith("print")
-                else self._bill.history_header_filters
+                else (
+                    self._bill._merge_header_filters
+                    if self._mode.startswith("merge")
+                    else self._bill.history_header_filters
+                )
             )
         )
         if not sel or sel == full:
@@ -254,6 +284,10 @@ class ColumnPickFilterPopup(QDialog):
             self._bill.refresh_table()
         elif self._mode.startswith("print"):
             self._bill.refresh_print_records_table()
+        elif self._mode.startswith("merge"):
+            cb = getattr(self._bill, "_merge_render_cb", None)
+            if callable(cb):
+                cb()
         else:
             self._bill.refresh_history_table()
 
@@ -338,6 +372,10 @@ class HoverFilterHeaderView(QHeaderView):
                 self._bill._on_frozen_header_col0_clicked(self._mode)
                 event.accept()
                 return
+            if idx == 0 and self._mode == "merge_excel":
+                self._bill._on_merge_header_section_clicked(idx)
+                event.accept()
+                return
             # 单击表头排序：与 sectionClicked 槽一致（避免仅 super 时不触发排序）
             if idx >= 0:
                 if self._mode == "print_rec" and 1 <= idx <= len(PRINT_LOG_DATA_FIELDS):
@@ -360,7 +398,20 @@ class HoverFilterHeaderView(QHeaderView):
                     self._bill._on_history_scroll_header_clicked(idx)
                     event.accept()
                     return
+                if self._mode == "merge_excel":
+                    self._bill._on_merge_header_section_clicked(idx)
+                    event.accept()
+                    return
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            idx = self.logicalIndexAt(event.position().toPoint())
+            if idx >= 0 and self._mode == "merge_excel":
+                self._bill._on_merge_header_section_clicked(idx)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def paintSection(self, painter: QPainter, rect: QRect, logical_index: int):
         super().paintSection(painter, rect, logical_index)
@@ -469,6 +520,64 @@ class AllowPrintUrlCellDelegate(QStyledItemDelegate):
         cx, cy = rect.center().x(), rect.center().y()
         disc = QRect(int(cx - d / 2), int(cy - d / 2), d, d)
         if yes:
+            fill = QColor(200, 232, 204)
+            border = QColor(165, 210, 172)
+            pen_text = QColor(52, 118, 68)
+        else:
+            fill = QColor(222, 222, 230)
+            border = QColor(198, 198, 208)
+            pen_text = QColor(92, 92, 108)
+        painter.setBrush(fill)
+        painter.setPen(QPen(border, 1))
+        painter.drawEllipse(disc)
+
+        f = QFont(opt.font)
+        f.setBold(True)
+        for _ in range(4):
+            fm = QFontMetricsF(f)
+            if fm.horizontalAdvance(text) <= d - 8 and fm.height() <= d - 6:
+                break
+            f.setPointSizeF(max(7.5, f.pointSizeF() - 0.5))
+        painter.setFont(f)
+        painter.setPen(pen_text)
+        painter.drawText(disc, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
+
+
+class BadgeCellDelegate(QStyledItemDelegate):
+    """通用圆形徽标：主值走绿色样式，其余走灰色样式（视觉与「允许」列一致）。"""
+
+    def __init__(self, primary_values: set[str], parent=None, badge_styles: dict[str, tuple[QColor, QColor, QColor]] | None = None):
+        super().__init__(parent)
+        self._primary_values = {str(x).strip() for x in primary_values}
+        self._badge_styles = {str(k).strip(): v for k, v in (badge_styles or {}).items()}
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = (opt.text or "").strip() or str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip()
+        primary = text in self._primary_values
+        rect = option.rect
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        pal = opt.palette
+        if opt.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(rect, pal.brush(QPalette.ColorRole.Highlight))
+        elif opt.features & QStyleOptionViewItem.ViewItemFeature.Alternate:
+            painter.fillRect(rect, pal.brush(QPalette.ColorRole.AlternateBase))
+        else:
+            painter.fillRect(rect, pal.brush(QPalette.ColorRole.Base))
+
+        margin = 6
+        d = min(rect.width(), rect.height()) - 2 * margin
+        d = max(24, min(int(d), 38))
+        cx, cy = rect.center().x(), rect.center().y()
+        disc = QRect(int(cx - d / 2), int(cy - d / 2), d, d)
+        custom = self._badge_styles.get(text)
+        if custom is not None:
+            fill, border, pen_text = custom
+        elif primary:
             fill = QColor(200, 232, 204)
             border = QColor(165, 210, 172)
             pen_text = QColor(52, 118, 68)

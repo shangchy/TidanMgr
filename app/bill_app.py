@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from PySide6.QtCore import QEvent, QObject, QModelIndex, QPoint, QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
@@ -68,6 +68,7 @@ from bill_paths import (
 from bill_theme import STYLESHEET_DARK, STYLESHEET_LIGHT
 from bill_widgets import (
     AllowPrintUrlCellDelegate,
+    BadgeCellDelegate,
     ColumnPickFilterPopup,
     HoverFilterHeaderView,
     MultiSelectDialog,
@@ -89,6 +90,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -107,7 +109,7 @@ class BillApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setObjectName("BillAppMain")
-        self.setWindowTitle("提单管理")
+        self.setWindowTitle("高效办公")
         self.records: list[dict[str, Any]] = []
         self.history_records: list[dict[str, Any]] = []
         self.history_filtered_indices: list[int] = []
@@ -189,7 +191,7 @@ class BillApp(QMainWindow):
         brand_titles = QVBoxLayout()
         brand_titles.setContentsMargins(0, 1, 0, 0)
         brand_titles.setSpacing(5)
-        self._sidebar_logo_title = QLabel("提单管理")
+        self._sidebar_logo_title = QLabel("高效办公")
         self._sidebar_logo_title.setObjectName("sidebarLogoTitle")
         self._sidebar_logo_sub = QLabel("任务表 · 核对与归档")
         self._sidebar_logo_sub.setObjectName("sidebarLogoSub")
@@ -205,9 +207,12 @@ class BillApp(QMainWindow):
         self.nav_history = QPushButton("🕘  历史提单表")
         self.nav_history.setObjectName("navNormal")
         self.nav_history.clicked.connect(self.show_history_page)
-        self.nav_print_records = QPushButton("📋  打印记录")
+        self.nav_print_records = QPushButton("📁  文件管理")
         self.nav_print_records.setObjectName("navNormal")
         self.nav_print_records.clicked.connect(self.show_print_records_page)
+        self.nav_excel_tools = QPushButton("🧰  Excel工具")
+        self.nav_excel_tools.setObjectName("navNormal")
+        self.nav_excel_tools.clicked.connect(self.show_excel_tools_page)
         self.nav_settings = QPushButton("⚙️  设置")
         self.nav_settings.setObjectName("navNormal")
         self.nav_settings.clicked.connect(self.show_settings_page)
@@ -218,6 +223,7 @@ class BillApp(QMainWindow):
         sidebar_layout.addWidget(self.nav_bill)
         sidebar_layout.addWidget(self.nav_history)
         sidebar_layout.addWidget(self.nav_print_records)
+        sidebar_layout.addWidget(self.nav_excel_tools)
         sidebar_layout.addWidget(divider)
         sidebar_layout.addWidget(side_item_sub1)
         sidebar_layout.addWidget(self.nav_settings)
@@ -494,11 +500,45 @@ class BillApp(QMainWindow):
         hdr_print = HoverFilterHeaderView(self.print_log_table, self, "print_rec")
         self.print_log_table.setHorizontalHeader(hdr_print)
         hdr_print.setSectionResizeMode(QHeaderView.Interactive)
+        # 文件管理：来源(印/合)与状态(有/无)使用与「允许」列一致的圆形徽标风格
+        self.print_log_table.setItemDelegateForColumn(
+            2,
+            BadgeCellDelegate(
+                {"印"},
+                self.print_log_table,
+                {
+                    "印": (QColor(233, 220, 252), QColor(205, 180, 245), QColor(109, 64, 170)),
+                    "合": (QColor(214, 234, 255), QColor(171, 209, 247), QColor(42, 106, 181)),
+                },
+            ),
+        )
+        self.print_log_table.setItemDelegateForColumn(6, BadgeCellDelegate({"有"}, self.print_log_table))
         hdr_print.sectionClicked.connect(self._on_print_rec_header_section_clicked)
         self.print_log_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.print_log_table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         pl_layout.addWidget(self.print_log_table, 1)
         self.content_stack.addWidget(print_log_page)
+
+        excel_tools_page = QWidget()
+        excel_tools_page.setObjectName("stackExcelToolsPage")
+        excel_tools_page.setAutoFillBackground(True)
+        excel_tools_page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        excel_tools_layout = QVBoxLayout(excel_tools_page)
+        excel_tools_layout.setContentsMargins(24, 20, 24, 20)
+        excel_tools_layout.setSpacing(12)
+        excel_tools_title = QLabel("Excel工具")
+        excel_tools_title.setObjectName("settingsTitle")
+        excel_tools_layout.addWidget(excel_tools_title)
+        excel_tools_hint = QLabel("可扩展的 Excel 功能入口（后续可继续新增卡片按钮）。")
+        excel_tools_hint.setObjectName("hintLabel")
+        excel_tools_layout.addWidget(excel_tools_hint)
+        self.btn_excel_merge = QPushButton("🧩 合并Excel")
+        self.btn_excel_merge.setObjectName("btnAccent")
+        self.btn_excel_merge.setFixedHeight(44)
+        self.btn_excel_merge.clicked.connect(self.open_merge_excel_dialog)
+        excel_tools_layout.addWidget(self.btn_excel_merge, 0, Qt.AlignmentFlag.AlignLeft)
+        excel_tools_layout.addStretch(1)
+        self.content_stack.addWidget(excel_tools_page)
 
         settings_page = QWidget()
         settings_page.setObjectName("stackSettingsPage")
@@ -547,7 +587,7 @@ class BillApp(QMainWindow):
         for s in range(HISTORY_SCROLL_COLUMNS):
             self.history_table.setColumnWidth(s, hist_widths[s + 1])
         self.print_log_table.setColumnWidth(0, 44)
-        _pw = [300, 168, 88, 100, 88, 380, 228]
+        _pw = [280, 92, 168, 88, 100, 88, 380, 228]
         for s, w in enumerate(_pw, start=1):
             self.print_log_table.setColumnWidth(s, w)
         self.table_frozen.itemChanged.connect(self.on_item_changed)
@@ -633,13 +673,16 @@ class BillApp(QMainWindow):
 
     def _restyle_sidebar_nav(self, page: str):
         styles = {
-            "bill": ("navActive", "navNormal", "navNormal", "navNormal"),
-            "history": ("navNormal", "navActive", "navNormal", "navNormal"),
-            "print": ("navNormal", "navNormal", "navActive", "navNormal"),
-            "settings": ("navNormal", "navNormal", "navNormal", "navActive"),
+            "bill": ("navActive", "navNormal", "navNormal", "navNormal", "navNormal"),
+            "history": ("navNormal", "navActive", "navNormal", "navNormal", "navNormal"),
+            "print": ("navNormal", "navNormal", "navActive", "navNormal", "navNormal"),
+            "excel_tools": ("navNormal", "navNormal", "navNormal", "navActive", "navNormal"),
+            "settings": ("navNormal", "navNormal", "navNormal", "navNormal", "navActive"),
         }
         names = styles[page]
-        for w, oname in zip((self.nav_bill, self.nav_history, self.nav_print_records, self.nav_settings), names):
+        for w, oname in zip(
+            (self.nav_bill, self.nav_history, self.nav_print_records, self.nav_excel_tools, self.nav_settings), names
+        ):
             w.setObjectName(oname)
             w.style().unpolish(w)
             w.style().polish(w)
@@ -661,8 +704,13 @@ class BillApp(QMainWindow):
         self.refresh_print_records_table()
         self.apply_theme()
 
-    def show_settings_page(self):
+    def show_excel_tools_page(self):
         self.content_stack.setCurrentIndex(3)
+        self._restyle_sidebar_nav("excel_tools")
+        self.apply_theme()
+
+    def show_settings_page(self):
+        self.content_stack.setCurrentIndex(4)
         self._restyle_sidebar_nav("settings")
         self.apply_theme()
 
@@ -772,6 +820,8 @@ class BillApp(QMainWindow):
                 rec["include_print_url"] = False
             else:
                 rec["include_print_url"] = bool(rec.get("include_print_url"))
+            src = str(rec.get("source", "") or "").strip()
+            rec["source"] = src if src in ("打印", "合并") else "打印"
         self.print_records = [r for r in rows if str(r.get("path", "") or "").strip()]
 
     def save_print_records(self):
@@ -793,11 +843,15 @@ class BillApp(QMainWindow):
         if field == "row_count":
             return str(int(rec.get("row_count", 0) or 0))
         if field == "include_print_url":
+            if str(rec.get("source", "") or "") == "合并":
+                return "—"
             return "是" if rec.get("include_print_url") else "否"
         if field == "file_exists":
-            return "存在" if self._print_record_file_ok(rec) else "缺失"
+            return "有" if self._print_record_file_ok(rec) else "无"
         if field == "filename":
             return str(rec.get("filename", "") or "")
+        if field == "source":
+            return str(rec.get("source", "") or "")
         if field == "printed_at":
             return BillApp._created_at_filter_key(rec.get("printed_at"))
         if field == "path":
@@ -844,6 +898,55 @@ class BillApp(QMainWindow):
             out.sort(key=lambda s: (s == "", s.casefold()))
         return out
 
+    @staticmethod
+    def _merge_size_display(n: int) -> str:
+        kb = 1024
+        mb = kb * 1024
+        if n >= mb:
+            return f"{n / mb:.2f} MB"
+        if n >= kb:
+            return f"{n / kb:.1f} KB"
+        return f"{n} B"
+
+    def _merge_cell_display_for_filter(self, rec: dict, field: str) -> str:
+        if field == "merge_filename":
+            return str(rec.get("name", "") or "")
+        if field == "merge_size":
+            return BillApp._merge_size_display(int(rec.get("size", 0) or 0))
+        if field == "merge_mtime":
+            return str(rec.get("mtime", "") or "")
+        if field == "merge_path":
+            return str(rec.get("path_display", "") or "")
+        return ""
+
+    def _merge_row_matches_header_filters_except(self, rec: dict, skip_field: str | None) -> bool:
+        filters = getattr(self, "_merge_header_filters", {})
+        for field, vals in filters.items():
+            if skip_field and field == skip_field:
+                continue
+            if not vals:
+                continue
+            if self._merge_cell_display_for_filter(rec, field) not in vals:
+                return False
+        return True
+
+    def _unique_display_values_merge(self, field: str) -> list[str]:
+        rows = list(getattr(self, "_merge_rows_all", []))
+        query = str(getattr(self, "_merge_active_query", "") or "").strip().lower()
+        out: list[str] = []
+        seen: set[str] = set()
+        for r in rows:
+            if query and query not in str(r.get("name", "")).lower():
+                continue
+            if not self._merge_row_matches_header_filters_except(r, field):
+                continue
+            dv = self._merge_cell_display_for_filter(r, field)
+            if dv not in seen:
+                seen.add(dv)
+                out.append(dv)
+        out.sort(key=lambda s: (s == "", s.casefold()))
+        return out
+
     def _sort_key_print_field(self, rec: dict, field: str) -> Any:
         if field == "row_count":
             try:
@@ -858,6 +961,8 @@ class BillApp(QMainWindow):
             return str(rec.get("printed_at", "") or "").strip()
         if field == "filename":
             return str(rec.get("filename", "") or "").lower()
+        if field == "source":
+            return str(rec.get("source", "") or "").lower()
         if field == "path":
             return str(rec.get("path", "") or "").lower()
         return ""
@@ -959,6 +1064,7 @@ class BillApp(QMainWindow):
             if (
                 not query
                 or query in str(r.get("filename", "")).lower()
+                or query in str(r.get("source", "")).lower()
                 or query in str(r.get("path", "")).lower()
             )
             and self._print_row_matches_header_filters(r)
@@ -998,28 +1104,39 @@ class BillApp(QMainWindow):
             it_fn.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.print_log_table.setItem(row, 1, it_fn)
 
+            src = str(rec.get("source", "") or "")
+            src_icon = "合" if src == "合并" else "印"
+            it_src = QTableWidgetItem(src_icon)
+            it_src.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            it_src.setToolTip(src)
+            it_src.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.print_log_table.setItem(row, 2, it_src)
+
             it_time = QTableWidgetItem(str(rec.get("printed_at", "") or ""))
             it_time.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             it_time.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.print_log_table.setItem(row, 2, it_time)
+            self.print_log_table.setItem(row, 3, it_time)
 
             rc = int(rec.get("row_count", 0) or 0)
             it_rc = QTableWidgetItem(str(rc))
             it_rc.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             it_rc.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.print_log_table.setItem(row, 3, it_rc)
+            self.print_log_table.setItem(row, 4, it_rc)
 
-            iurl = QTableWidgetItem("是" if rec.get("include_print_url") else "否")
+            source = str(rec.get("source", "") or "")
+            iurl_text = "—" if source == "合并" else ("是" if rec.get("include_print_url") else "否")
+            iurl = QTableWidgetItem(iurl_text)
             iurl.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             iurl.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.print_log_table.setItem(row, 4, iurl)
+            self.print_log_table.setItem(row, 5, iurl)
 
             ok = self._print_record_file_ok(rec)
-            st = QTableWidgetItem("存在" if ok else "缺失")
+            st = QTableWidgetItem("有" if ok else "无")
             st.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             st.setForeground(QColor("#2e8b57" if ok else "#c93042"))
+            st.setToolTip("文件存在" if ok else "文件缺失")
             st.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.print_log_table.setItem(row, 5, st)
+            self.print_log_table.setItem(row, 6, st)
 
             pth = str(rec.get("path", "") or "")
             disp = pth if len(pth) <= 64 else pth[:30] + "…" + pth[-28:]
@@ -1027,7 +1144,7 @@ class BillApp(QMainWindow):
             it_p.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             it_p.setToolTip(pth)
             it_p.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.print_log_table.setItem(row, 6, it_p)
+            self.print_log_table.setItem(row, 7, it_p)
 
             act = QWidget()
             al = QHBoxLayout(act)
@@ -1046,7 +1163,7 @@ class BillApp(QMainWindow):
             bd.clicked.connect(lambda _=False, p=pth: self.open_print_record_folder(p))
             al.addWidget(bp)
             al.addWidget(bd)
-            self.print_log_table.setCellWidget(row, 7, act)
+            self.print_log_table.setCellWidget(row, 8, act)
 
         for r in range(n):
             self.print_log_table.setRowHeight(r, h)
@@ -1124,6 +1241,546 @@ class BillApp(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "打开文件夹失败", str(e))
             return
+
+    @staticmethod
+    def _collect_excel_files_under(folder: Path) -> list[Path]:
+        exts = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"}
+        files = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+        files.sort(key=lambda x: str(x).lower())
+        return files
+
+    def open_merge_excel_dialog(self):
+        chosen_root = QFileDialog.getExistingDirectory(self, "选择待合并文件夹", str(APP_DIR))
+        if not chosen_root:
+            return
+        merge_root = Path(chosen_root)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("合并Excel")
+        dlg.resize(980, 640)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+
+        root_tip = QLabel(f"当前路径：{merge_root}")
+        root_tip.setObjectName("hintLabel")
+        lay.addWidget(root_tip)
+
+        top = QHBoxLayout()
+        name_search = QLineEdit()
+        name_search.setPlaceholderText("检索文件名（支持关键字）...")
+        name_search.setFixedWidth(200)
+        btn_search = QPushButton("🔍 搜索")
+        btn_search.setObjectName("btnGhost")
+        btn_clear = QPushButton("🔄 清空筛选")
+        btn_clear.setObjectName("btnGhost")
+        top.addWidget(name_search)
+        top.addWidget(btn_search)
+        top.addWidget(btn_clear)
+        top.addStretch(1)
+        lay.addLayout(top)
+
+        file_table = QTableWidget(0, 6)
+        file_table.setHorizontalHeaderLabels(["☐", "文件名", "大小", "日期", "路径名", "操作"])
+        h0 = file_table.horizontalHeaderItem(0)
+        if h0:
+            h0.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        file_table.verticalHeader().setVisible(False)
+        file_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        file_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        file_table.setAlternatingRowColors(True)
+        file_table.setColumnWidth(0, 44)
+        hdr = HoverFilterHeaderView(file_table, self, "merge_excel")
+        file_table.setHorizontalHeader(hdr)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        file_table.setColumnWidth(1, 360)
+        file_table.setColumnWidth(2, 110)
+        file_table.setColumnWidth(3, 170)
+        file_table.setColumnWidth(4, 280)
+        file_table.setColumnWidth(5, 188)
+        hdr.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        lay.addWidget(file_table, 1)
+
+        foot = QHBoxLayout()
+        lbl_stat = QLabel("共 0 个文件，已勾选 0 个")
+        foot.addWidget(lbl_stat)
+        foot.addStretch(1)
+        btn_merge = QPushButton("🧩 合并选中")
+        btn_merge.setObjectName("btnAccent")
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setObjectName("btnGhost")
+        foot.addWidget(btn_merge)
+        foot.addWidget(btn_cancel)
+        lay.addLayout(foot)
+
+        all_files: list[dict[str, Any]] = []
+        checked_map: dict[str, bool] = {}
+        row_paths: list[str] = []
+        sort_state = {"field": None, "asc": True}
+        active_query = {"text": ""}
+        self._merge_header_filters = {}
+        self._merge_rows_all = []
+        self._merge_active_query = ""
+        self._merge_render_cb = None
+        self._merge_filter_parent = dlg
+        self._merge_on_header_click_cb = None
+        self._merge_file_table = file_table
+
+        def update_header_check():
+            if not row_paths:
+                file_table.horizontalHeaderItem(0).setText("☐")
+                file_table.horizontalHeaderItem(0).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                return
+            checked_cnt = sum(1 for p in row_paths if checked_map.get(p, True))
+            symbol = "☐" if checked_cnt == 0 else ("☑" if checked_cnt == len(row_paths) else "◩")
+            file_table.horizontalHeaderItem(0).setText(symbol)
+            file_table.horizontalHeaderItem(0).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        def update_stat():
+            total = len(row_paths)
+            checked = sum(1 for p in row_paths if checked_map.get(p, True))
+            lbl_stat.setText(f"共 {total} 个文件，已勾选 {checked} 个")
+            update_header_check()
+
+        def sort_key(rec: dict[str, Any]):
+            f = sort_state["field"]
+            if f == 1:
+                return str(rec.get("name", "")).lower()
+            if f == 2:
+                return int(rec.get("size", 0))
+            if f == 3:
+                return float(rec.get("mtime_ts", 0))
+            if f == 4:
+                return str(rec.get("path_display", "")).lower()
+            return str(rec.get("name", "")).lower()
+
+        def pass_filters(rec: dict[str, Any]) -> bool:
+            kw_name = active_query["text"]
+            if kw_name and kw_name not in str(rec.get("name", "")).lower():
+                return False
+            if not self._merge_row_matches_header_filters_except(rec, None):
+                return False
+            return True
+
+        def filtered_header_text(base: str, section: int) -> str:
+            fmap = {1: "merge_filename", 2: "merge_size", 3: "merge_mtime", 4: "merge_path"}
+            field = fmap.get(section, "")
+            kw = ""
+            if field:
+                vals = self._merge_header_filters.get(field, set())
+                if vals:
+                    kw = str(len(vals))
+            return f"{base} (筛:{kw})" if kw else base
+
+        def refresh_header_labels():
+            file_table.setHorizontalHeaderItem(1, QTableWidgetItem(filtered_header_text("文件名", 1)))
+            file_table.setHorizontalHeaderItem(2, QTableWidgetItem(filtered_header_text("大小", 2)))
+            file_table.setHorizontalHeaderItem(3, QTableWidgetItem(filtered_header_text("日期", 3)))
+            file_table.setHorizontalHeaderItem(4, QTableWidgetItem(filtered_header_text("路径名", 4)))
+            file_table.setHorizontalHeaderItem(5, QTableWidgetItem("操作"))
+
+        def update_merge_header_tooltips():
+            tips = {1: "文件名", 2: "大小", 3: "日期", 4: "路径名"}
+            for col, title in tips.items():
+                it = file_table.horizontalHeaderItem(col)
+                if not it:
+                    continue
+                tip = title + "\n单击：排序；悬停右侧 ▼ 筛选"
+                fmap = {1: "merge_filename", 2: "merge_size", 3: "merge_mtime", 4: "merge_path"}
+                f = fmap.get(col, "")
+                vals = self._merge_header_filters.get(f, set()) if f else set()
+                if vals:
+                    tip += f"\n已选 {len(vals)} 项"
+                it.setToolTip(tip)
+
+        def render_table():
+            nonlocal row_paths
+            row_paths = []
+            rows = [r for r in all_files if pass_filters(r)]
+            self._merge_rows_all = list(all_files)
+            self._merge_active_query = active_query["text"]
+            if sort_state["field"] in (1, 2, 3):
+                rows.sort(key=sort_key, reverse=not sort_state["asc"])
+            file_table.blockSignals(True)
+            try:
+                file_table.setRowCount(len(rows))
+                for row, rec in enumerate(rows):
+                    p = str(rec["path"])
+                    row_paths.append(p)
+                    ph = QTableWidgetItem("")
+                    ph.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                    file_table.setItem(row, 0, ph)
+
+                    wrap = QWidget()
+                    wl = QHBoxLayout(wrap)
+                    wl.setContentsMargins(0, 0, 0, 0)
+                    wl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    chk = QCheckBox()
+                    chk.setChecked(checked_map.get(p, True))
+                    chk.stateChanged.connect(
+                        lambda _s=0, fp=p, c=chk: (
+                            checked_map.__setitem__(fp, c.isChecked()),
+                            update_stat(),
+                        )
+                    )
+                    wl.addWidget(chk)
+                    file_table.setCellWidget(row, 0, wrap)
+
+                    it_name = QTableWidgetItem(str(rec["name"]))
+                    it_name.setToolTip(str(rec["path"]))
+                    file_table.setItem(row, 1, it_name)
+                    it_size = QTableWidgetItem(BillApp._merge_size_display(int(rec["size"])))
+                    it_size.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    file_table.setItem(row, 2, it_size)
+                    it_time = QTableWidgetItem(str(rec["mtime"]))
+                    it_time.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    file_table.setItem(row, 3, it_time)
+                    it_path = QTableWidgetItem(str(rec.get("path_display", "")))
+                    it_path.setToolTip(str(rec["path"]))
+                    it_path.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                    file_table.setItem(row, 4, it_path)
+
+                    op_wrap = QWidget()
+                    op_lo = QHBoxLayout(op_wrap)
+                    op_lo.setContentsMargins(4, 2, 4, 2)
+                    op_lo.setSpacing(6)
+                    op_lo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    bp = QPushButton("👁 预览")
+                    bp.setObjectName("btnGhost")
+                    bp.setFixedSize(84, 26)
+                    bp.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+                    bd = QPushButton("📂 打开")
+                    bd.setObjectName("btnGhost")
+                    bd.setFixedSize(84, 26)
+                    bd.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+                    fp = str(rec["path"])
+                    bp.clicked.connect(lambda _=False, p=fp: self.preview_print_record_file(p))
+                    bd.clicked.connect(lambda _=False, p=fp: self.open_print_record_folder(p))
+                    op_lo.addWidget(bp)
+                    op_lo.addWidget(bd)
+                    file_table.setCellWidget(row, 5, op_wrap)
+                    file_table.setRowHeight(row, 42)
+            finally:
+                file_table.blockSignals(False)
+            refresh_header_labels()
+            update_merge_header_tooltips()
+            update_stat()
+            self._merge_render_cb = render_table
+
+        def load_files():
+            nonlocal all_files
+            files = self._collect_excel_files_under(merge_root)
+            all_files = []
+            for p in files:
+                try:
+                    st = p.stat()
+                    mtime_dt = datetime.fromtimestamp(st.st_mtime)
+                    mtime_s = mtime_dt.strftime("%Y/%m/%d %H:%M:%S")
+                    size = int(st.st_size or 0)
+                    mts = float(st.st_mtime)
+                except OSError:
+                    mtime_s = ""
+                    size = 0
+                    mts = 0.0
+                all_files.append(
+                    {
+                        "path": p,
+                        "name": p.name,
+                        "size": size,
+                        "mtime": mtime_s,
+                        "mtime_ts": mts,
+                        "path_display": str(p.parent.relative_to(merge_root)) if p.parent != merge_root else ".",
+                    }
+                )
+                checked_map.setdefault(str(p), False)
+            render_table()
+
+        def on_header_clicked(section: int):
+            if section == 0:
+                if not row_paths:
+                    return
+                all_checked = all(checked_map.get(p, True) for p in row_paths)
+                for p in row_paths:
+                    checked_map[p] = not all_checked
+                render_table()
+                return
+            if section not in (1, 2, 3, 4):
+                return
+            if sort_state["field"] == section:
+                if sort_state["asc"]:
+                    sort_state["asc"] = False
+                else:
+                    sort_state["field"] = None
+                    sort_state["asc"] = True
+            else:
+                sort_state["field"] = section
+                sort_state["asc"] = True
+            render_table()
+        self._merge_on_header_click_cb = on_header_clicked
+
+        def on_cell_clicked(row: int, _col: int):
+            if row < 0 or row >= len(row_paths):
+                return
+            p = row_paths[row]
+            checked_map[p] = not checked_map.get(p, True)
+            render_table()
+
+        def on_header_menu(pos):
+            section = hdr.logicalIndexAt(pos)
+            menu = QMenu(file_table)
+            if section in (1, 2, 3, 4):
+                action_set = menu.addAction("打开本列筛选")
+                action_clear = menu.addAction("清除本列过滤")
+                menu.addSeparator()
+                action_clear_all = menu.addAction("清除全部过滤")
+                chosen = menu.exec(hdr.mapToGlobal(pos))
+                if chosen is action_set:
+                    self._open_header_filter_from_header("merge_excel", section)
+                elif chosen is action_clear:
+                    f = self._field_for_header_section("merge_excel", section)
+                    if f:
+                        self._merge_header_filters.pop(f, None)
+                    render_table()
+                elif chosen is action_clear_all:
+                    self._merge_header_filters.clear()
+                    render_table()
+            else:
+                action_clear_all = menu.addAction("清除全部过滤")
+                chosen = menu.exec(hdr.mapToGlobal(pos))
+                if chosen is action_clear_all:
+                    self._merge_header_filters.clear()
+                    render_table()
+
+        def merge_selected():
+            selected_paths: list[Path] = []
+            for rec in all_files:
+                p = str(rec["path"])
+                if checked_map.get(p, True):
+                    selected_paths.append(Path(p))
+            if not selected_paths:
+                QMessageBox.information(dlg, "提示", "请先勾选至少一个 Excel 文件")
+                return
+            confirm_box = QMessageBox(dlg)
+            confirm_box.setIcon(QMessageBox.Icon.Question)
+            confirm_box.setWindowTitle("确认合并")
+            confirm_box.setText(f"确定要把选中的这 {len(selected_paths)} 个 Excel 文件合并吗？")
+            btn_ok = confirm_box.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+            confirm_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            confirm_box.exec()
+            if confirm_box.clickedButton() is not btn_ok:
+                return
+            base_dir = APP_DIR if sys.platform == "darwin" else (
+                Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else APP_DIR
+            )
+            date_dir = base_dir / datetime.now().strftime("%Y%m%d")
+            try:
+                date_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                QMessageBox.warning(dlg, "合并失败", f"创建目录失败：\n{date_dir}\n\n{e}")
+                return
+            out_default = date_dir / f"合并结果_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            out_file, _ = QFileDialog.getSaveFileName(
+                dlg,
+                "选择保存位置并命名文件",
+                str(out_default),
+                "Excel (*.xlsx)",
+            )
+            if not out_file:
+                return
+            out_path = Path(out_file)
+            if out_path.suffix.lower() != ".xlsx":
+                out_path = out_path.with_suffix(".xlsx")
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                QMessageBox.warning(dlg, "合并失败", f"创建目录失败：\n{out_path.parent}\n\n{e}")
+                return
+
+            out_wb = None
+            out_ws = None
+            header_written = False
+            header_cols = 0
+            merged_file_count = 0
+            merged_data_rows = 0
+            failed_files: list[str] = []
+            header_ref_canon: tuple[str, ...] = tuple()
+            merged_rows: list[list[Any]] = []
+
+            def _canon(vals: list[Any], width: int) -> tuple[str, ...]:
+                arr = list(vals)
+                if width > 0:
+                    if len(arr) < width:
+                        arr.extend([None] * (width - len(arr)))
+                    elif len(arr) > width:
+                        arr = arr[:width]
+                return tuple(str(v).strip().lower() if v is not None else "" for v in arr)
+
+            def _normalize(vals: list[Any], width: int) -> list[Any]:
+                arr = list(vals)
+                if width > 0:
+                    if len(arr) < width:
+                        arr.extend([None] * (width - len(arr)))
+                    elif len(arr) > width:
+                        arr = arr[:width]
+                return arr
+
+            def _has_effective_data(vals: list[Any]) -> bool:
+                return any(str(v).strip() for v in vals if v is not None)
+            template_path: Path | None = None
+            for p in selected_paths:
+                if p.is_file() and p.suffix.lower() != ".xls":
+                    template_path = p
+                    break
+            if template_path is None:
+                QMessageBox.warning(dlg, "合并失败", "未找到可作为模板的文件（.xls 暂不支持）。")
+                return
+            try:
+                out_wb = load_workbook(str(template_path))
+                out_ws = out_wb[out_wb.sheetnames[0]]
+            except Exception as e:
+                QMessageBox.warning(dlg, "合并失败", f"模板文件读取失败：\n{template_path}\n\n{e}")
+                return
+            template_rows = list(out_ws.iter_rows(values_only=True))
+            header_idx = None
+            for i, row in enumerate(template_rows):
+                if row is not None and any(str(v).strip() for v in row if v is not None):
+                    header_idx = i
+                    break
+            if header_idx is None:
+                QMessageBox.warning(dlg, "合并失败", f"模板文件无有效表头：\n{template_path}")
+                return
+            header_written = True
+            header_cols = len(list(template_rows[header_idx]))
+            header_ref_canon = _canon(list(template_rows[header_idx]), header_cols)
+            for row in template_rows[header_idx + 1 :]:
+                if row is None:
+                    continue
+                vals = _normalize(list(row), header_cols)
+                if not _has_effective_data(vals):
+                    continue
+                if _canon(vals, header_cols) == header_ref_canon:
+                    continue
+                merged_rows.append(vals)
+                merged_data_rows += 1
+            merged_file_count = 1
+            for fp in selected_paths:
+                if fp == template_path:
+                    continue
+                if not fp.is_file():
+                    failed_files.append(f"{fp.name}（文件不存在）")
+                    continue
+                if fp.suffix.lower() == ".xls":
+                    failed_files.append(f"{fp.name}（暂不支持 .xls，请先另存为 .xlsx）")
+                    continue
+                try:
+                    wb = load_workbook(str(fp), read_only=True, data_only=True)
+                    try:
+                        ws = wb[wb.sheetnames[0]]
+                        rows_all = list(ws.iter_rows(values_only=True))
+                        if not rows_all:
+                            continue
+                        header_idx = None
+                        for i, row in enumerate(rows_all):
+                            if row is None:
+                                continue
+                            if any(str(v).strip() for v in row if v is not None):
+                                header_idx = i
+                                break
+                        if header_idx is None:
+                            continue
+                        for row in rows_all[header_idx + 1 :]:
+                            if row is None:
+                                continue
+                            vals = _normalize(list(row), header_cols)
+                            if not _has_effective_data(vals):
+                                continue
+                            if _canon(vals, header_cols) == header_ref_canon:
+                                continue
+                            merged_rows.append(vals)
+                            merged_data_rows += 1
+                        merged_file_count += 1
+                    finally:
+                        wb.close()
+                except Exception as e:
+                    failed_files.append(f"{fp.name}（{e}）")
+            try:
+                assert out_wb is not None
+                assert out_ws is not None
+                # 固定从模板表头下一行开始连续写入，避免 append 因模板历史样式把数据追加到很靠后位置。
+                write_row = header_idx + 2
+                for vals in merged_rows:
+                    for ci in range(header_cols):
+                        out_ws.cell(row=write_row, column=ci + 1, value=vals[ci] if ci < len(vals) else None)
+                    write_row += 1
+                out_wb.save(str(out_path))
+            except OSError as e:
+                QMessageBox.warning(dlg, "合并失败", f"保存文件失败：\n{out_path}\n\n{e}")
+                return
+            msg = f"已基于模板「{template_path.name}」合并 {merged_file_count} 个文件，输出文件：\n{out_path}"
+            if failed_files:
+                shown = "\n".join(failed_files[:6])
+                more = f"\n... 其余 {len(failed_files) - 6} 个失败文件未展开" if len(failed_files) > 6 else ""
+                msg += f"\n\n以下文件合并失败（最多显示6条）：\n{shown}{more}"
+            stamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+            self.print_records.insert(
+                0,
+                {
+                    "id": str(uuid.uuid4()),
+                    "path": str(out_path),
+                    "filename": out_path.name,
+                    "source": "合并",
+                    "printed_at": stamp,
+                    "row_count": max(0, merged_data_rows),
+                    "include_print_url": False,
+                },
+            )
+            self.save_print_records()
+            if self.content_stack.currentIndex() == 2:
+                self.refresh_print_records_table()
+            box = QMessageBox(dlg)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("合并成功")
+            box.setText(msg)
+            btn_open_dir = box.addButton("打开文件夹", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Ok)
+            box.exec()
+            if box.clickedButton() is btn_open_dir:
+                self.open_print_record_folder(str(out_path))
+            dlg.accept()
+
+        def on_search_clicked():
+            active_query["text"] = name_search.text().strip().lower()
+            self._merge_header_filters.clear()
+            render_table()
+
+        def on_clear_clicked():
+            name_search.setText("")
+            active_query["text"] = ""
+            self._merge_header_filters.clear()
+            sort_state["field"] = None
+            sort_state["asc"] = True
+            render_table()
+
+        hdr.sectionClicked.connect(on_header_clicked)
+        hdr.customContextMenuRequested.connect(on_header_menu)
+        file_table.cellClicked.connect(on_cell_clicked)
+        btn_search.clicked.connect(on_search_clicked)
+        btn_clear.clicked.connect(on_clear_clicked)
+        btn_merge.clicked.connect(merge_selected)
+        btn_cancel.clicked.connect(dlg.reject)
+        load_files()
+        dlg.exec()
+        self._merge_header_filters = {}
+        self._merge_rows_all = []
+        self._merge_active_query = ""
+        self._merge_render_cb = None
+        self._merge_filter_parent = None
+        self._merge_on_header_click_cb = None
+        self._merge_file_table = None
 
     def delete_selected_print_records(self):
         to_del = [i for i, r in enumerate(self.print_records) if r.get("checked")]
@@ -1574,6 +2231,16 @@ class BillApp(QMainWindow):
             if section == 0 or section > len(PRINT_LOG_DATA_FIELDS):
                 return None
             return PRINT_LOG_DATA_FIELDS[section - 1]
+        if mode == "merge_excel":
+            if section == 1:
+                return "merge_filename"
+            if section == 2:
+                return "merge_size"
+            if section == 3:
+                return "merge_mtime"
+            if section == 4:
+                return "merge_path"
+            return None
         if mode == "main_scroll":
             return self._main_scroll_field_for_section(section)
         if mode == "hist_scroll":
@@ -1582,6 +2249,11 @@ class BillApp(QMainWindow):
 
     def _header_show_filter_btn(self, mode: str, section: int) -> bool:
         return self._field_for_header_section(mode, section) is not None
+
+    def _on_merge_header_section_clicked(self, section: int):
+        cb = getattr(self, "_merge_on_header_click_cb", None)
+        if callable(cb):
+            cb(section)
 
     def _close_column_filter_popup(self):
         w = self._filter_popup
@@ -1606,6 +2278,11 @@ class BillApp(QMainWindow):
             h = self.history_table.horizontalHeader()
         elif mode == "print_rec":
             h = self.print_log_table.horizontalHeader()
+        elif mode == "merge_excel":
+            mt = getattr(self, "_merge_file_table", None)
+            if mt is None:
+                return None
+            h = mt.horizontalHeader()
         else:
             return None
         if not isinstance(h, HoverFilterHeaderView):
@@ -1623,6 +2300,9 @@ class BillApp(QMainWindow):
         elif mode.startswith("print"):
             opts = self._unique_display_values_print(field)
             cur = set(self.print_header_filters.get(field, ()))
+        elif mode.startswith("merge"):
+            opts = self._unique_display_values_merge(field)
+            cur = set(getattr(self, "_merge_header_filters", {}).get(field, ()))
         else:
             opts = self._unique_display_values_hist(field)
             cur = set(self.history_header_filters.get(field, ()))
@@ -1633,6 +2313,7 @@ class BillApp(QMainWindow):
         anchor = self._filter_button_global_bottom_right(mode, section)
         if anchor is None:
             anchor = self.mapToGlobal(self.rect().topRight())
+        popup_parent = getattr(self, "_merge_filter_parent", None) if mode.startswith("merge") else self
         dlg = ColumnPickFilterPopup(
             self,
             mode,
@@ -1641,7 +2322,7 @@ class BillApp(QMainWindow):
             opts,
             cur,
             anchor,
-            parent=self,
+            parent=popup_parent or self,
         )
         dlg.destroyed.connect(lambda *a, d=dlg: self._on_column_filter_popup_closed(d))
         self._filter_popup = dlg
@@ -3094,6 +3775,7 @@ class BillApp(QMainWindow):
                 "id": str(uuid.uuid4()),
                 "path": out_file,
                 "filename": os.path.basename(out_file),
+                "source": "打印",
                 "printed_at": stamp,
                 "row_count": len(selected),
                 "include_print_url": include_url,
