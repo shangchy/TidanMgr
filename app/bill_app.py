@@ -1,7 +1,7 @@
 import json
 import os
 import re
-import shutil
+import subprocess
 import sys
 import uuid
 from datetime import datetime
@@ -81,7 +81,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -399,7 +398,7 @@ class BillApp(QMainWindow):
         history_top.addWidget(btn_history_search)
         history_top.addWidget(btn_history_clear)
         history_top.addStretch(1)
-        self.btn_restore_selected = QPushButton("↩ 恢复选中到提单表")
+        self.btn_restore_selected = QPushButton("↩ 恢复选中")
         self.btn_restore_selected.setObjectName("btnAccent")
         self.btn_restore_selected.clicked.connect(self.restore_selected_history)
         history_top.addWidget(self.btn_restore_selected)
@@ -472,7 +471,7 @@ class BillApp(QMainWindow):
         btn_pl_clear = QPushButton("🔄 清空筛选")
         btn_pl_clear.setObjectName("btnGhost")
         btn_pl_clear.clicked.connect(self.clear_print_log_search_and_filters)
-        self.btn_print_log_delete = QPushButton("🗑 批量删除选中")
+        self.btn_print_log_delete = QPushButton("🗑 删除选中")
         self.btn_print_log_delete.setObjectName("btnDanger")
         self.btn_print_log_delete.clicked.connect(self.delete_selected_print_records)
         pl_top.addWidget(self.print_log_search)
@@ -536,7 +535,7 @@ class BillApp(QMainWindow):
 
         # 与滚动区列顺序一致：类型…行业、「允许」、URL…；长度须 >= MAIN_SCROLL_COLUMNS+1（含 col_widths[0] 给冻结任务名列）
         # 滚动区列序与 col_widths[1:] 对齐；末四列为 提单时间、打印次数、打印时间、操作（原打印相关宽顺序已随列序调整）
-        col_widths = [260, 150, 150, 120, 72, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 168, 170, 72, 90, 100]
+        col_widths = [260, 150, 150, 120, 72, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 168, 88, 168, 128]
         self.table_frozen.setColumnWidth(0, 42)
         self.table_frozen.setColumnWidth(1, col_widths[0])
         for s in range(MAIN_SCROLL_COLUMNS):
@@ -547,7 +546,7 @@ class BillApp(QMainWindow):
         for s in range(HISTORY_SCROLL_COLUMNS):
             self.history_table.setColumnWidth(s, hist_widths[s + 1])
         self.print_log_table.setColumnWidth(0, 44)
-        _pw = [300, 168, 88, 100, 88, 380, 168]
+        _pw = [300, 168, 88, 100, 88, 380, 228]
         for s, w in enumerate(_pw, start=1):
             self.print_log_table.setColumnWidth(s, w)
         self.table_frozen.itemChanged.connect(self.on_item_changed)
@@ -1033,12 +1032,17 @@ class BillApp(QMainWindow):
             al = QHBoxLayout(act)
             al.setContentsMargins(4, 2, 4, 2)
             al.setSpacing(6)
-            bp = QPushButton("预览")
+            al.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            bp = QPushButton("👁 预览")
             bp.setObjectName("btnGhost")
+            bp.setFixedSize(84, 30)
+            bp.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             bp.clicked.connect(lambda _=False, p=pth: self.preview_print_record_file(p))
-            bd = QPushButton("下载")
+            bd = QPushButton("📂 打开")
             bd.setObjectName("btnGhost")
-            bd.clicked.connect(lambda _=False, p=pth: self.download_print_record_file(p))
+            bd.setFixedSize(84, 30)
+            bd.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            bd.clicked.connect(lambda _=False, p=pth: self.open_print_record_folder(p))
             al.addWidget(bp)
             al.addWidget(bd)
             self.print_log_table.setCellWidget(row, 7, act)
@@ -1100,22 +1104,25 @@ class BillApp(QMainWindow):
         lo.addWidget(bb)
         dlg.exec()
 
-    def download_print_record_file(self, path: str):
+    def open_print_record_folder(self, path: str):
         p = Path(path)
         if not p.is_file():
-            QMessageBox.warning(self, "下载", "文件不存在或已被移动。")
-            return
-        dest, _ = QFileDialog.getSaveFileName(
-            self, "保存副本", str(Path.home() / p.name), "Excel (*.xlsx);;所有文件 (*.*)"
-        )
-        if not dest:
+            QMessageBox.warning(self, "打开文件夹", "文件不存在或已被移动。")
             return
         try:
-            shutil.copy2(p, dest)
-        except OSError as e:
-            QMessageBox.warning(self, "下载失败", str(e))
+            if sys.platform.startswith("win"):
+                # Windows 下优先异步打开目录；失败时异步定位文件。
+                try:
+                    os.startfile(str(p.parent))  # type: ignore[attr-defined]
+                except OSError:
+                    subprocess.Popen(["explorer", "/select,", str(p)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p.parent)])
+        except Exception as e:
+            QMessageBox.warning(self, "打开文件夹失败", str(e))
             return
-        QMessageBox.information(self, "下载", f"已保存至:\n{dest}")
 
     def delete_selected_print_records(self):
         to_del = [i for i, r in enumerate(self.print_records) if r.get("checked")]
@@ -2077,7 +2084,7 @@ class BillApp(QMainWindow):
             )
             tn_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             if not str(rec.get("task_name", "")).strip():
-                tn_item.setToolTip("示例：客户全国YDDBDK-产品")
+                tn_item.setToolTip("示例：客户全国######-产品")
             if self.field_errors.get((rec_idx, "task_name")):
                 tn_item.setBackground(QColor("#e05263"))
                 tn_item.setToolTip(self.field_error_msgs.get((rec_idx, "task_name"), "字段校验失败"))
@@ -2159,10 +2166,18 @@ class BillApp(QMainWindow):
             pt_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             pt_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.table.setItem(row, len(FIELDS) + 1, pt_item)
+            act_del = QWidget()
+            del_lo = QHBoxLayout(act_del)
+            del_lo.setContentsMargins(4, 2, 4, 2)
+            del_lo.setSpacing(0)
+            del_lo.setAlignment(Qt.AlignmentFlag.AlignCenter)
             btn = QPushButton("🗑 删除")
             btn.setObjectName("btnDanger")
+            btn.setFixedSize(92, 30)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda _=False, x=rec_idx: self.delete_row(x))
-            self.table.setCellWidget(row, MAIN_SCROLL_COLUMNS - 1, btn)
+            del_lo.addWidget(btn)
+            self.table.setCellWidget(row, MAIN_SCROLL_COLUMNS - 1, act_del)
             per_row_heights.append(row_max_h)
         for r, rh in enumerate(per_row_heights):
             self.table.setRowHeight(r, rh)
@@ -2303,6 +2318,14 @@ class BillApp(QMainWindow):
     def on_current_cell_changed(self, current_row, current_col, _previous_row, _previous_col):
         if self.updating_table:
             return
+        should_refresh = False
+        if 0 <= _previous_row < len(self.filtered_indices):
+            prev_rec_idx = self.filtered_indices[_previous_row]
+            should_refresh = self._validate_row_on_leave(prev_rec_idx)
+        if should_refresh:
+            self.refresh_table()
+            if 0 <= current_row < len(self.filtered_indices) and 0 <= current_col < self.table.columnCount():
+                self.table.setCurrentCell(current_row, current_col)
         if current_row < 0 or current_row >= len(self.filtered_indices):
             return
         if current_col <= 0 or current_col >= len(DISPLAY_FIELDS) - 1:
@@ -2335,7 +2358,10 @@ class BillApp(QMainWindow):
         menu = self.table.createStandardContextMenu()
         action_map: dict[object, tuple[str, str]] = {}
         if field == "task_name":
-            sample = f"客户{self.region_part(rec)}{rec.get('operator_code') or 'YD'}{rec.get('type_code') or 'DB'}{rec.get('industry_code') or 'DK'}-产品"
+            sample = (
+                f"客户{self.region_part(rec)}{rec.get('operator_code') or '##'}"
+                f"{rec.get('type_code') or '##'}{rec.get('industry_code') or '##'}-产品"
+            )
             action_fill = menu.addAction("套用任务名示例")
             action_map[action_fill] = ("task_name", sample)
         elif field == "operator_code":
@@ -2609,6 +2635,67 @@ class BillApp(QMainWindow):
         self.field_errors.pop((rec_idx, field), None)
         self.field_error_msgs.pop((rec_idx, field), None)
 
+    def _mark_row_validation_error(self, rec_idx: int, msg: str):
+        if "年龄上限必须大于等于年龄下限" in msg:
+            self.mark_error(rec_idx, "age_min", msg)
+            self.mark_error(rec_idx, "age_max", msg)
+        elif "运营商" in msg:
+            self.mark_error(rec_idx, "operator_code", msg)
+            self.mark_error(rec_idx, "task_name", msg)
+        elif "类型" in msg:
+            self.mark_error(rec_idx, "type_code", msg)
+            self.mark_error(rec_idx, "task_name", msg)
+        elif "行业编码" in msg:
+            self.mark_error(rec_idx, "industry_code", msg)
+            self.mark_error(rec_idx, "task_name", msg)
+        elif "任务名中的地域" in msg:
+            self.mark_error(rec_idx, "task_name", msg)
+            self.mark_error(rec_idx, "province", msg)
+            self.mark_error(rec_idx, "city", msg)
+        elif "数量必须大于0" in msg or "数量" in msg:
+            self.mark_error(rec_idx, "quantity", msg)
+        elif "年龄上限" in msg:
+            self.mark_error(rec_idx, "age_max", msg)
+        elif "年龄下限" in msg:
+            self.mark_error(rec_idx, "age_min", msg)
+        elif "pv" in msg:
+            self.mark_error(rec_idx, "pv", msg)
+        elif "URL" in msg:
+            self.mark_error(rec_idx, "url", msg)
+        elif "时长" in msg:
+            self.mark_error(rec_idx, "duration", msg)
+        elif "任务名" in msg:
+            self.mark_error(rec_idx, "task_name", msg)
+
+    def _validate_row_on_leave(self, rec_idx: int) -> bool:
+        if rec_idx < 0 or rec_idx >= len(self.records):
+            return False
+        tracked_fields = (
+            "task_name",
+            "type_code",
+            "operator_code",
+            "industry_code",
+            "url",
+            "quantity",
+            "duration",
+            "age_max",
+            "age_min",
+            "pv",
+            "province",
+            "city",
+        )
+        before = {f: self.field_error_msgs.get((rec_idx, f), "") for f in tracked_fields if (rec_idx, f) in self.field_errors}
+        for f in tracked_fields:
+            self.clear_error(rec_idx, f)
+        rec = self.records[rec_idx]
+        ok, msg = self.validate_record(rec)
+        if ok:
+            ok, msg = self.validate_export_record(rec)
+        if not ok:
+            self._mark_row_validation_error(rec_idx, msg)
+        after = {f: self.field_error_msgs.get((rec_idx, f), "") for f in tracked_fields if (rec_idx, f) in self.field_errors}
+        return before != after
+
     def _shift_field_errors_after_insert(self, insert_at: int):
         """在 insert_at 插入空行后，原索引 >= insert_at 的校验错误键整体 +1。"""
         new_err: dict[tuple[int, str], bool] = {}
@@ -2711,6 +2798,7 @@ class BillApp(QMainWindow):
             ("type_code", "类型"),
             ("operator_code", "运营商"),
             ("industry_code", "行业编码"),
+            ("url", "URL"),
             ("quantity", "数量"),
             ("duration", "时长"),
         ]
@@ -2798,7 +2886,10 @@ class BillApp(QMainWindow):
         product = old.split("-", 1)[1] if "-" in old else "产品"
         parsed = self.parse_left(old.split("-", 1)[0]) if "-" in old else None
         customer = parsed["customer"] if parsed else "客户"
-        return f"{customer}{self.region_part(rec)}{rec.get('operator_code') or 'YD'}{rec.get('type_code') or 'DB'}{rec.get('industry_code') or 'DK'}-{product}"
+        return (
+            f"{customer}{self.region_part(rec)}{rec.get('operator_code') or '##'}"
+            f"{rec.get('type_code') or '##'}{rec.get('industry_code') or '##'}-{product}"
+        )
 
     def parse_task_name(self, rec):
         self._task_name_parse_user_warned = False
@@ -2864,6 +2955,15 @@ class BillApp(QMainWindow):
         selected_with_index = [(idx, r) for idx, r in enumerate(self.records) if r.get("checked")]
         if not selected_with_index:
             QMessageBox.information(self, "提示", "请先勾选至少一条记录")
+            return
+        confirm_box = QMessageBox(self)
+        confirm_box.setIcon(QMessageBox.Icon.Question)
+        confirm_box.setWindowTitle("确认打印")
+        confirm_box.setText(f"确定要把选中的这 {len(selected_with_index)} 条数据打印到 Excel 文件？")
+        btn_ok = confirm_box.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+        confirm_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        confirm_box.exec()
+        if confirm_box.clickedButton() is not btn_ok:
             return
         include_url = self.chk_print_url.isChecked()
         selected = [x[1] for x in selected_with_index]
@@ -2941,10 +3041,30 @@ class BillApp(QMainWindow):
                     ws[f"{c}{rr}"] = rec.get(f, "")
         customer = self.export_customer_name(selected[0])
         filename = f"{customer}_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        out_file, _ = QFileDialog.getSaveFileName(self, "保存导出文件", str(APP_DIR / filename), "Excel (*.xlsx)")
-        if not out_file:
+        base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else APP_DIR
+        date_dir = base_dir / datetime.now().strftime("%Y%m%d")
+        try:
+            date_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "导出失败", f"创建目录失败：\n{date_dir}\n\n{e}")
             return
-        wb.save(out_file)
+        out_path = date_dir / filename
+        if out_path.exists():
+            stem = out_path.stem
+            suffix = out_path.suffix
+            i = 1
+            while True:
+                candidate = date_dir / f"{stem}_{i:02d}{suffix}"
+                if not candidate.exists():
+                    out_path = candidate
+                    break
+                i += 1
+        try:
+            wb.save(str(out_path))
+        except OSError as e:
+            QMessageBox.warning(self, "导出失败", f"保存文件失败：\n{out_path}\n\n{e}")
+            return
+        out_file = str(out_path)
         stamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
         for rec_idx, _r in selected_with_index:
             rr = self.records[rec_idx]
@@ -2970,7 +3090,21 @@ class BillApp(QMainWindow):
         self.save_print_records()
         if self.content_stack.currentIndex() == 2:
             self.refresh_print_records_table()
-        QMessageBox.information(self, "导出成功", f"已导出: {out_file}")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("导出成功")
+        box.setText(f"已导出: {out_file}")
+        box.setInformativeText(
+            "<span style='color:#2563eb;'>"
+            "可点击“打开文件夹”快速定位到该导出文件。"
+            "<br/>也可以到打印记录页面中打开该文件所在文件夹。"
+            "</span>"
+        )
+        btn_open_dir = box.addButton("打开文件夹", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is btn_open_dir:
+            self.open_print_record_folder(out_file)
 
 
 def _show_license_expired_dialog(parent: QWidget | None = None) -> None:
