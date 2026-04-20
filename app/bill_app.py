@@ -143,6 +143,7 @@ class BillApp(QMainWindow):
         # 须在 _setup_ui 之前：建表时会触发列宽/URL 行高回调，依赖本属性
         _fm0 = QFontMetrics(self.font())
         self._data_row_height = max(44, int((_fm0.height() + max(_fm0.leading(), 0)) * 1.5) + 14)
+        self._ensure_output_dirs()
         self._setup_ui()
         self.load_data()
         self.load_history_data()
@@ -1573,16 +1574,13 @@ class BillApp(QMainWindow):
             confirm_box.exec()
             if confirm_box.clickedButton() is not btn_ok:
                 return
-            base_dir = APP_DIR if sys.platform == "darwin" else (
-                Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else APP_DIR
-            )
-            date_dir = base_dir / datetime.now().strftime("%Y%m%d")
+            base_dir = self._default_output_dir_for("merge")
             try:
-                date_dir.mkdir(parents=True, exist_ok=True)
+                base_dir.mkdir(parents=True, exist_ok=True)
             except OSError as e:
-                QMessageBox.warning(dlg, "合并失败", f"创建目录失败：\n{date_dir}\n\n{e}")
+                QMessageBox.warning(dlg, "合并失败", f"创建目录失败：\n{base_dir}\n\n{e}")
                 return
-            out_default = date_dir / f"合并结果_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            out_default = base_dir / f"合并结果_{datetime.now().strftime('%Y%m%d')}.xlsx"
             out_file, _ = QFileDialog.getSaveFileName(
                 dlg,
                 "选择保存位置并命名文件",
@@ -2254,6 +2252,34 @@ class BillApp(QMainWindow):
         cb = getattr(self, "_merge_on_header_click_cb", None)
         if callable(cb):
             cb(section)
+
+    def _default_output_base_dir(self) -> Path:
+        """输出目录：优先可执行文件目录（便于 U 盘携带），不可写时回退 APP_DIR。"""
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).resolve().parent
+            probe = exe_dir / ".tidanmgr_write_probe"
+            try:
+                probe.mkdir(parents=False, exist_ok=True)
+                probe.rmdir()
+                return exe_dir
+            except OSError:
+                return APP_DIR
+        return APP_DIR
+
+    def _default_output_dir_for(self, kind: str) -> Path:
+        """按类型返回输出目录（print/merge），位于启动程序同级。"""
+        root = self._default_output_base_dir()
+        safe = "merge" if str(kind).strip().lower() == "merge" else "print"
+        return root / safe
+
+    def _ensure_output_dirs(self):
+        """启动时预创建输出目录（print / merge）。"""
+        for k in ("print", "merge"):
+            try:
+                self._default_output_dir_for(k).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # 不阻塞启动；实际导出时会再提示具体错误
+                pass
 
     def _close_column_filter_popup(self):
         w = self._filter_popup
@@ -3723,19 +3749,13 @@ class BillApp(QMainWindow):
                     ws[f"{c}{rr}"] = rec.get(f, "")
         customer = self.export_customer_name(selected[0])
         filename = f"{customer}_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        # macOS 打包后可执行目录通常位于 .app 包内，且可能被 App Translocation 挂载为只读；
-        # 因此 macOS 统一落到 APP_DIR（Application Support/便携目录），其他平台保持原策略。
-        if sys.platform == "darwin":
-            base_dir = APP_DIR
-        else:
-            base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else APP_DIR
-        date_dir = base_dir / datetime.now().strftime("%Y%m%d")
+        base_dir = self._default_output_dir_for("print")
         try:
-            date_dir.mkdir(parents=True, exist_ok=True)
+            base_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            QMessageBox.warning(self, "导出失败", f"创建目录失败：\n{date_dir}\n\n{e}")
+            QMessageBox.warning(self, "导出失败", f"创建目录失败：\n{base_dir}\n\n{e}")
             return
-        default_out = date_dir / filename
+        default_out = base_dir / filename
         out_file, _ = QFileDialog.getSaveFileName(
             self,
             "选择保存位置并命名文件",
