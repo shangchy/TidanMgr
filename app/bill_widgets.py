@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -23,6 +23,12 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFrame,
+    QGraphicsPathItem,
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QGraphicsSimpleTextItem,
+    QGraphicsView,
     QHeaderView,
     QLabel,
     QLineEdit,
@@ -542,6 +548,332 @@ class AllowPrintUrlCellDelegate(QStyledItemDelegate):
         painter.setPen(pen_text)
         painter.drawText(disc, Qt.AlignmentFlag.AlignCenter, text)
         painter.restore()
+
+
+class AccessoryGraphView(QGraphicsView):
+    """配件表图形树：卡片节点 + 连线，支持选中与枝干展开/收起。"""
+
+    nodeSelected = Signal(str)
+    nodeDoubleClicked = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._root: dict | None = None
+        self._keyword = ""
+        self._collapsed: set[str] = set()
+        self._selected_id: str = "root"
+        self._node_rects: dict[str, QRectF] = {}
+        self._toggle_rects: dict[str, QRectF] = {}
+        self._root_anchor_x: float | None = None
+        self._root_anchor_locked = False
+        self._panning = False
+        self._panning_button = Qt.MouseButton.NoButton
+        self._pan_start = QPoint()
+        self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setBackgroundBrush(QBrush(QColor(244, 247, 252)))
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+
+    def selected_id(self) -> str:
+        return self._selected_id
+
+    def set_tree_data(self, root: dict, keyword: str = ""):
+        self._root = root
+        self._keyword = (keyword or "").strip().lower()
+        self._render()
+
+    def set_root_anchor_scene_x(self, x: float):
+        """设置根节点固定锚点（场景坐标 X）。"""
+        self._root_anchor_x = float(x)
+        self._root_anchor_locked = True
+        self._render()
+
+    def _node_text(self, node: dict) -> tuple[str, str]:
+        name = str(node.get("name", "") or "")
+        ntype = str(node.get("node_type", "") or "")
+        if ntype == "leaf":
+            # 叶子节点仅显示描述
+            name = str(node.get("desc", "") or "")
+            sub = ""
+        else:
+            sub = ""
+        return name, sub
+
+    def _node_size(self, node: dict) -> tuple[float, float]:
+        name, sub = self._node_text(node)
+        fm = QFontMetricsF(self.font())
+        # 初始宽度较之前约缩小 1/3；若文本更长则自动扩宽以容纳内容。
+        text_w = max(fm.horizontalAdvance(name or " "), fm.horizontalAdvance(sub or ""))
+        w = max(120.0, text_w + 26.0)
+        # 节点高度较之前减少 50%（原 72 -> 36）。
+        h = 36.0
+        return w, h
+
+    def _matches_or_has_match(self, node: dict) -> bool:
+        if not self._keyword:
+            return True
+        blob = f"{node.get('name','')} {node.get('desc','')} {node.get('url','')}".lower()
+        if self._keyword in blob:
+            return True
+        for ch in node.get("children", []) or []:
+            if isinstance(ch, dict) and self._matches_or_has_match(ch):
+                return True
+        return False
+
+    def _visible_children(self, node: dict) -> list[dict]:
+        out: list[dict] = []
+        if node.get("id") in self._collapsed:
+            return out
+        for ch in node.get("children", []) or []:
+            if isinstance(ch, dict) and self._matches_or_has_match(ch):
+                out.append(ch)
+        return out
+
+    def _subtree_width(self, node: dict, h_gap: float) -> float:
+        nw, _ = self._node_size(node)
+        children = self._visible_children(node)
+        if not children:
+            return nw
+        total = 0.0
+        for i, ch in enumerate(children):
+            if i:
+                total += h_gap
+            total += self._subtree_width(ch, h_gap)
+        return max(nw, total)
+
+    def _layout(self, node: dict, left: float, top: float, h_gap: float, v_gap: float):
+        sw = self._subtree_width(node, h_gap)
+        nw, nh = self._node_size(node)
+        cx = left + sw / 2.0
+        rect = QRectF(cx - nw / 2.0, top, nw, nh)
+        nid = str(node.get("id", ""))
+        self._node_rects[nid] = rect
+        cur_left = left
+        children = self._visible_children(node)
+        for ch in children:
+            chw = self._subtree_width(ch, h_gap)
+            self._layout(ch, cur_left, top + nh + v_gap, h_gap, v_gap)
+            cur_left += chw + h_gap
+
+    def _draw_node(self, node: dict):
+        nid = str(node.get("id", ""))
+        rect = self._node_rects.get(nid)
+        if rect is None:
+            return
+        ntype = str(node.get("node_type", "") or "")
+        border = QColor(111, 152, 220) if ntype != "leaf" else QColor(178, 127, 206)
+        if ntype == "root":
+            border = QColor(110, 162, 152)
+        bg = QColor(250, 252, 255)
+        if nid == self._selected_id:
+            bg = QColor(236, 243, 255)
+        item = QGraphicsRectItem(rect)
+        item.setBrush(QBrush(bg))
+        item.setPen(QPen(border, 2.0))
+        item.setData(0, nid)
+        if ntype == "leaf":
+            tip_url = str(node.get("url", "") or "").strip()
+            if tip_url:
+                item.setToolTip(tip_url)
+        self._scene.addItem(item)
+        title, sub = self._node_text(node)
+        t1 = QGraphicsSimpleTextItem(title or " ", item)
+        t2 = QGraphicsSimpleTextItem(sub, item)
+        t1.setBrush(QBrush(QColor(49, 64, 86)))
+        t2.setBrush(QBrush(QColor(66, 132, 108)))
+        fm = QFontMetricsF(self.font())
+        tw1 = fm.horizontalAdvance(title or " ")
+        tw2 = fm.horizontalAdvance(sub)
+        lh = fm.height()
+        has_sub = bool(sub.strip())
+        total_h = lh * (2 if has_sub else 1) + (6.0 if has_sub else 0.0)
+        top_y = rect.y() + (rect.height() - total_h) / 2.0
+        t1.setPos(rect.x() + (rect.width() - tw1) / 2.0, top_y)
+        if has_sub:
+            t2.setPos(rect.x() + (rect.width() - tw2) / 2.0, top_y + lh + 6.0)
+        else:
+            t2.setVisible(False)
+
+        ntype = str(node.get("node_type", "") or "")
+        children = [ch for ch in node.get("children", []) or [] if isinstance(ch, dict)]
+        if ntype in ("root", "branch") and children:
+            collapsed = nid in self._collapsed
+            tw, th = 20.0, 14.0
+            # 展开/收缩按钮放到节点右下角，避开主连线，避免误触发导致看起来“线被点没了”。
+            tr = QRectF(rect.right() - tw - 6.0, rect.bottom() - th - 2.0, tw, th)
+            tg = QGraphicsRectItem(tr)
+            tg.setBrush(QBrush(QColor(231, 239, 248)))
+            tg.setPen(QPen(QColor(125, 150, 190), 1.0))
+            self._scene.addItem(tg)
+            sign = QGraphicsSimpleTextItem("+" if collapsed else "−")
+            sfm = QFontMetricsF(sign.font())
+            sign.setBrush(QBrush(QColor(88, 110, 146)))
+            sign.setPos(tr.x() + (tr.width() - sfm.horizontalAdvance(sign.text())) / 2.0, tr.y() - 1.0)
+            self._scene.addItem(sign)
+            self._toggle_rects[nid] = tr
+
+    def _draw_edges(self, node: dict):
+        nid = str(node.get("id", ""))
+        parent_rect = self._node_rects.get(nid)
+        if parent_rect is None:
+            return
+        for ch in self._visible_children(node):
+            cid = str(ch.get("id", ""))
+            ch_rect = self._node_rects.get(cid)
+            if ch_rect is None:
+                continue
+            p1 = QPointF(parent_rect.center().x(), parent_rect.bottom())
+            p2 = QPointF(ch_rect.center().x(), ch_rect.top())
+            path = QPainterPath(p1)
+            mid_y = (p1.y() + p2.y()) / 2.0
+            path.lineTo(p1.x(), mid_y)
+            path.lineTo(p2.x(), mid_y)
+            path.lineTo(p2.x(), p2.y())
+            edge = QGraphicsPathItem(path)
+            edge.setPen(QPen(QColor(170, 182, 205), 1.1))
+            self._scene.addItem(edge)
+            self._draw_edges(ch)
+
+    def _shift_layout(self, dx: float, dy: float = 0.0):
+        if dx == 0.0 and dy == 0.0:
+            return
+        for nid, r in list(self._node_rects.items()):
+            self._node_rects[nid] = QRectF(r.x() + dx, r.y() + dy, r.width(), r.height())
+
+    def _render(self):
+        h_scroll = self.horizontalScrollBar().value()
+        v_scroll = self.verticalScrollBar().value()
+        self._scene.clear()
+        self._node_rects.clear()
+        self._toggle_rects.clear()
+        if not isinstance(self._root, dict):
+            return
+        h_gap = 34.0
+        v_gap = 58.0
+        # 根节点再上移 100px（由 -80 -> -180）
+        self._layout(self._root, 20.0, -180.0, h_gap, v_gap)
+        root_rect = self._node_rects.get("root")
+        if root_rect is not None:
+            if self._root_anchor_x is None:
+                self._root_anchor_x = root_rect.center().x()
+            else:
+                self._shift_layout(self._root_anchor_x - root_rect.center().x(), 0.0)
+        self._draw_edges(self._root)
+
+        def draw_all(node: dict):
+            self._draw_node(node)
+            for ch in self._visible_children(node):
+                draw_all(ch)
+
+        draw_all(self._root)
+        br = self._scene.itemsBoundingRect().adjusted(-28, -28, 28, 36)
+        # 固定较稳定的场景上边界，避免展开/收缩后视图锚点跳动。
+        top = min(-240.0, br.top())
+        left = min(-220.0, br.left())
+        width = max(br.width(), float(self.viewport().width()) - 4.0)
+        height = max(br.bottom() - top, float(self.viewport().height()) - 4.0)
+        self._scene.setSceneRect(QRectF(left, top, width, height))
+        self.horizontalScrollBar().setValue(h_scroll)
+        self.verticalScrollBar().setValue(v_scroll)
+
+    def mousePressEvent(self, event):
+        pos = self.mapToScene(event.position().toPoint())
+        it0 = self._scene.itemAt(pos, self.transform())
+        while it0 is not None and it0.data(0) is None:
+            it0 = it0.parentItem()
+        hit_root = it0 is not None and str(it0.data(0) or "") == "root"
+
+        if event.button() == Qt.MouseButton.RightButton or (event.button() == Qt.MouseButton.LeftButton and hit_root):
+            self._panning = True
+            self._panning_button = event.button()
+            self._pan_start = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        for nid, tr in self._toggle_rects.items():
+            if tr.contains(pos):
+                if nid in self._collapsed:
+                    self._collapsed.remove(nid)
+                else:
+                    self._collapsed.add(nid)
+                self._selected_id = nid
+                self.nodeSelected.emit(nid)
+                self._render()
+                return
+        it = self._scene.itemAt(pos, self.transform())
+        while it is not None and it.data(0) is None:
+            it = it.parentItem()
+        if it is not None:
+            self._selected_id = str(it.data(0) or "root")
+            self.nodeSelected.emit(self._selected_id)
+            self._render()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning:
+            delta = event.position().toPoint() - self._pan_start
+            self._pan_start = event.position().toPoint()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._panning and event.button() == self._panning_button:
+            self._panning = False
+            self._panning_button = Qt.MouseButton.NoButton
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        pos = self.mapToScene(event.position().toPoint())
+        it = self._scene.itemAt(pos, self.transform())
+        while it is not None and it.data(0) is None:
+            it = it.parentItem()
+        if it is not None:
+            nid = str(it.data(0) or "")
+            self._selected_id = nid
+            self.nodeSelected.emit(nid)
+            if isinstance(self._root, dict):
+                stack = [self._root]
+                node = None
+                while stack:
+                    cur = stack.pop()
+                    if str(cur.get("id", "")) == nid:
+                        node = cur
+                        break
+                    for ch in cur.get("children", []) or []:
+                        if isinstance(ch, dict):
+                            stack.append(ch)
+                if node and node.get("node_type") in ("root", "branch"):
+                    if nid in self._collapsed:
+                        self._collapsed.remove(nid)
+                    else:
+                        self._collapsed.add(nid)
+            self.nodeDoubleClicked.emit(nid)
+            self._render()
+        super().mouseDoubleClickEvent(event)
+
+    def wheelEvent(self, event):
+        # Ctrl + 滚轮缩放；普通滚轮保持滚动。
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            factor = 1.12 if event.angleDelta().y() > 0 else (1.0 / 1.12)
+            cur_scale = self.transform().m11()
+            new_scale = cur_scale * factor
+            if 0.35 <= new_scale <= 3.2:
+                self.scale(factor, factor)
+            event.accept()
+            return
+        super().wheelEvent(event)
 
 
 class BadgeCellDelegate(QStyledItemDelegate):

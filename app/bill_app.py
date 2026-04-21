@@ -4,6 +4,8 @@ import re
 import subprocess
 import sys
 import uuid
+from copy import copy
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -50,11 +52,13 @@ from bill_constants import (
     find_earliest_region_in_left,
     first_url,
     int_to_cn,
+    region_in_task_name_requires_customer_prefix,
     sanitize_filename,
     split_multi,
     cities_under_provinces,
 )
 from bill_paths import (
+    ACCESSORIES_FILE,
     APP_DIR,
     DATA_FILE,
     HISTORY_FILE,
@@ -67,6 +71,7 @@ from bill_paths import (
 )
 from bill_theme import STYLESHEET_DARK, STYLESHEET_LIGHT
 from bill_widgets import (
+    AccessoryGraphView,
     AllowPrintUrlCellDelegate,
     BadgeCellDelegate,
     ColumnPickFilterPopup,
@@ -82,6 +87,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFormLayout,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -98,10 +104,28 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStatusBar,
     QStackedWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+)
+
+# 主表行「格式 + 导出必填」校验涉及的字段（输入/离行仅标红；点击打印校验失败时弹窗）
+MAIN_ROW_VALIDATE_FIELDS = (
+    "task_name",
+    "type_code",
+    "operator_code",
+    "industry_code",
+    "url",
+    "quantity",
+    "duration",
+    "age_max",
+    "age_min",
+    "pv",
+    "province",
+    "city",
 )
 
 
@@ -129,12 +153,14 @@ class BillApp(QMainWindow):
         self.history_sort_field: str | None = None
         self.history_sort_order = Qt.SortOrder.AscendingOrder
         self.print_records: list[dict[str, Any]] = []
+        self.accessories_root: dict[str, Any] = {}
         self.print_log_filtered_indices: list[int] = []
         self.print_header_filters: dict[str, set[str]] = {}
         self.print_sort_field: str | None = "printed_at"
         self.print_sort_order = Qt.SortOrder.DescendingOrder
         self._hist_v_sync = False
         self._hist_sel_sync = False
+        self._accessory_selected_node_id = "root"
         self._filter_popup: ColumnPickFilterPopup | None = None
         self._license_timer = QTimer(self)
         self._license_timer.timeout.connect(self._check_license_and_exit_if_needed)
@@ -148,6 +174,7 @@ class BillApp(QMainWindow):
         self.load_data()
         self.load_history_data()
         self.load_print_records()
+        self.load_accessories()
         self.load_picker_recent()
         self.apply_theme()
         fm = QFontMetrics(self.font())
@@ -194,7 +221,7 @@ class BillApp(QMainWindow):
         brand_titles.setSpacing(5)
         self._sidebar_logo_title = QLabel("高效办公")
         self._sidebar_logo_title.setObjectName("sidebarLogoTitle")
-        self._sidebar_logo_sub = QLabel("任务表 · 核对与归档")
+        self._sidebar_logo_sub = QLabel("＜初試人生＞")
         self._sidebar_logo_sub.setObjectName("sidebarLogoSub")
         brand_titles.addWidget(self._sidebar_logo_title)
         brand_titles.addWidget(self._sidebar_logo_sub)
@@ -203,12 +230,13 @@ class BillApp(QMainWindow):
         self.nav_bill = QPushButton("📝  提单表")
         self.nav_bill.setObjectName("navActive")
         self.nav_bill.clicked.connect(self.show_bill_page)
-        side_item_sub1 = QLabel("📎  配件表（规划中）")
-        side_item_sub1.setObjectName("navDisabled")
-        self.nav_history = QPushButton("🕘  历史提单表")
+        self.nav_accessories = QPushButton("📎  配件表")
+        self.nav_accessories.setObjectName("navNormal")
+        self.nav_accessories.clicked.connect(self.show_accessories_page)
+        self.nav_history = QPushButton("🗂  历史任务")
         self.nav_history.setObjectName("navNormal")
         self.nav_history.clicked.connect(self.show_history_page)
-        self.nav_print_records = QPushButton("📁  文件管理")
+        self.nav_print_records = QPushButton("🖨  历史打印记录")
         self.nav_print_records.setObjectName("navNormal")
         self.nav_print_records.clicked.connect(self.show_print_records_page)
         self.nav_excel_tools = QPushButton("🧰  Excel工具")
@@ -224,9 +252,9 @@ class BillApp(QMainWindow):
         sidebar_layout.addWidget(self.nav_bill)
         sidebar_layout.addWidget(self.nav_history)
         sidebar_layout.addWidget(self.nav_print_records)
+        sidebar_layout.addWidget(self.nav_accessories)
         sidebar_layout.addWidget(self.nav_excel_tools)
         sidebar_layout.addWidget(divider)
-        sidebar_layout.addWidget(side_item_sub1)
         sidebar_layout.addWidget(self.nav_settings)
         sidebar_layout.addStretch(1)
         root.addWidget(self.sidebar)
@@ -410,6 +438,10 @@ class BillApp(QMainWindow):
         self.btn_restore_selected.setObjectName("btnAccent")
         self.btn_restore_selected.clicked.connect(self.restore_selected_history)
         history_top.addWidget(self.btn_restore_selected)
+        self.btn_history_delete_selected = QPushButton("🗑 删除选中")
+        self.btn_history_delete_selected.setObjectName("btnDanger")
+        self.btn_history_delete_selected.clicked.connect(self.delete_selected_history)
+        history_top.addWidget(self.btn_history_delete_selected)
         history_layout.addLayout(history_top)
         hist_split = QWidget()
         hist_split.setObjectName("historyTableSplit")
@@ -501,7 +533,7 @@ class BillApp(QMainWindow):
         hdr_print = HoverFilterHeaderView(self.print_log_table, self, "print_rec")
         self.print_log_table.setHorizontalHeader(hdr_print)
         hdr_print.setSectionResizeMode(QHeaderView.Interactive)
-        # 文件管理：来源(印/合)与状态(有/无)使用与「允许」列一致的圆形徽标风格
+        # 历史打印记录：来源(印/合)与状态(有/无)使用与「允许」列一致的圆形徽标风格
         self.print_log_table.setItemDelegateForColumn(
             2,
             BadgeCellDelegate(
@@ -540,6 +572,42 @@ class BillApp(QMainWindow):
         excel_tools_layout.addWidget(self.btn_excel_merge, 0, Qt.AlignmentFlag.AlignLeft)
         excel_tools_layout.addStretch(1)
         self.content_stack.addWidget(excel_tools_page)
+
+        accessory_page = QWidget()
+        accessory_page.setObjectName("stackAccessoryPage")
+        accessory_page.setAutoFillBackground(True)
+        accessory_page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        ac_layout = QVBoxLayout(accessory_page)
+        ac_layout.setContentsMargins(16, 12, 16, 16)
+        ac_layout.setSpacing(10)
+        ac_top = QHBoxLayout()
+        self.accessory_search = QLineEdit()
+        self.accessory_search.setPlaceholderText("搜索节点：名称/描述/URL...")
+        self.accessory_search.setFixedWidth(280)
+        self.accessory_search.textChanged.connect(self.refresh_accessory_tree)
+        btn_acc_clear = QPushButton("🔄 清空搜索")
+        btn_acc_clear.setObjectName("btnGhost")
+        btn_acc_clear.clicked.connect(lambda: self.accessory_search.setText(""))
+        self.btn_acc_add = QPushButton("➕ 新增节点")
+        self.btn_acc_add.setObjectName("btnSuccess")
+        self.btn_acc_add.clicked.connect(self.add_accessory)
+        self.btn_acc_delete = QPushButton("🗑 删除节点")
+        self.btn_acc_delete.setObjectName("btnDanger")
+        self.btn_acc_delete.clicked.connect(self.delete_accessory)
+        ac_top.addWidget(self.accessory_search)
+        ac_top.addWidget(btn_acc_clear)
+        ac_top.addWidget(self.btn_acc_add)
+        ac_top.addWidget(self.btn_acc_delete)
+        ac_top.addStretch(1)
+        ac_layout.addLayout(ac_top)
+        ac_split = QHBoxLayout()
+        ac_split.setSpacing(12)
+        self.accessory_graph = AccessoryGraphView()
+        self.accessory_graph.nodeSelected.connect(self._on_accessory_graph_selected)
+        self.accessory_graph.nodeDoubleClicked.connect(lambda _nid: self.update_accessory())
+        ac_split.addWidget(self.accessory_graph, 1)
+        ac_layout.addLayout(ac_split, 1)
+        self.content_stack.addWidget(accessory_page)
 
         settings_page = QWidget()
         settings_page.setObjectName("stackSettingsPage")
@@ -674,15 +742,24 @@ class BillApp(QMainWindow):
 
     def _restyle_sidebar_nav(self, page: str):
         styles = {
-            "bill": ("navActive", "navNormal", "navNormal", "navNormal", "navNormal"),
-            "history": ("navNormal", "navActive", "navNormal", "navNormal", "navNormal"),
-            "print": ("navNormal", "navNormal", "navActive", "navNormal", "navNormal"),
-            "excel_tools": ("navNormal", "navNormal", "navNormal", "navActive", "navNormal"),
-            "settings": ("navNormal", "navNormal", "navNormal", "navNormal", "navActive"),
+            "bill": ("navActive", "navNormal", "navNormal", "navNormal", "navNormal", "navNormal"),
+            "history": ("navNormal", "navActive", "navNormal", "navNormal", "navNormal", "navNormal"),
+            "print": ("navNormal", "navNormal", "navActive", "navNormal", "navNormal", "navNormal"),
+            "excel_tools": ("navNormal", "navNormal", "navNormal", "navActive", "navNormal", "navNormal"),
+            "accessory": ("navNormal", "navNormal", "navNormal", "navNormal", "navActive", "navNormal"),
+            "settings": ("navNormal", "navNormal", "navNormal", "navNormal", "navNormal", "navActive"),
         }
         names = styles[page]
         for w, oname in zip(
-            (self.nav_bill, self.nav_history, self.nav_print_records, self.nav_excel_tools, self.nav_settings), names
+            (
+                self.nav_bill,
+                self.nav_history,
+                self.nav_print_records,
+                self.nav_excel_tools,
+                self.nav_accessories,
+                self.nav_settings,
+            ),
+            names
         ):
             w.setObjectName(oname)
             w.style().unpolish(w)
@@ -711,8 +788,14 @@ class BillApp(QMainWindow):
         self.apply_theme()
 
     def show_settings_page(self):
-        self.content_stack.setCurrentIndex(4)
+        self.content_stack.setCurrentIndex(5)
         self._restyle_sidebar_nav("settings")
+        self.apply_theme()
+
+    def show_accessories_page(self):
+        self.content_stack.setCurrentIndex(4)
+        self._restyle_sidebar_nav("accessory")
+        self.refresh_accessory_tree()
         self.apply_theme()
 
     def update_time(self):
@@ -829,6 +912,382 @@ class BillApp(QMainWindow):
         clean = [{k: v for k, v in r.items() if k != "checked"} for r in self.print_records]
         PRINT_RECORDS_FILE.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
         self.lbl_save.setText("已自动保存")
+
+    def load_accessories(self):
+        def default_root() -> dict[str, Any]:
+            return {"id": "root", "name": "配件表", "node_type": "root", "children": []}
+
+        def normalize(node: dict[str, Any]) -> dict[str, Any]:
+            ntype = str(node.get("node_type", "branch") or "branch")
+            out = {
+                "id": str(node.get("id") or uuid.uuid4()),
+                "name": str(node.get("name", "") or "").strip(),
+                "node_type": ntype,
+                "desc": str(node.get("desc", "") or "").strip(),
+                "url": str(node.get("url", "") or "").strip(),
+                "created_at": str(node.get("created_at", "") or "").strip() or datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+                "children": [],
+            }
+            if ntype in ("root", "branch"):
+                out["desc"] = ""
+                out["url"] = ""
+                for ch in node.get("children", []) or []:
+                    if isinstance(ch, dict):
+                        out["children"].append(normalize(ch))
+            else:
+                out["children"] = []
+            return out
+
+        if ACCESSORIES_FILE.exists():
+            try:
+                raw = json.loads(ACCESSORIES_FILE.read_text(encoding="utf-8"))
+                if isinstance(raw, dict) and raw.get("node_type") == "root":
+                    self.accessories_root = normalize(raw)
+                    self.accessories_root["id"] = "root"
+                    self.accessories_root["name"] = "配件表"
+                    return
+                # 兼容旧版平铺数据，迁移为 root->branch(type)->branch(channel)->branch(name)->leaf(desc,url)
+                rows = [x for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
+            except Exception:
+                rows = []
+        else:
+            rows = []
+        root = default_root()
+        type_map: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
+        for rec in rows:
+            tp = str(rec.get("type", "") or "").strip() or "未分类"
+            ch = str(rec.get("channel", "") or "").strip() or "未分渠道"
+            nm = str(rec.get("name", "") or "").strip() or "未命名"
+            type_map.setdefault(tp, {}).setdefault(ch, {}).setdefault(nm, []).append(
+                {
+                    "id": str(rec.get("id") or uuid.uuid4()),
+                    "desc": str(rec.get("desc", "") or "").strip() or "（空描述）",
+                    "url": str(rec.get("url", "") or "").strip(),
+                    "created_at": str(rec.get("created_at", "") or "").strip() or datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+                }
+            )
+        for tp, chs in type_map.items():
+            tp_node = {"id": str(uuid.uuid4()), "name": tp, "node_type": "branch", "children": []}
+            root["children"].append(tp_node)
+            for ch, nms in chs.items():
+                ch_node = {"id": str(uuid.uuid4()), "name": ch, "node_type": "branch", "children": []}
+                tp_node["children"].append(ch_node)
+                for nm, leaves in nms.items():
+                    nm_node = {"id": str(uuid.uuid4()), "name": nm, "node_type": "branch", "children": []}
+                    ch_node["children"].append(nm_node)
+                    for lf in leaves:
+                        nm_node["children"].append(
+                            {
+                                "id": lf["id"],
+                                "name": lf["desc"],
+                                "node_type": "leaf",
+                                "desc": lf["desc"],
+                                "url": lf["url"],
+                                "created_at": lf["created_at"],
+                                "children": [],
+                            }
+                        )
+        self.accessories_root = normalize(root)
+        self.accessories_root["id"] = "root"
+        self.accessories_root["name"] = "配件表"
+
+    def save_accessories(self):
+        ACCESSORIES_FILE.write_text(json.dumps(self.accessories_root, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.lbl_save.setText("已自动保存")
+
+    def _iter_accessory_nodes(self, node: dict[str, Any] | None = None, parent: dict[str, Any] | None = None):
+        cur = self.accessories_root if node is None else node
+        yield cur, parent
+        for ch in cur.get("children", []) or []:
+            if isinstance(ch, dict):
+                yield from self._iter_accessory_nodes(ch, cur)
+
+    def _find_accessory_node(self, node_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        for node, parent in self._iter_accessory_nodes():
+            if str(node.get("id", "")) == str(node_id):
+                return node, parent
+        return None, None
+
+    def _find_node_path_names(self, target_id: str) -> list[str]:
+        """返回从根到目标节点（不含根）的名称路径。"""
+
+        def dfs(node: dict[str, Any], path: list[str]) -> list[str] | None:
+            nid = str(node.get("id", ""))
+            ntype = str(node.get("node_type", ""))
+            next_path = path
+            if ntype != "root":
+                next_path = path + [str(node.get("name", "") or "").strip()]
+            if nid == target_id:
+                return next_path
+            for ch in node.get("children", []) or []:
+                if isinstance(ch, dict):
+                    got = dfs(ch, next_path)
+                    if got is not None:
+                        return got
+            return None
+
+        if not isinstance(self.accessories_root, dict):
+            return []
+        return dfs(self.accessories_root, []) or []
+
+    def _leaf_unique_key(self, parent: dict[str, Any] | None, desc: str) -> tuple[str, str, str, str]:
+        """唯一键：类目+渠道+名称+描述。"""
+        if parent is None:
+            path = []
+        else:
+            path = self._find_node_path_names(str(parent.get("id", "")))
+        cat = path[0] if len(path) > 0 else ""
+        channel = path[1] if len(path) > 1 else ""
+        name = path[2] if len(path) > 2 else (path[-1] if path else "")
+        return (cat.strip(), channel.strip(), name.strip(), str(desc or "").strip())
+
+    def _leaf_key_exists(self, key: tuple[str, str, str, str], *, exclude_id: str | None = None) -> bool:
+        for node, parent in self._iter_accessory_nodes():
+            if node.get("node_type") != "leaf":
+                continue
+            nid = str(node.get("id", ""))
+            if exclude_id and nid == exclude_id:
+                continue
+            other = self._leaf_unique_key(parent, str(node.get("desc", "") or node.get("name", "")))
+            if other == key:
+                return True
+        return False
+
+    def _accessory_leaf_nodes(self) -> list[dict[str, Any]]:
+        return [n for n, _ in self._iter_accessory_nodes() if n.get("node_type") == "leaf"]
+
+    def _selected_url_descs_for_record(self, rec: dict[str, Any]) -> list[str]:
+        text = str(rec.get("url", "") or "")
+        parts = [x.strip() for x in text.replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n").split("\n") if x.strip()]
+        return parts
+
+    def _accessory_desc_url_map(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for lf in self._accessory_leaf_nodes():
+            desc = str(lf.get("desc", "") or lf.get("name", "") or "").strip()
+            url = str(lf.get("url", "") or "").strip()
+            if desc and url and desc not in out:
+                out[desc] = url
+        return out
+
+    def _resolve_urls_from_descs(self, raw_descs: str) -> list[str]:
+        desc_map = self._accessory_desc_url_map()
+        descs = [x.strip() for x in str(raw_descs or "").replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n").split("\n") if x.strip()]
+        out: list[str] = []
+        for d in descs:
+            u = desc_map.get(d, "")
+            if u:
+                out.append(u)
+        return out
+
+    def _resolve_urls_from_descs_with_missing(self, raw_descs: str) -> tuple[list[str], list[str]]:
+        desc_map = self._accessory_desc_url_map()
+        descs = [x.strip() for x in str(raw_descs or "").replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n").split("\n") if x.strip()]
+        out: list[str] = []
+        missing: list[str] = []
+        for d in descs:
+            u = desc_map.get(d, "")
+            if u:
+                out.append(u)
+            else:
+                missing.append(d)
+        return out, missing
+
+    @staticmethod
+    def _is_valid_http_url(url: str) -> bool:
+        u = str(url or "").strip()
+        if not u:
+            return False
+        p = urlparse(u)
+        return p.scheme.lower() in ("http", "https") and bool(p.netloc)
+
+    def refresh_accessory_tree(self):
+        if not hasattr(self, "accessory_graph"):
+            return
+        kw = self.accessory_search.text().strip().lower()
+        self.accessory_graph.set_tree_data(self.accessories_root, kw)
+        if hasattr(self, "btn_acc_add"):
+            btn_center_global = self.btn_acc_add.mapToGlobal(self.btn_acc_add.rect().center())
+            scene_pt = self.accessory_graph.mapToScene(self.accessory_graph.mapFromGlobal(btn_center_global))
+            self.accessory_graph.set_root_anchor_scene_x(scene_pt.x())
+
+    def _on_accessory_graph_selected(self, node_id: str):
+        self._accessory_selected_node_id = node_id
+
+    def _selected_accessory_node(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        rid = str(getattr(self, "_accessory_selected_node_id", "root") or "root")
+        return self._find_accessory_node(rid)
+
+    def _open_accessory_node_dialog(self, title: str, preset: dict[str, Any] | None = None, allow_type_change: bool = True):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(600, 400)
+        form = QFormLayout(dlg)
+        cmb_type = QComboBox()
+        cmb_type.addItem("枝干", "branch")
+        cmb_type.addItem("叶子", "leaf")
+        if not allow_type_change:
+            cmb_type.setEnabled(False)
+        name = QLineEdit(str((preset or {}).get("name", "") or ""))
+        desc = QLineEdit(str((preset or {}).get("desc", "") or ""))
+        url = QLineEdit(str((preset or {}).get("url", "") or ""))
+        row_type = "节点种类"
+        row_name = "名称"
+        row_desc = "描述"
+        row_url = "URL"
+        form.addRow(row_type, cmb_type)
+        form.addRow(row_name, name)
+        form.addRow(row_desc, desc)
+        form.addRow(row_url, url)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        form.addRow(btns)
+
+        def update_visible():
+            is_leaf = (cmb_type.currentData() == "leaf")
+            # 叶子仅显示描述+URL；枝干仅显示名称。
+            name.setVisible(not is_leaf)
+            form.labelForField(name).setVisible(not is_leaf)
+            desc.setVisible(is_leaf)
+            form.labelForField(desc).setVisible(is_leaf)
+            url.setVisible(is_leaf)
+            form.labelForField(url).setVisible(is_leaf)
+            if is_leaf:
+                name.setText("")
+            else:
+                desc.setText("")
+                url.setText("")
+
+            if allow_type_change:
+                cmb_type.setVisible(True)
+                form.labelForField(cmb_type).setVisible(True)
+            else:
+                cmb_type.setVisible(False)
+                form.labelForField(cmb_type).setVisible(False)
+
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        cmb_type.currentIndexChanged.connect(update_visible)
+        if preset and preset.get("node_type") == "leaf":
+            cmb_type.setCurrentIndex(cmb_type.findData("leaf"))
+        update_visible()
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        out = {
+            "node_type": str(cmb_type.currentData() or "branch"),
+            "name": name.text().strip(),
+            "desc": desc.text().strip(),
+            "url": url.text().strip(),
+            "created_at": str((preset or {}).get("created_at", "") or datetime.now().strftime("%Y/%m/%d %H:%M:%S")),
+        }
+        if out["node_type"] == "branch" and not out["name"]:
+            QMessageBox.warning(self, "提示", "枝干节点名称不能为空")
+            return None
+        if out["node_type"] == "leaf" and (not out["desc"] or not out["url"]):
+            QMessageBox.warning(self, "提示", "叶子节点必须填写描述和URL")
+            return None
+        if out["node_type"] == "leaf":
+            out["name"] = out["desc"]
+        return out
+
+    @staticmethod
+    def _is_http_url(text: str) -> bool:
+        u = str(text or "").strip().lower()
+        return u.startswith("http://") or u.startswith("https://")
+
+    def add_accessory(self):
+        node, _parent = self._selected_accessory_node()
+        if node is None:
+            return
+        if node.get("node_type") == "leaf":
+            QMessageBox.information(self, "提示", "叶子节点不允许新增子节点")
+            return
+        data = self._open_accessory_node_dialog("新增节点")
+        if not data:
+            return
+        if data["node_type"] == "leaf" and not self._is_http_url(data["url"]):
+            QMessageBox.warning(self, "提示", "URL格式错误（必须以 http:// 或 https:// 开头）")
+            return
+        if data["node_type"] == "leaf":
+            key = self._leaf_unique_key(node, data["desc"])
+            if self._leaf_key_exists(key):
+                QMessageBox.warning(self, "提示", "同一“类目+渠道+名称+描述”不允许重复")
+                return
+        child = {
+            "id": str(uuid.uuid4()),
+            "name": data["name"],
+            "node_type": data["node_type"],
+            "desc": data["desc"] if data["node_type"] == "leaf" else "",
+            "url": data["url"] if data["node_type"] == "leaf" else "",
+            "created_at": data["created_at"],
+            "children": [],
+        }
+        node.setdefault("children", []).append(child)
+        self.save_accessories()
+        self.refresh_accessory_tree()
+
+    def update_accessory(self):
+        node, _parent = self._selected_accessory_node()
+        if node is None or node.get("node_type") == "root":
+            return
+        data = self._open_accessory_node_dialog("编辑节点", preset=node, allow_type_change=False)
+        if not data:
+            return
+        if node.get("node_type") == "leaf" and not self._is_http_url(data["url"]):
+            QMessageBox.warning(self, "提示", "URL格式错误，已删除该叶子节点")
+            _cur, parent = self._find_accessory_node(str(node.get("id", "")))
+            if parent is not None:
+                parent["children"] = [x for x in (parent.get("children", []) or []) if x.get("id") != node.get("id")]
+                self.save_accessories()
+                self.refresh_accessory_tree()
+            return
+        if node.get("node_type") == "leaf":
+            _cur, parent = self._find_accessory_node(str(node.get("id", "")))
+            key = self._leaf_unique_key(parent, data["desc"])
+            if self._leaf_key_exists(key, exclude_id=str(node.get("id", ""))):
+                QMessageBox.warning(self, "提示", "同一“类目+渠道+名称+描述”不允许重复")
+                return
+        node["name"] = data["name"]
+        if node.get("node_type") == "leaf":
+            node["desc"] = data["desc"]
+            node["url"] = data["url"]
+        self.save_accessories()
+        self.refresh_accessory_tree()
+
+    def _used_urls_in_bills(self) -> set[str]:
+        used: set[str] = set()
+        for rec in self.records:
+            raw = str(rec.get("url", "") or "")
+            for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                s = line.strip()
+                if s:
+                    used.add(s)
+        return used
+
+    def _node_or_descendants_used(self, node: dict[str, Any], used_urls: set[str]) -> bool:
+        if node.get("node_type") == "leaf" and str(node.get("url", "")).strip() in used_urls:
+            return True
+        for ch in node.get("children", []) or []:
+            if isinstance(ch, dict) and self._node_or_descendants_used(ch, used_urls):
+                return True
+        return False
+
+    def delete_accessory(self, _rid: str | None = None):
+        node, parent = self._selected_accessory_node()
+        if node is None or parent is None:
+            return
+        if node.get("node_type") == "root":
+            QMessageBox.information(self, "提示", "根节点不可删除")
+            return
+        used_urls = self._used_urls_in_bills()
+        if self._node_or_descendants_used(node, used_urls):
+            QMessageBox.warning(self, "提示", "该节点（或其子节点）已被提单表使用，不可删除")
+            return
+        node_name = str(node.get("desc", "") or node.get("name", "") or "该节点")
+        if QMessageBox.question(self, "确认删除", f"确认删除“{node_name}”节点吗？此操作不可撤销。") != QMessageBox.Yes:
+            return
+        parent["children"] = [x for x in (parent.get("children", []) or []) if x.get("id") != node.get("id")]
+        self.save_accessories()
+        self.refresh_accessory_tree()
 
     @staticmethod
     def _print_record_file_ok(rec: dict) -> bool:
@@ -1574,30 +2033,6 @@ class BillApp(QMainWindow):
             confirm_box.exec()
             if confirm_box.clickedButton() is not btn_ok:
                 return
-            base_dir = self._default_output_dir_for("merge")
-            try:
-                base_dir.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                QMessageBox.warning(dlg, "合并失败", f"创建目录失败：\n{base_dir}\n\n{e}")
-                return
-            out_default = base_dir / f"合并结果_{datetime.now().strftime('%Y%m%d')}.xlsx"
-            out_file, _ = QFileDialog.getSaveFileName(
-                dlg,
-                "选择保存位置并命名文件",
-                str(out_default),
-                "Excel (*.xlsx)",
-            )
-            if not out_file:
-                return
-            out_path = Path(out_file)
-            if out_path.suffix.lower() != ".xlsx":
-                out_path = out_path.with_suffix(".xlsx")
-            try:
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                QMessageBox.warning(dlg, "合并失败", f"创建目录失败：\n{out_path.parent}\n\n{e}")
-                return
-
             out_wb = None
             out_ws = None
             header_written = False
@@ -1705,6 +2140,30 @@ class BillApp(QMainWindow):
                         wb.close()
                 except Exception as e:
                     failed_files.append(f"{fp.name}（{e}）")
+            base_dir = self._default_output_dir_for("merge")
+            try:
+                base_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                QMessageBox.warning(dlg, "合并失败", f"创建目录失败：\n{base_dir}\n\n{e}")
+                return
+            suggest_name = self._build_merge_default_filename(merged_rows, merged_data_rows)
+            out_default = base_dir / suggest_name
+            out_file, _ = QFileDialog.getSaveFileName(
+                dlg,
+                "选择保存位置并命名文件",
+                str(out_default),
+                "Excel (*.xlsx)",
+            )
+            if not out_file:
+                return
+            out_path = Path(out_file)
+            if out_path.suffix.lower() != ".xlsx":
+                out_path = out_path.with_suffix(".xlsx")
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                QMessageBox.warning(dlg, "合并失败", f"创建目录失败：\n{out_path.parent}\n\n{e}")
+                return
             try:
                 assert out_wb is not None
                 assert out_ws is not None
@@ -1714,6 +2173,7 @@ class BillApp(QMainWindow):
                     for ci in range(header_cols):
                         out_ws.cell(row=write_row, column=ci + 1, value=vals[ci] if ci < len(vals) else None)
                     write_row += 1
+                self._write_merge_stats_sheet(out_wb, merged_rows)
                 out_wb.save(str(out_path))
             except OSError as e:
                 QMessageBox.warning(dlg, "合并失败", f"保存文件失败：\n{out_path}\n\n{e}")
@@ -1968,7 +2428,7 @@ class BillApp(QMainWindow):
         if not restore_idx:
             QMessageBox.information(self, "提示", "请先勾选要恢复的数据")
             return
-        if QMessageBox.question(self, "确认恢复", f"确认恢复 {len(restore_idx)} 条历史提单到提单表吗？") != QMessageBox.Yes:
+        if QMessageBox.question(self, "确认恢复", f"确认恢复 {len(restore_idx)} 条历史任务到提单表吗？") != QMessageBox.Yes:
             return
         for idx in sorted(restore_idx):
             src = self.history_records[idx]
@@ -1990,6 +2450,18 @@ class BillApp(QMainWindow):
         self.refresh_history_table()
         QMessageBox.information(self, "恢复成功", f"已恢复 {len(restore_idx)} 条数据到提单表")
 
+    def delete_selected_history(self):
+        to_del = [i for i, rec in enumerate(self.history_records) if rec.get("checked")]
+        if not to_del:
+            QMessageBox.information(self, "提示", "请先勾选要删除的历史任务")
+            return
+        if QMessageBox.question(self, "确认删除", f"确认删除 {len(to_del)} 条历史任务吗？此操作不可撤销。") != QMessageBox.Yes:
+            return
+        for idx in sorted(to_del, reverse=True):
+            self.history_records.pop(idx)
+        self.save_history_data()
+        self.refresh_history_table()
+
     def display_val(self, rec, field):
         if field == "type_code":
             return TYPE_MAP.get(rec.get(field, ""), "")
@@ -1998,7 +2470,8 @@ class BillApp(QMainWindow):
         if field == "allow_print_url":
             return "是" if coerce_allow_print_url(rec.get("allow_print_url")) else "否"
         if field == "url":
-            return first_url(rec.get(field, ""))
+            descs = self._selected_url_descs_for_record(rec)
+            return "|".join(descs)
         if field == "print_count":
             return str(int(rec.get("print_count", 0) or 0))
         if field == "last_printed_at":
@@ -2734,27 +3207,32 @@ class BillApp(QMainWindow):
         if self.records[rec_idx].get("url", "") == txt:
             return
         self.records[rec_idx]["url"] = txt
-        ok, msg = self.validate_record(self.records[rec_idx])
         self.clear_error(rec_idx, "url")
-        if not ok and "URL" in msg:
-            self.mark_error(rec_idx, "url", msg)
+        ok, msg = self.validate_urls(txt)
+        if not ok:
+            self.mark_error(rec_idx, "url", msg or "URL 格式不正确")
             ed.setStyleSheet(self._url_editor_stylesheet(True))
         else:
             ed.setStyleSheet(self._url_editor_stylesheet(False))
         self.save_data()
+        self._refresh_main_row_validation_marks(rec_idx)
 
     def _on_url_cell_focus_out(self, rec_idx: int, ed: QPlainTextEdit):
-        """URL 失焦时若不符合规则则弹窗提示（输入过程中仅用红框，不弹窗）。"""
+        """URL 失焦仅同步样式；整行标红由输入/离行刷新，弹窗仅在点击打印时。"""
         if self.updating_table:
             return
         if rec_idx < 0 or rec_idx >= len(self.records):
             return
         if str(self.records[rec_idx].get("url", "")) != ed.toPlainText():
             return
+        self.clear_error(rec_idx, "url")
         ok, msg = self.validate_urls(ed.toPlainText())
-        if ok:
-            return
-        QMessageBox.warning(self, "URL 校验失败", msg or "URL 格式不正确")
+        if not ok:
+            self.mark_error(rec_idx, "url", msg or "URL 格式不正确")
+            ed.setStyleSheet(self._url_editor_stylesheet(True))
+        else:
+            ed.setStyleSheet(self._url_editor_stylesheet(False))
+        self._refresh_main_row_validation_marks(rec_idx)
 
     def refresh_table(self):
         self.updating_table = True
@@ -2810,29 +3288,13 @@ class BillApp(QMainWindow):
                     self.table.setItem(row, sc, aw_item)
                     continue
                 if f == "url":
-                    raw_u = str(rec.get("url", ""))
-                    pte = UrlCellEditor(self, rec_idx)
-                    pte.setFrameShape(QFrame.Shape.NoFrame)
-                    pte.setTabChangesFocus(True)
-                    pte.setFont(QFont(self.table.font()))
-                    pte.blockSignals(True)
-                    pte.setPlainText(raw_u)
-                    pte.blockSignals(False)
-                    pte.setFixedHeight(self._url_cell_editor_display_height())
-                    pte.textChanged.connect(lambda ri=rec_idx, ed=pte: self._on_url_cell_text_changed(ri, ed))
-                    pte.setStyleSheet(self._url_editor_stylesheet(bool(self.field_errors.get((rec_idx, "url")))))
-                    ph_url = QTableWidgetItem()
-                    ph_url.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                    self.table.setItem(row, sc, ph_url)
-                    url_wrap = QWidget()
-                    url_wrap.setObjectName("urlCellWrap")
-                    url_lo = QVBoxLayout(url_wrap)
-                    url_lo.setContentsMargins(0, 0, 0, 0)
-                    url_lo.setSpacing(0)
-                    url_lo.addStretch(1)
-                    url_lo.addWidget(pte)
-                    url_lo.addStretch(1)
-                    self.table.setCellWidget(row, sc, url_wrap)
+                    item = QTableWidgetItem(self.display_val(rec, f))
+                    item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    if self.field_errors.get((rec_idx, f)):
+                        item.setBackground(QColor("#e05263"))
+                        item.setToolTip(self.field_error_msgs.get((rec_idx, f), "字段校验失败"))
+                    self.table.setItem(row, sc, item)
                     continue
                 item = QTableWidgetItem(self.display_val(rec, f))
                 if f in ("province", "exclude_province", "city", "exclude_city"):
@@ -2971,9 +3433,12 @@ class BillApp(QMainWindow):
             return
         if field == "url":
             sc = FIELDS.index("url") - 1
-            ed = self._url_plain_editor_at(row, sc)
-            if ed is not None:
-                ed.setFocus()
+            idx0 = self.table.model().index(row, sc)
+            rect = self.table.visualRect(idx0)
+            anchor = self.table.viewport()
+            anchor.setProperty("_url_anchor_global", self.table.viewport().mapToGlobal(rect.bottomLeft()))
+            anchor.setProperty("_url_anchor_width", rect.width())
+            self._open_url_picker_dialog(rec_idx, anchor)
             return
         if field in ("province", "exclude_province", "city", "exclude_city"):
             if field == "city" and rec.get("province", "").strip():
@@ -3017,6 +3482,9 @@ class BillApp(QMainWindow):
                 ),
             )
             dlg = MultiSelectDialog("选择", ordered, split_multi(rec.get(field, "")), self)
+            cell_rect = self.table.visualRect(self.table.model().index(row, col - FROZEN_COLUMNS))
+            anchor = self.table.viewport().mapToGlobal(cell_rect.bottomLeft())
+            self._place_dialog_below_rect(dlg, anchor, cell_rect.width())
             if dlg.exec() == QDialog.Accepted:
                 values = dlg.values()
                 self.update_picker_recent(field, values)
@@ -3210,17 +3678,14 @@ class BillApp(QMainWindow):
             if field in ("age_min", "age_max"):
                 self.clear_error(idx, "age_min")
                 self.clear_error(idx, "age_max")
-            self.after_field_change(rec, field)
+            self.after_field_change(rec, field, idx)
+            self._refresh_main_row_validation_marks(idx)
             ok, msg = self.validate_record(rec)
             if not ok:
                 failed.append(idx)
                 fail_details.append((idx, field, msg))
                 self.records[idx] = old_rec
-                if "年龄上限必须大于等于年龄下限" in msg:
-                    self.mark_error(idx, "age_min", msg)
-                    self.mark_error(idx, "age_max", msg)
-                else:
-                    self.mark_error(idx, field, msg)
+                self._refresh_main_row_validation_marks(idx)
         self.save_data()
         self.refresh_table()
         if failed:
@@ -3343,65 +3808,20 @@ class BillApp(QMainWindow):
         self.field_errors.pop((rec_idx, field), None)
         self.field_error_msgs.pop((rec_idx, field), None)
 
-    def _mark_row_validation_error(self, rec_idx: int, msg: str):
-        if "年龄上限必须大于等于年龄下限" in msg:
-            self.mark_error(rec_idx, "age_min", msg)
-            self.mark_error(rec_idx, "age_max", msg)
-        elif "运营商" in msg:
-            self.mark_error(rec_idx, "operator_code", msg)
-            self.mark_error(rec_idx, "task_name", msg)
-        elif "类型" in msg:
-            self.mark_error(rec_idx, "type_code", msg)
-            self.mark_error(rec_idx, "task_name", msg)
-        elif "行业编码" in msg:
-            self.mark_error(rec_idx, "industry_code", msg)
-            self.mark_error(rec_idx, "task_name", msg)
-        elif "任务名中的地域" in msg:
-            self.mark_error(rec_idx, "task_name", msg)
-            self.mark_error(rec_idx, "province", msg)
-            self.mark_error(rec_idx, "city", msg)
-        elif "数量必须大于0" in msg or "数量" in msg:
-            self.mark_error(rec_idx, "quantity", msg)
-        elif "年龄上限" in msg:
-            self.mark_error(rec_idx, "age_max", msg)
-        elif "年龄下限" in msg:
-            self.mark_error(rec_idx, "age_min", msg)
-        elif "pv" in msg:
-            self.mark_error(rec_idx, "pv", msg)
-        elif "URL" in msg:
-            self.mark_error(rec_idx, "url", msg)
-        elif "时长" in msg:
-            self.mark_error(rec_idx, "duration", msg)
-        elif "任务名" in msg:
-            self.mark_error(rec_idx, "task_name", msg)
-
     def _validate_row_on_leave(self, rec_idx: int) -> bool:
         if rec_idx < 0 or rec_idx >= len(self.records):
             return False
-        tracked_fields = (
-            "task_name",
-            "type_code",
-            "operator_code",
-            "industry_code",
-            "url",
-            "quantity",
-            "duration",
-            "age_max",
-            "age_min",
-            "pv",
-            "province",
-            "city",
-        )
-        before = {f: self.field_error_msgs.get((rec_idx, f), "") for f in tracked_fields if (rec_idx, f) in self.field_errors}
-        for f in tracked_fields:
-            self.clear_error(rec_idx, f)
-        rec = self.records[rec_idx]
-        ok, msg = self.validate_record(rec)
-        if ok:
-            ok, msg = self.validate_export_record(rec)
-        if not ok:
-            self._mark_row_validation_error(rec_idx, msg)
-        after = {f: self.field_error_msgs.get((rec_idx, f), "") for f in tracked_fields if (rec_idx, f) in self.field_errors}
+        before = {
+            f: self.field_error_msgs.get((rec_idx, f), "")
+            for f in MAIN_ROW_VALIDATE_FIELDS
+            if (rec_idx, f) in self.field_errors
+        }
+        self._refresh_main_row_validation_marks(rec_idx)
+        after = {
+            f: self.field_error_msgs.get((rec_idx, f), "")
+            for f in MAIN_ROW_VALIDATE_FIELDS
+            if (rec_idx, f) in self.field_errors
+        }
         return before != after
 
     def _shift_field_errors_after_insert(self, insert_at: int):
@@ -3434,39 +3854,26 @@ class BillApp(QMainWindow):
         if field in ("created_at", "print_count", "last_printed_at"):
             return
         rec = self.records[rec_idx]
-        old = rec.get(field, "")
         cleaned = value.replace("\n", " ").replace("\r", " ").strip() if field == "task_name" else value
         if field == "task_name":
             hint = self.task_name_hint(cleaned)
             if hint:
                 self.statusBar().showMessage(hint, 5000)
+        # 单元格提交不回滚；标红由 _refresh_main_row_validation_marks 按导出规则刷新（不弹窗）。
         rec[field] = cleaned
         self.clear_error(rec_idx, field)
         if field in ("age_min", "age_max"):
             self.clear_error(rec_idx, "age_min")
             self.clear_error(rec_idx, "age_max")
-        ok, msg = self.validate_record(rec)
-        if not ok:
-            QMessageBox.warning(self, "校验失败", msg)
-            rec[field] = old
-            if "年龄上限必须大于等于年龄下限" in msg:
-                self.mark_error(rec_idx, "age_min", msg)
-                self.mark_error(rec_idx, "age_max", msg)
-            else:
-                self.mark_error(rec_idx, field, msg)
-        else:
-            changed_ok = self.after_field_change(rec, field)
-            if field == "task_name":
-                if changed_ok:
-                    self.clear_error(rec_idx, "task_name")
-                else:
-                    if getattr(self, "_task_name_parse_user_warned", False):
-                        self._task_name_parse_user_warned = False
-                        self.mark_error(rec_idx, "task_name", "任务名码段与列表不匹配")
-                    else:
-                        parse_msg = "任务名未按规范完全解析：已保留原文本，仅同步可识别片段"
-                        self.mark_error(rec_idx, "task_name", parse_msg)
-                        self.statusBar().showMessage(parse_msg, 5000)
+        changed_ok = self.after_field_change(rec, field, rec_idx)
+        if field == "task_name" and changed_ok:
+            self.clear_error(rec_idx, "task_name")
+        soft_task_name_warn = ""
+        if field == "task_name" and (not changed_ok) and (not getattr(self, "_task_name_parse_err_marked", False)):
+            soft_task_name_warn = "任务名未按规范完全解析：已保留原文本，仅同步可识别片段"
+        self._refresh_main_row_validation_marks(rec_idx)
+        if soft_task_name_warn:
+            self.mark_error(rec_idx, "task_name", soft_task_name_warn)
         self.save_data()
         self.refresh_table()
 
@@ -3486,19 +3893,29 @@ class BillApp(QMainWindow):
         return True, ""
 
     def validate_urls(self, raw: str):
-        text = str(raw or "")
-        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        desc_map = self._accessory_desc_url_map()
+        lines = [x.strip() for x in str(raw or "").replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n").split("\n") if x.strip()]
         for idx, line in enumerate(lines, start=1):
-            if " " in line:
-                return False, f"URL 第{idx}行包含空格，请删除空格"
-            parsed = urlparse(line)
-            if parsed.scheme.lower() not in ("http", "https"):
-                return False, f"URL 第{idx}行必须以 http:// 或 https:// 开头"
-            if not parsed.netloc:
-                return False, f"URL 第{idx}行缺少域名"
-            if len(line) > 2048:
-                return False, f"URL 第{idx}行长度超过 2048"
+            resolved = desc_map.get(line, "")
+            if not resolved:
+                return False, f"URL 第{idx}行描述“{line}”不在配件表中"
+            if not self._is_valid_http_url(resolved):
+                return False, f"URL 第{idx}行描述“{line}”对应URL格式错误（需为http/https）"
         return True, ""
+
+    def _validate_urls_collect(self, raw: str) -> list[str]:
+        """逐行收集 URL 描述问题（必须能在配件表中命中）。"""
+        desc_map = self._accessory_desc_url_map()
+        lines = [x.strip() for x in str(raw or "").replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n").split("\n") if x.strip()]
+        out: list[str] = []
+        for idx, line in enumerate(lines, start=1):
+            resolved = desc_map.get(line, "")
+            if not resolved:
+                out.append(f"URL 第{idx}行描述“{line}”不在配件表中")
+                continue
+            if not self._is_valid_http_url(resolved):
+                out.append(f"URL 第{idx}行描述“{line}”对应URL格式错误（需为http/https）")
+        return out
 
     def validate_export_record(self, rec):
         required_fields = [
@@ -3516,7 +3933,9 @@ class BillApp(QMainWindow):
         tn = str(rec.get("task_name", "")).strip()
         if "-" not in tn:
             return False, "任务名格式错误：缺少 '-' 分隔"
-        parsed = self.parse_left(tn.split("-", 1)[0])
+        parsed, perrs = self.parse_left_with_errors(tn.split("-", 1)[0])
+        if perrs:
+            return False, perrs[0]
         if not parsed:
             return False, "任务名格式错误：无法解析运营商/类型/行业编码"
         if parsed["op"] != rec.get("operator_code", ""):
@@ -3530,6 +3949,348 @@ class BillApp(QMainWindow):
         if region_from_task != region_from_fields:
             return False, f"任务名中的地域“{region_from_task}”与字段地域“{region_from_fields}”不匹配"
         return True, ""
+
+    def collect_record_validation_issues(self, rec: dict) -> list[tuple[str, str]]:
+        """收集主表一行全部校验问题（格式校验 + 导出必填/任务名关联），供标红与打印前汇总。"""
+        issues: list[tuple[str, str]] = []
+        for k, title in [("quantity", "数量"), ("age_max", "年龄上限"), ("age_min", "年龄下限"), ("pv", "pv")]:
+            v = str(rec.get(k, "")).strip()
+            if v and not v.isdigit():
+                issues.append((k, f"{title} 必须是数字"))
+        for msg in self._validate_urls_collect(str(rec.get("url", ""))):
+            issues.append(("url", msg))
+        if str(rec.get("quantity", "")).strip() == "0":
+            issues.append(("quantity", "数量必须大于0"))
+        amin, amax = str(rec.get("age_min", "")).strip(), str(rec.get("age_max", "")).strip()
+        if amin and amax and amin.isdigit() and amax.isdigit() and int(amax) < int(amin):
+            pair = "年龄上限必须大于等于年龄下限"
+            issues.append(("age_min", pair))
+            issues.append(("age_max", pair))
+        required_fields = [
+            ("task_name", "任务名"),
+            ("type_code", "类型"),
+            ("operator_code", "运营商"),
+            ("industry_code", "行业编码"),
+            ("url", "URL"),
+            ("quantity", "数量"),
+            ("duration", "时长"),
+        ]
+        for field, title in required_fields:
+            if not str(rec.get(field, "")).strip():
+                issues.append((field, f"{title} 为必填项"))
+        tn = str(rec.get("task_name", "")).strip()
+        if tn and "-" not in tn:
+            issues.append(("task_name", "任务名格式错误：缺少 '-' 分隔"))
+        elif tn and "-" in tn:
+            left_part = tn.split("-", 1)[0]
+            parsed, perrs = self.parse_left_with_errors(left_part)
+            if perrs:
+                for msg in perrs:
+                    issues.append(("task_name", msg))
+            elif not parsed:
+                issues.append(("task_name", "任务名格式错误：无法解析运营商/类型/行业编码"))
+            else:
+                if parsed["op"] != rec.get("operator_code", ""):
+                    m = "任务名中的运营商码值与运营商字段不匹配"
+                    issues.append(("operator_code", m))
+                    issues.append(("task_name", m))
+                if parsed["tp"] != rec.get("type_code", ""):
+                    m = "任务名中的类型码值与类型字段不匹配"
+                    issues.append(("type_code", m))
+                    issues.append(("task_name", m))
+                if parsed["ind"] != rec.get("industry_code", ""):
+                    m = "任务名中的行业编码与行业编码字段不匹配"
+                    issues.append(("industry_code", m))
+                    issues.append(("task_name", m))
+                region_from_task = parsed.get("region", "") or "全国"
+                region_from_fields = self.region_part(rec)
+                if region_from_task != region_from_fields:
+                    m = f"任务名中的地域“{region_from_task}”与字段地域“{region_from_fields}”不匹配"
+                    issues.append(("task_name", m))
+                    issues.append(("province", m))
+                    issues.append(("city", m))
+        return issues
+
+    def _merge_validation_issues_by_field(self, issues: list[tuple[str, str]]) -> dict[str, str]:
+        merged_lists: dict[str, list[str]] = {}
+        for f, m in issues:
+            merged_lists.setdefault(f, []).append(m)
+        return {f: "\n".join(dict.fromkeys(msgs)) for f, msgs in merged_lists.items()}
+
+    def _clear_main_row_validation_errors(self, rec_idx: int):
+        for f in MAIN_ROW_VALIDATE_FIELDS:
+            self.clear_error(rec_idx, f)
+
+    def _mark_row_from_validation_issues(self, rec_idx: int, issues: list[tuple[str, str]]):
+        merged = self._merge_validation_issues_by_field(issues)
+        for f, msg in merged.items():
+            self.mark_error(rec_idx, f, msg)
+
+    def _place_dialog_below_rect(self, dlg: QDialog, anchor_global: QPoint, anchor_w: int) -> None:
+        """将弹窗定位到锚点正下方，且尽量不越出当前屏幕。"""
+        screen = QGuiApplication.screenAt(anchor_global) or QGuiApplication.primaryScreen()
+        geo = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        size = dlg.sizeHint()
+        x = anchor_global.x()
+        y = anchor_global.y() + 2
+        if x + size.width() > geo.right():
+            x = geo.right() - size.width()
+        if x < geo.left():
+            x = geo.left()
+        # 锚点宽度较大时，尽量水平居中到控件下方
+        if anchor_w > size.width():
+            x = max(geo.left(), min(anchor_global.x() + (anchor_w - size.width()) // 2, geo.right() - size.width()))
+        if y + size.height() > geo.bottom():
+            y = max(geo.top(), anchor_global.y() - size.height() - 2)
+        dlg.move(x, y)
+
+    def _task_no_from_task_name(self, task_name: str) -> str:
+        tn = str(task_name or "").strip()
+        if not tn:
+            return ""
+        left = tn.split("-", 1)[0]
+        reg = find_earliest_region_in_left(left)
+        if not reg:
+            return ""
+        start, _end, _region = reg
+        return left[:start].strip()
+
+    def _build_merge_default_filename(self, merged_rows: list[list[Any]], merged_data_rows: int) -> str:
+        prefix = "合并结果"
+        if merged_rows:
+            first = merged_rows[0]
+            if len(first) >= 2:
+                first_task_no = self._task_no_from_task_name(str(first[1] or ""))
+                if first_task_no:
+                    prefix = first_task_no
+        return f"{sanitize_filename(prefix)}-{max(0, merged_data_rows)}.xlsx"
+
+    def _open_url_picker_dialog(self, rec_idx: int, anchor_widget: QWidget):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("选择配件URL")
+        dlg.resize(620, 460)
+        lo = QVBoxLayout(dlg)
+        lo.setContentsMargins(10, 10, 10, 10)
+        lo.setSpacing(8)
+        search = QLineEdit()
+        search.setPlaceholderText("搜索节点：名称/描述/URL...")
+        lo.addWidget(search)
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["名称", "URL"])
+        tree.setColumnWidth(0, 280)
+        tree.setColumnWidth(1, 360)
+        lo.addWidget(tree, 1)
+        btns = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+        lo.addWidget(btns)
+        picked: dict[str, Any] = {"urls": [], "descs": []}
+        rec = self.records[rec_idx] if 0 <= rec_idx < len(self.records) else {}
+        pre_descs = set(self._selected_url_descs_for_record(rec))
+
+        def on_item_double_clicked(item: QTreeWidgetItem, _col: int):
+            node_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+            node, _ = self._find_accessory_node(node_id)
+            if not node or node.get("node_type") != "leaf":
+                return
+            nxt = Qt.CheckState.Unchecked if item.checkState(0) == Qt.CheckState.Checked else Qt.CheckState.Checked
+            item.setCheckState(0, nxt)
+
+        def render():
+            kw = search.text().strip().lower()
+            tree.clear()
+
+            def matches_or_has_match(node: dict[str, Any]) -> bool:
+                node_text = f"{node.get('name','')} {node.get('desc','')} {node.get('url','')}".lower()
+                if not kw or kw in node_text:
+                    return True
+                for ch in node.get("children", []) or []:
+                    if isinstance(ch, dict) and matches_or_has_match(ch):
+                        return True
+                return False
+
+            def add_node(node: dict[str, Any], parent_item: QTreeWidgetItem | None):
+                if not matches_or_has_match(node):
+                    return
+                item = QTreeWidgetItem(
+                    [
+                        str(node.get("name", "")),
+                        str(node.get("url", "")),
+                    ]
+                )
+                item.setData(0, Qt.ItemDataRole.UserRole, str(node.get("id", "")))
+                if node.get("node_type") == "leaf":
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    desc_name = str(node.get("desc", "") or node.get("name", "") or "")
+                    item.setCheckState(0, Qt.CheckState.Checked if desc_name in pre_descs else Qt.CheckState.Unchecked)
+                if parent_item is None:
+                    tree.addTopLevelItem(item)
+                else:
+                    parent_item.addChild(item)
+                for ch in node.get("children", []) or []:
+                    if isinstance(ch, dict):
+                        add_node(ch, item)
+
+            add_node(self.accessories_root, None)
+            tree.expandAll()
+
+        def on_accept():
+            picked_urls: list[str] = []
+            picked_descs: list[str] = []
+
+            def walk(item: QTreeWidgetItem):
+                node_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+                node, _ = self._find_accessory_node(node_id)
+                if node and node.get("node_type") == "leaf" and item.checkState(0) == Qt.CheckState.Checked:
+                    url = str(node.get("url", "") or "").strip()
+                    desc = str(node.get("desc", "") or node.get("name", "") or "").strip()
+                    if url:
+                        picked_urls.append(url)
+                        picked_descs.append(desc or url)
+                for i in range(item.childCount()):
+                    walk(item.child(i))
+
+            for i in range(tree.topLevelItemCount()):
+                walk(tree.topLevelItem(i))
+
+            # 去重且保序
+            seen_u: set[str] = set()
+            final_urls: list[str] = []
+            for u in picked_urls:
+                if u not in seen_u:
+                    seen_u.add(u)
+                    final_urls.append(u)
+            seen_d: set[str] = set()
+            final_descs: list[str] = []
+            for d in picked_descs:
+                if d not in seen_d:
+                    seen_d.add(d)
+                    final_descs.append(d)
+            if not final_urls:
+                QMessageBox.information(dlg, "提示", "请至少勾选一个描述")
+                return
+            picked["urls"] = final_urls
+            picked["descs"] = final_descs
+            dlg.accept()
+
+        search.textChanged.connect(render)
+        tree.itemDoubleClicked.connect(on_item_double_clicked)
+        btns.accepted.connect(on_accept)
+        btns.rejected.connect(dlg.reject)
+        render()
+        anchor = anchor_widget.property("_url_anchor_global")
+        width = anchor_widget.property("_url_anchor_width")
+        if isinstance(anchor, QPoint) and isinstance(width, int):
+            self._place_dialog_below_rect(dlg, anchor, width)
+        else:
+            p = anchor_widget.mapToGlobal(anchor_widget.rect().bottomLeft())
+            self._place_dialog_below_rect(dlg, p, anchor_widget.width())
+        if dlg.exec() == QDialog.Accepted:
+            self.apply_field_update(rec_idx, "url", "\n".join(picked["descs"]))
+
+    def _write_merge_stats_sheet(self, wb: Workbook, merged_rows: list[list[Any]]) -> None:
+        """统计页来源于 sum-template.xlsx 的统计页模板，再按规则填充数据。"""
+
+        def _copy_sheet_template(src_ws, dst_ws):
+            # 复制基础表级属性
+            dst_ws.sheet_format = copy(src_ws.sheet_format)
+            dst_ws.sheet_properties = copy(src_ws.sheet_properties)
+            dst_ws.page_margins = copy(src_ws.page_margins)
+            dst_ws.page_setup = copy(src_ws.page_setup)
+            dst_ws.print_options = copy(src_ws.print_options)
+            dst_ws.freeze_panes = src_ws.freeze_panes
+            # 复制列宽/隐藏/分组
+            for col_key, dim in src_ws.column_dimensions.items():
+                dst = dst_ws.column_dimensions[col_key]
+                dst.width = dim.width
+                dst.hidden = dim.hidden
+                dst.outlineLevel = dim.outlineLevel
+                dst.bestFit = dim.bestFit
+            # 复制行高/隐藏/分组
+            for row_idx, dim in src_ws.row_dimensions.items():
+                dst = dst_ws.row_dimensions[row_idx]
+                dst.height = dim.height
+                dst.hidden = dim.hidden
+                dst.outlineLevel = dim.outlineLevel
+            # 复制单元格值与样式（避免直接拷贝 _style 造成样式索引错乱）
+            for row in src_ws.iter_rows(min_row=1, max_row=src_ws.max_row, min_col=1, max_col=src_ws.max_column):
+                for cell in row:
+                    dcell = dst_ws.cell(row=cell.row, column=cell.column, value=cell.value)
+                    dcell.font = copy(cell.font)
+                    dcell.fill = copy(cell.fill)
+                    dcell.border = copy(cell.border)
+                    dcell.protection = copy(cell.protection)
+                    dcell.alignment = copy(cell.alignment)
+                    dcell.number_format = cell.number_format
+            # 复制合并单元格
+            for rg in src_ws.merged_cells.ranges:
+                dst_ws.merge_cells(str(rg))
+
+        if "统计" in wb.sheetnames:
+            del wb["统计"]
+
+        sum_tpl = APP_DIR / "sum-template.xlsx"
+        if sum_tpl.exists():
+            try:
+                sum_wb = load_workbook(str(sum_tpl))
+                try:
+                    src_ws = sum_wb["统计"] if "统计" in sum_wb.sheetnames else sum_wb[sum_wb.sheetnames[0]]
+                    ws = wb.create_sheet("统计")
+                    _copy_sheet_template(src_ws, ws)
+                finally:
+                    sum_wb.close()
+            except Exception:
+                ws = wb.create_sheet("统计")
+        else:
+            ws = wb.create_sheet("统计")
+
+        ws["C1"] = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        counts: Counter[str] = Counter()
+        for vals in merged_rows:
+            if len(vals) < 2:
+                continue
+            name = str(vals[1] or "").strip()
+            if name:
+                counts[name] += 1
+        row = 4
+        serial = 1
+        for name, cnt in counts.most_common():
+            ws.cell(row=row, column=2, value=serial)  # B列 序号
+            ws.cell(row=row, column=3, value=name)    # C列 任务名
+            ws.cell(row=row, column=4, value=cnt)     # D列 统计行数
+            row += 1
+            serial += 1
+        # 默认打开定位到统计页 A1
+        wb.active = wb.sheetnames.index(ws.title)
+        try:
+            ws.sheet_view.topLeftCell = "A1"
+            if ws.sheet_view.selection:
+                ws.sheet_view.selection[0].activeCell = "A1"
+                ws.sheet_view.selection[0].sqref = "A1"
+        except Exception:
+            pass
+
+    def _refresh_main_row_validation_marks(self, rec_idx: int):
+        """按导出规则刷新主表一行标红；不弹窗（仅打印按钮失败时弹窗）。"""
+        if rec_idx < 0 or rec_idx >= len(self.records):
+            return
+        rec = self.records[rec_idx]
+        self._clear_main_row_validation_errors(rec_idx)
+        issues = self.collect_record_validation_issues(rec)
+        if issues:
+            self._mark_row_from_validation_issues(rec_idx, issues)
+
+    def _format_validation_issues_message(self, issues: list[tuple[str, str]], *, with_title: bool = True) -> str:
+        if not issues:
+            return ""
+        merged = self._merge_validation_issues_by_field(issues)
+        order = [f for f in FIELDS if f in merged]
+        for f in merged:
+            if f not in order:
+                order.append(f)
+        lines = [f"• {HEADERS.get(f, f)}：{merged[f]}" for f in order]
+        body = "\n".join(lines)
+        if with_title:
+            return "请修正以下问题：\n\n" + body
+        return body
 
     def region_part(self, rec):
         p, c = split_multi(rec.get("province", "")), split_multi(rec.get("city", ""))
@@ -3555,9 +4316,12 @@ class BillApp(QMainWindow):
             errs.append(f"运营商编码「{op}」输入不正确")
         if tp not in TYPE_MAP:
             errs.append(f"类型编码「{tp}」输入不正确")
-        customer = (left[:start] + tail[6:]).strip() or "客户"
         if errs:
             return None, errs
+        customer_raw = (left[:start] + tail[6:]).strip()
+        if region_in_task_name_requires_customer_prefix(region) and not customer_raw:
+            return None, ["请输入任务编号"]
+        customer = customer_raw or "客户"
         return {"customer": customer, "region": region, "op": op, "tp": tp, "ind": ind}, []
 
     def parse_left_with_errors(self, left: str) -> tuple[dict | None, list[str]]:
@@ -3583,6 +4347,8 @@ class BillApp(QMainWindow):
             if rm:
                 region = rm.group(1)
                 customer = prefix[: -len(region)]
+        if region_in_task_name_requires_customer_prefix(region) and not str(customer or "").strip():
+            return None, ["请输入任务编号"]
         return {"customer": customer or "客户", "region": region, "op": m.group(1), "tp": m.group(2), "ind": m.group(3)}, []
 
     def parse_left(self, left):
@@ -3599,8 +4365,8 @@ class BillApp(QMainWindow):
             f"{rec.get('type_code') or '##'}{rec.get('industry_code') or '##'}-{product}"
         )
 
-    def parse_task_name(self, rec):
-        self._task_name_parse_user_warned = False
+    def parse_task_name(self, rec, rec_idx: int | None = None):
+        self._task_name_parse_err_marked = False
         tn = rec.get("task_name", "")
         if "-" not in tn:
             return False
@@ -3610,8 +4376,8 @@ class BillApp(QMainWindow):
         if errs:
             for k, v in snap.items():
                 rec[k] = v
-            QMessageBox.warning(self, "任务名", "\n".join(errs))
-            self._task_name_parse_user_warned = True
+            if rec_idx is not None:
+                self._task_name_parse_err_marked = True
             return False
         if not parsed:
             return False
@@ -3625,7 +4391,7 @@ class BillApp(QMainWindow):
             rec["city"], rec["province"] = region, ""
         return True
 
-    def after_field_change(self, rec, field):
+    def after_field_change(self, rec, field, rec_idx: int | None = None):
         if field == "province" and rec.get("province", "").strip():
             rec["city"] = ""
             rec["exclude_province"] = ""
@@ -3645,7 +4411,7 @@ class BillApp(QMainWindow):
         if field == "exclude_city" and rec.get("exclude_city", "").strip():
             rec["city"] = ""
         if field == "task_name":
-            return self.parse_task_name(rec)
+            return self.parse_task_name(rec, rec_idx)
         elif field in ("province", "city", "type_code", "operator_code", "industry_code"):
             rec["task_name"] = self.build_task_name(rec)
         return True
@@ -3675,50 +4441,42 @@ class BillApp(QMainWindow):
             return
         include_url = self.chk_print_url.isChecked()
         selected = [x[1] for x in selected_with_index]
-        # 导出前做一次全量校验，避免写出不合规数据。
+        # 导出前做一次全量校验；仅在此处对校验失败弹窗（输入过程中只标红不弹窗）。
+        issues_by_idx: dict[int, list[tuple[str, str]]] = {}
         has_invalid = False
         for rec_idx, rec in selected_with_index:
-            for k in ("task_name", "type_code", "operator_code", "industry_code", "quantity", "duration", "age_max", "age_min", "pv"):
-                self.clear_error(rec_idx, k)
-            ok, msg = self.validate_record(rec)
-            if ok:
-                ok, msg = self.validate_export_record(rec)
-            if ok:
+            self._clear_main_row_validation_errors(rec_idx)
+            issues = self.collect_record_validation_issues(rec)
+            resolved_urls, missing_descs = self._resolve_urls_from_descs_with_missing(str(rec.get("url", "")))
+            if missing_descs:
+                show = "、".join(missing_descs[:3])
+                more = f" 等{len(missing_descs)}项" if len(missing_descs) > 3 else ""
+                issues.append(("url", f"URL 描述未匹配到配件表URL：{show}{more}"))
+            bad_urls = [u for u in resolved_urls if not self._is_valid_http_url(u)]
+            if bad_urls:
+                show = "、".join(bad_urls[:2])
+                more = f" 等{len(bad_urls)}项" if len(bad_urls) > 2 else ""
+                issues.append(("url", f"描述映射出的URL格式错误（需为http/https）：{show}{more}"))
+            if not issues:
                 continue
             has_invalid = True
-            if "年龄上限必须大于等于年龄下限" in msg:
-                self.mark_error(rec_idx, "age_min", msg)
-                self.mark_error(rec_idx, "age_max", msg)
-            elif "运营商" in msg:
-                self.mark_error(rec_idx, "operator_code", msg)
-                self.mark_error(rec_idx, "task_name", msg)
-            elif "类型" in msg:
-                self.mark_error(rec_idx, "type_code", msg)
-                self.mark_error(rec_idx, "task_name", msg)
-            elif "行业编码" in msg:
-                self.mark_error(rec_idx, "industry_code", msg)
-                self.mark_error(rec_idx, "task_name", msg)
-            elif "任务名中的地域" in msg:
-                self.mark_error(rec_idx, "task_name", msg)
-                self.mark_error(rec_idx, "province", msg)
-                self.mark_error(rec_idx, "city", msg)
-            elif "数量必须大于0" in msg or "数量" in msg:
-                self.mark_error(rec_idx, "quantity", msg)
-            elif "年龄上限" in msg:
-                self.mark_error(rec_idx, "age_max", msg)
-            elif "年龄下限" in msg:
-                self.mark_error(rec_idx, "age_min", msg)
-            elif "pv" in msg:
-                self.mark_error(rec_idx, "pv", msg)
-            elif "URL" in msg:
-                self.mark_error(rec_idx, "url", msg)
-            elif "时长" in msg:
-                self.mark_error(rec_idx, "duration", msg)
-            elif "任务名" in msg:
-                self.mark_error(rec_idx, "task_name", msg)
+            issues_by_idx[rec_idx] = issues
+            self._mark_row_from_validation_issues(rec_idx, issues)
         if has_invalid:
             self.refresh_table()
-            QMessageBox.warning(self, "导出失败", "选中记录存在必填缺失或任务名关联不匹配（已标红），请修正后再导出")
+            parts = ["勾选记录存在以下问题（已标红对应字段），请修正后再点击打印。\n"]
+            for rec_idx, rec in selected_with_index:
+                issues = issues_by_idx.get(rec_idx)
+                if not issues:
+                    continue
+                label = (str(rec.get("task_name", "")).strip()[:40] or f"第 {rec_idx + 1} 条").replace("\n", " ")
+                parts.append("\n————————————————")
+                parts.append(f"【{label}】")
+                parts.append(self._format_validation_issues_message(issues, with_title=False))
+            full = "\n".join(parts)
+            if len(full) > 12000:
+                full = full[:12000] + "\n\n……（以下节选，请以表格标红为准）"
+            QMessageBox.warning(self, "无法打印", full)
             return
         if not TEMPLATE_FILE.exists():
             QMessageBox.warning(self, "导出失败", f"模板不存在: {TEMPLATE_FILE.name}")
@@ -3734,13 +4492,22 @@ class BillApp(QMainWindow):
             rr = start_row + idx
             for f, c in col_map.items():
                 if f == "url":
-                    raw_url = str(rec.get("url", ""))
+                    raw_descs = str(rec.get("url", ""))
                     row_allow = coerce_allow_print_url(rec.get("allow_print_url"))
                     if include_url and row_allow:
-                        lines = [line for line in raw_url.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
-                        ws[f"{c}{rr}"] = "\r\n".join(lines)
+                        lines, _missing = self._resolve_urls_from_descs_with_missing(raw_descs)
+                        cell = ws[f"{c}{rr}"]
+                        # URL 以多行写入单元格，便于在 Excel 中直接逐行查看。
+                        cell.value = "\r\n".join(lines)
+                        ali = copy(cell.alignment)
+                        ali.wrap_text = True
+                        cell.alignment = ali
                     else:
-                        ws[f"{c}{rr}"] = ""
+                        cell = ws[f"{c}{rr}"]
+                        cell.value = ""
+                        ali = copy(cell.alignment)
+                        ali.wrap_text = True
+                        cell.alignment = ali
                 elif f == "type_code":
                     ws[f"{c}{rr}"] = TYPE_MAP.get(rec.get(f, ""), "")
                 elif f == "operator_code":
@@ -3811,7 +4578,7 @@ class BillApp(QMainWindow):
         box.setInformativeText(
             "<span style='color:#2563eb;'>"
             "可点击“打开文件夹”快速定位到该导出文件。"
-            "<br/>也可以到打印记录页面中打开该文件所在文件夹。"
+            "<br/>也可以到「历史打印记录」页面中打开该文件所在文件夹。"
             "</span>"
         )
         btn_open_dir = box.addButton("打开文件夹", QMessageBox.ButtonRole.ActionRole)

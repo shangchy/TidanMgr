@@ -147,6 +147,20 @@ _REGION_NAME_TOKENS = sorted(set(PROVINCES + CITIES + ["全国"]), key=len, reve
 _REGION_NUM_RE = re.compile(r"^([一二两三四五六七八九十]+省|[一二两三四五六七八九十]+市|\d+省|\d+市)")
 
 
+def region_in_task_name_requires_customer_prefix(region: str) -> bool:
+    """
+    任务名左段中若出现省/市名或「几省/几市」等地域词，则其前须填写任务编号（客户段），全国除外。
+    """
+    r = str(region or "").strip()
+    if not r or r == "全国":
+        return False
+    if r in PROVINCES or r in CITIES:
+        return True
+    if _REGION_NUM_RE.fullmatch(r):
+        return True
+    return False
+
+
 def find_earliest_region_in_left(left: str) -> tuple[int, int, str] | None:
     """返回 (起始下标, 结束下标不含, 地域词)。取最靠前起点；同起点取长匹配。"""
     n = len(left)

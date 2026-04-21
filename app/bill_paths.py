@@ -29,6 +29,7 @@ HISTORY_FILE = APP_DIR / "history_data.json"
 THEME_FILE = APP_DIR / "theme.json"
 PICKER_RECENT_FILE = APP_DIR / "picker_recent.json"
 PRINT_RECORDS_FILE = APP_DIR / "print_records.json"
+ACCESSORIES_FILE = APP_DIR / "accessories.json"
 # 打包时模板随 --add-data 放入 _MEIPASS；未打包时放在 app 目录
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     _bundled_tpl = Path(sys._MEIPASS) / "template.xlsx"
