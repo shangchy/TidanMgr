@@ -24,6 +24,12 @@ if (Test-Path "template.xlsx") {
 } else {
   Write-Host "Warning: template.xlsx missing; export may need template in app folder"
 }
+if (Test-Path "sum-template.xlsx") {
+  $addData += @("--add-data", "sum-template.xlsx;.")
+  Write-Host "Bundled: sum-template.xlsx"
+} else {
+  Write-Host "Warning: sum-template.xlsx missing; merge stats sheet may lose template style"
+}
 
 Write-Host "Running PyInstaller (onedir)..."
 $pyiArgs = @(

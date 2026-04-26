@@ -4,12 +4,11 @@ import re
 import subprocess
 import sys
 import uuid
-from copy import copy
+from copy import copy, deepcopy
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from openpyxl import Workbook, load_workbook
 from PySide6.QtCore import QEvent, QObject, QModelIndex, QPoint, QPointF, QRect, QRectF, Qt, QTimer
@@ -65,6 +64,8 @@ from bill_paths import (
     LICENSE_EXPIRED_MSG,
     PICKER_RECENT_FILE,
     PRINT_RECORDS_FILE,
+    RECEIPT_DATA_FILE,
+    SUM_TEMPLATE_FILE,
     TEMPLATE_FILE,
     THEME_FILE,
     is_license_valid,
@@ -82,6 +83,7 @@ from bill_widgets import (
     style_combo_centered,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -101,15 +103,18 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QProgressDialog,
     QSizePolicy,
     QStatusBar,
     QStackedWidget,
     QTreeWidget,
     QTreeWidgetItem,
+    QTreeView,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QListView,
 )
 
 # 主表行「格式 + 导出必填」校验涉及的字段（输入/离行仅标红；点击打印校验失败时弹窗）
@@ -135,6 +140,7 @@ class BillApp(QMainWindow):
         self.setObjectName("BillAppMain")
         self.setWindowTitle("高效办公")
         self.records: list[dict[str, Any]] = []
+        self.current_business = "bill"
         self.history_records: list[dict[str, Any]] = []
         self.history_filtered_indices: list[int] = []
         self.filtered_indices: list[int] = []
@@ -160,7 +166,15 @@ class BillApp(QMainWindow):
         self.print_sort_order = Qt.SortOrder.DescendingOrder
         self._hist_v_sync = False
         self._hist_sel_sync = False
+        self._acc_v_sync = False
+        self._acc_sel_sync = False
+        self._acc_list_updating = False
+        self._accessory_checked_node_ids: set[str] = set()
+        self._accessory_draft_rows: list[dict[str, str]] = []
         self._accessory_selected_node_id = "root"
+        self.accessory_header_filters: dict[str, set[str]] = {}
+        self.accessory_sort_field: str | None = None
+        self.accessory_sort_order = Qt.SortOrder.AscendingOrder
         self._filter_popup: ColumnPickFilterPopup | None = None
         self._license_timer = QTimer(self)
         self._license_timer.timeout.connect(self._check_license_and_exit_if_needed)
@@ -230,6 +244,9 @@ class BillApp(QMainWindow):
         self.nav_bill = QPushButton("📝  提单表")
         self.nav_bill.setObjectName("navActive")
         self.nav_bill.clicked.connect(self.show_bill_page)
+        self.nav_receipt = QPushButton("📬  回执管理")
+        self.nav_receipt.setObjectName("navNormal")
+        self.nav_receipt.clicked.connect(self.show_receipt_page)
         self.nav_accessories = QPushButton("📎  配件表")
         self.nav_accessories.setObjectName("navNormal")
         self.nav_accessories.clicked.connect(self.show_accessories_page)
@@ -250,6 +267,7 @@ class BillApp(QMainWindow):
         divider.setFrameShape(QFrame.HLine)
         sidebar_layout.addWidget(self.sidebar_brand)
         sidebar_layout.addWidget(self.nav_bill)
+        sidebar_layout.addWidget(self.nav_receipt)
         sidebar_layout.addWidget(self.nav_history)
         sidebar_layout.addWidget(self.nav_print_records)
         sidebar_layout.addWidget(self.nav_accessories)
@@ -306,14 +324,15 @@ class BillApp(QMainWindow):
         self.btn_print = QPushButton("🖨 打印")
         self.btn_print.setObjectName("btnAccent")
         self.btn_print.clicked.connect(self.export_excel)
+        self.btn_import_excel = QPushButton("📥 导入Excel")
+        self.btn_import_excel.setObjectName("btnGhost")
+        self.btn_import_excel.clicked.connect(self.import_bill_excel)
         self.btn_add = QPushButton("➕ 新增行")
         self.btn_add.setObjectName("btnSuccess")
         self.btn_add.clicked.connect(self.add_row)
         self.btn_bulk_fill = QPushButton("📋 批量填充")
         self.btn_bulk_fill.setObjectName("btnAccent")
         self.btn_bulk_fill.clicked.connect(self.bulk_fill_selected)
-        self.btn_bulk_fill.setParent(bill_page)
-        self.btn_bulk_fill.hide()
         self.btn_delete_sel = QPushButton("🗑 删除选中")
         self.btn_delete_sel.setObjectName("btnDanger")
         self.btn_delete_sel.clicked.connect(self.delete_selected)
@@ -335,7 +354,7 @@ class BillApp(QMainWindow):
         top.addWidget(sep1)
         top.addLayout(print_opt_layout, 1)
         top.addWidget(sep2)
-        for w in [self.btn_print, self.btn_add]:
+        for w in [self.btn_print, self.btn_import_excel, self.btn_add, self.btn_bulk_fill]:
             top.addWidget(w)
         top.addStretch(1)
         bill_page_layout.addLayout(top)
@@ -587,26 +606,111 @@ class BillApp(QMainWindow):
         self.accessory_search.textChanged.connect(self.refresh_accessory_tree)
         btn_acc_clear = QPushButton("🔄 清空搜索")
         btn_acc_clear.setObjectName("btnGhost")
-        btn_acc_clear.clicked.connect(lambda: self.accessory_search.setText(""))
+        btn_acc_clear.clicked.connect(self.clear_accessory_search_and_filters)
         self.btn_acc_add = QPushButton("➕ 新增节点")
         self.btn_acc_add.setObjectName("btnSuccess")
         self.btn_acc_add.clicked.connect(self.add_accessory)
+        self.btn_acc_add_row = QPushButton("➕ 新增行")
+        self.btn_acc_add_row.setObjectName("btnSuccess")
+        self.btn_acc_add_row.clicked.connect(self.add_accessory_row)
+        self.btn_acc_import = QPushButton("📥 导入Excel")
+        self.btn_acc_import.setObjectName("btnGhost")
+        self.btn_acc_import.clicked.connect(self.import_accessories_from_excel)
+        self.btn_acc_copy_leaf = QPushButton("📄 复制叶子")
+        self.btn_acc_copy_leaf.setObjectName("btnGhost")
+        self.btn_acc_copy_leaf.clicked.connect(self.copy_accessory_leaf)
+        self.btn_acc_copy_leaf.hide()
         self.btn_acc_delete = QPushButton("🗑 删除节点")
         self.btn_acc_delete.setObjectName("btnDanger")
         self.btn_acc_delete.clicked.connect(self.delete_accessory)
+        self.btn_acc_delete_selected = QPushButton("🗑 删除选中")
+        self.btn_acc_delete_selected.setObjectName("btnDanger")
+        self.btn_acc_delete_selected.clicked.connect(self.delete_accessory_selected)
+        self.accessory_mode_combo = QComboBox()
+        self.accessory_mode_combo.addItem("树形结构", "tree")
+        self.accessory_mode_combo.addItem("列表结构", "list")
+        self.accessory_mode_combo.currentIndexChanged.connect(self.on_accessory_mode_changed)
         ac_top.addWidget(self.accessory_search)
         ac_top.addWidget(btn_acc_clear)
         ac_top.addWidget(self.btn_acc_add)
+        ac_top.addWidget(self.btn_acc_add_row)
+        ac_top.addWidget(self.btn_acc_import)
+        ac_top.addWidget(self.btn_acc_copy_leaf)
+        ac_top.addWidget(self.btn_acc_delete_selected)
         ac_top.addWidget(self.btn_acc_delete)
         ac_top.addStretch(1)
+        ac_top.addWidget(self.accessory_mode_combo)
         ac_layout.addLayout(ac_top)
-        ac_split = QHBoxLayout()
-        ac_split.setSpacing(12)
+        self.accessory_view_stack = QStackedWidget()
         self.accessory_graph = AccessoryGraphView()
         self.accessory_graph.nodeSelected.connect(self._on_accessory_graph_selected)
         self.accessory_graph.nodeDoubleClicked.connect(lambda _nid: self.update_accessory())
-        ac_split.addWidget(self.accessory_graph, 1)
-        ac_layout.addLayout(ac_split, 1)
+        self.accessory_list_split = QWidget()
+        self.accessory_list_split.setObjectName("historyTableSplit")
+        acc_split_lo = QHBoxLayout(self.accessory_list_split)
+        acc_split_lo.setContentsMargins(0, 0, 0, 0)
+        acc_split_lo.setSpacing(0)
+        self.accessory_list_frozen = QTableWidget(0, 2)
+        self.accessory_list_frozen.setObjectName("tableFrozenCol")
+        self.accessory_list_frozen.setHorizontalHeaderLabels(["☐", "类型"])
+        self.accessory_list_frozen.verticalHeader().setVisible(False)
+        self.accessory_list_frozen.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.accessory_list_frozen.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.accessory_list_frozen.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.SelectedClicked | QTableWidget.EditTrigger.EditKeyPressed)
+        self.accessory_list_frozen.setAlternatingRowColors(True)
+        self.accessory_list_frozen.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.accessory_list_frozen.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.accessory_list_frozen.horizontalScrollBar().setEnabled(False)
+        self.accessory_list_frozen.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.accessory_list_table = QTableWidget(0, 7)
+        self.accessory_list_table.setObjectName("historyScrollPart")
+        self.accessory_list_table.setHorizontalHeaderLabels(["渠道", "名称", "描述", "URL", "备注", "创建时间", "操作"])
+        self.accessory_list_table.verticalHeader().setVisible(False)
+        self.accessory_list_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.accessory_list_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.accessory_list_table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.SelectedClicked | QTableWidget.EditTrigger.EditKeyPressed)
+        self.accessory_list_table.setAlternatingRowColors(True)
+        fm_acc = QFontMetrics(self.font())
+        w_type = max(100, fm_acc.horizontalAdvance("[类目一123]") + 24)
+        self.accessory_list_frozen.setColumnWidth(0, 42)
+        self.accessory_list_frozen.setColumnWidth(1, w_type)
+        self.accessory_list_table.setColumnWidth(0, max(100, fm_acc.horizontalAdvance("渠道一123") + 24))
+        self.accessory_list_table.setColumnWidth(1, max(150, fm_acc.horizontalAdvance("名称一123456") + 28))
+        self.accessory_list_table.setColumnWidth(2, max(150, fm_acc.horizontalAdvance("描述一123456") + 28))
+        self.accessory_list_table.setColumnWidth(3, max(200, fm_acc.horizontalAdvance("https://example.com/xxx") + 28))
+        self.accessory_list_table.setColumnWidth(4, max(100, fm_acc.horizontalAdvance("备注一123") + 24))
+        self.accessory_list_table.setColumnWidth(5, 150)
+        self.accessory_list_table.setColumnWidth(6, 100)
+        hdr_acc_f = HoverFilterHeaderView(self.accessory_list_frozen, self, "acc_frozen")
+        hdr_acc_s = HoverFilterHeaderView(self.accessory_list_table, self, "acc_scroll")
+        self.accessory_list_frozen.setHorizontalHeader(hdr_acc_f)
+        self.accessory_list_table.setHorizontalHeader(hdr_acc_s)
+        hdr_acc_f.setSectionResizeMode(0, QHeaderView.Fixed)
+        hdr_acc_f.setSectionResizeMode(1, QHeaderView.Interactive)
+        hdr_acc_s.setSectionResizeMode(QHeaderView.Interactive)
+        hdr_acc_f.sectionClicked.connect(self._on_accessory_frozen_header_clicked)
+        hdr_acc_s.sectionClicked.connect(self._on_accessory_scroll_header_clicked)
+        self.accessory_list_table.verticalScrollBar().valueChanged.connect(lambda v: self._sync_accessory_v_scroll(v, "scroll"))
+        self.accessory_list_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_accessory_v_scroll(v, "frozen"))
+        self.accessory_list_table.itemSelectionChanged.connect(self._sync_selection_accessory_to_frozen)
+        self.accessory_list_frozen.itemSelectionChanged.connect(self._sync_selection_accessory_frozen_to_scroll)
+        self.accessory_list_frozen.cellClicked.connect(self._on_accessory_list_frozen_cell_clicked)
+        self.accessory_list_frozen.itemSelectionChanged.connect(self._on_accessory_list_selection_changed)
+        self.accessory_list_table.itemSelectionChanged.connect(self._on_accessory_list_selection_changed)
+        self.accessory_list_frozen.itemChanged.connect(self._on_accessory_list_item_changed)
+        self.accessory_list_table.itemChanged.connect(self._on_accessory_list_item_changed)
+        self.accessory_list_frozen.horizontalHeader().sectionResized.connect(self._on_accessory_frozen_section_resized)
+        self.accessory_list_frozen.horizontalHeader().sectionResized.connect(self._save_accessory_list_col_widths)
+        self.accessory_list_table.horizontalHeader().sectionResized.connect(self._save_accessory_list_col_widths)
+        self.accessory_list_table.cellDoubleClicked.connect(self._on_accessory_list_cell_double_clicked)
+        self.accessory_list_row_node_ids: list[str] = []
+        self._load_accessory_list_col_widths()
+        acc_split_lo.addWidget(self.accessory_list_frozen, 0)
+        acc_split_lo.addWidget(self.accessory_list_table, 1)
+        self.accessory_view_stack.addWidget(self.accessory_graph)
+        self.accessory_view_stack.addWidget(self.accessory_list_split)
+        ac_layout.addWidget(self.accessory_view_stack, 1)
+        self.accessory_mode_combo.setCurrentIndex(1)
         self.content_stack.addWidget(accessory_page)
 
         settings_page = QWidget()
@@ -628,7 +732,7 @@ class BillApp(QMainWindow):
 
         status = QStatusBar(self)
         self.setStatusBar(status)
-        self.lbl_count = QLabel("提单数: 0")
+        self.lbl_count = QLabel("任务数: 0")
         self.lbl_time = QLabel()
         self.lbl_save = QLabel("已自动保存")
         status.addPermanentWidget(self.lbl_count)
@@ -636,6 +740,9 @@ class BillApp(QMainWindow):
         status.addPermanentWidget(self.lbl_time)
         status.addPermanentWidget(QLabel("|"))
         status.addPermanentWidget(self.lbl_save)
+        status.addPermanentWidget(QLabel("|"))
+        self.lbl_version = QLabel("Version:1.0.0 Copyright © 2026 Sprain")
+        status.addPermanentWidget(self.lbl_version)
         timer = QTimer(self)
         timer.timeout.connect(self.update_time)
         timer.start(1000)
@@ -663,6 +770,7 @@ class BillApp(QMainWindow):
         self._apply_initial_window_geometry()
         self._on_main_frozen_section_resized()
         self._on_hist_frozen_section_resized()
+        self._on_accessory_frozen_section_resized()
 
     def _apply_initial_window_geometry(self):
         """初始窗口宽度 1500；高度为可用区估算值再加 50（无屏信息时 910）；窗口可自由拉伸。"""
@@ -710,16 +818,77 @@ class BillApp(QMainWindow):
         finally:
             hf.blockSignals(False)
 
+    def _on_accessory_frozen_section_resized(self, *_args):
+        if not hasattr(self, "accessory_list_frozen"):
+            return
+        hf = self.accessory_list_frozen.horizontalHeader()
+        hf.blockSignals(True)
+        try:
+            w0 = 42
+            w1 = max(120, min(self.accessory_list_frozen.columnWidth(1), 2000))
+            self.accessory_list_frozen.setColumnWidth(0, w0)
+            self.accessory_list_frozen.setColumnWidth(1, w1)
+            self.accessory_list_frozen.setFixedWidth(w0 + w1)
+        finally:
+            hf.blockSignals(False)
+
     def load_theme(self):
         if THEME_FILE.exists():
             try:
-                return json.loads(THEME_FILE.read_text(encoding="utf-8")).get("theme", "light")
-            except Exception:
+                payload = json.loads(THEME_FILE.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    self._ui_prefs = dict(payload)
+                    return str(payload.get("theme", "light") or "light")
+                self._ui_prefs = {}
                 return "light"
+            except Exception:
+                self._ui_prefs = {}
+                return "light"
+        self._ui_prefs = {}
         return "light"
 
     def save_theme(self):
-        THEME_FILE.write_text(json.dumps({"theme": self.theme}, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = dict(getattr(self, "_ui_prefs", {}))
+        payload["theme"] = self.theme
+        THEME_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _load_accessory_list_col_widths(self):
+        widths = (getattr(self, "_ui_prefs", {}) or {}).get("accessory_list_col_widths", [])
+        if not isinstance(widths, list) or len(widths) not in (8, 9):
+            return
+        try:
+            if len(widths) >= 9:
+                self.accessory_list_frozen.setColumnWidth(0, int(widths[0]))
+                self.accessory_list_frozen.setColumnWidth(1, int(widths[1]))
+                start_idx = 2
+                scroll_count = 7
+            else:
+                # 兼容旧配置：冻结区仅“类型”一列
+                self.accessory_list_frozen.setColumnWidth(0, 42)
+                self.accessory_list_frozen.setColumnWidth(1, int(widths[0]))
+                start_idx = 1
+                scroll_count = 7
+            for i in range(scroll_count):
+                w = int(widths[i + start_idx])
+                # 末两列限制到更紧凑宽度，避免历史配置导致“创建时间/操作”过宽。
+                if i == scroll_count - 2:
+                    w = max(120, min(w, 160))
+                elif i == scroll_count - 1:
+                    w = max(90, min(w, 110))
+                self.accessory_list_table.setColumnWidth(i, w)
+            self._on_accessory_frozen_section_resized()
+        except Exception:
+            return
+
+    def _save_accessory_list_col_widths(self, *_args):
+        if not hasattr(self, "accessory_list_frozen"):
+            return
+        widths = [self.accessory_list_frozen.columnWidth(0), self.accessory_list_frozen.columnWidth(1)] + [
+            self.accessory_list_table.columnWidth(i) for i in range(7)
+        ]
+        self._ui_prefs = dict(getattr(self, "_ui_prefs", {}))
+        self._ui_prefs["accessory_list_col_widths"] = widths
+        self.save_theme()
 
     def apply_theme(self):
         self.setStyleSheet(STYLESHEET_DARK if self.theme == "dark" else STYLESHEET_LIGHT)
@@ -742,17 +911,19 @@ class BillApp(QMainWindow):
 
     def _restyle_sidebar_nav(self, page: str):
         styles = {
-            "bill": ("navActive", "navNormal", "navNormal", "navNormal", "navNormal", "navNormal"),
-            "history": ("navNormal", "navActive", "navNormal", "navNormal", "navNormal", "navNormal"),
-            "print": ("navNormal", "navNormal", "navActive", "navNormal", "navNormal", "navNormal"),
-            "excel_tools": ("navNormal", "navNormal", "navNormal", "navActive", "navNormal", "navNormal"),
-            "accessory": ("navNormal", "navNormal", "navNormal", "navNormal", "navActive", "navNormal"),
-            "settings": ("navNormal", "navNormal", "navNormal", "navNormal", "navNormal", "navActive"),
+            "bill": ("navActive", "navNormal", "navNormal", "navNormal", "navNormal", "navNormal", "navNormal"),
+            "receipt": ("navNormal", "navActive", "navNormal", "navNormal", "navNormal", "navNormal", "navNormal"),
+            "history": ("navNormal", "navNormal", "navActive", "navNormal", "navNormal", "navNormal", "navNormal"),
+            "print": ("navNormal", "navNormal", "navNormal", "navActive", "navNormal", "navNormal", "navNormal"),
+            "excel_tools": ("navNormal", "navNormal", "navNormal", "navNormal", "navActive", "navNormal", "navNormal"),
+            "accessory": ("navNormal", "navNormal", "navNormal", "navNormal", "navNormal", "navActive", "navNormal"),
+            "settings": ("navNormal", "navNormal", "navNormal", "navNormal", "navNormal", "navNormal", "navActive"),
         }
         names = styles[page]
         for w, oname in zip(
             (
                 self.nav_bill,
+                self.nav_receipt,
                 self.nav_history,
                 self.nav_print_records,
                 self.nav_excel_tools,
@@ -766,8 +937,15 @@ class BillApp(QMainWindow):
             w.style().polish(w)
 
     def show_bill_page(self):
+        self._switch_business("bill")
         self.content_stack.setCurrentIndex(0)
         self._restyle_sidebar_nav("bill")
+        self.apply_theme()
+
+    def show_receipt_page(self):
+        self._switch_business("receipt")
+        self.content_stack.setCurrentIndex(0)
+        self._restyle_sidebar_nav("receipt")
         self.apply_theme()
 
     def show_history_page(self):
@@ -806,12 +984,42 @@ class BillApp(QMainWindow):
         d["allow_print_url"] = True
         d["print_count"] = 0
         d["last_printed_at"] = ""
+        d["age_max"] = "55"
+        d["pv"] = "1"
         return d
 
+    def _current_business_noun(self) -> str:
+        return "提单" if self.current_business == "bill" else "回执"
+
+    def _current_business_table_name(self) -> str:
+        return "提单表" if self.current_business == "bill" else "回执管理"
+
+    def _current_data_file(self) -> Path:
+        return DATA_FILE if self.current_business == "bill" else RECEIPT_DATA_FILE
+
+    def _switch_business(self, business: str):
+        if business not in ("bill", "receipt"):
+            return
+        if business == self.current_business:
+            return
+        # 切页前保存当前业务数据，保证提单与回执数据互不覆盖。
+        self.save_data()
+        self.current_business = business
+        self.filtered_indices = []
+        self.select_all_state = False
+        self.field_errors.clear()
+        self.field_error_msgs.clear()
+        self.header_filters.clear()
+        self.header_sort_field = None
+        self.header_sort_order = Qt.SortOrder.AscendingOrder
+        self.load_data()
+        self.refresh_table()
+
     def load_data(self):
-        if DATA_FILE.exists():
+        data_file = self._current_data_file()
+        if data_file.exists():
             try:
-                self.records = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+                self.records = json.loads(data_file.read_text(encoding="utf-8"))
             except Exception:
                 self.records = []
         for rec in self.records:
@@ -869,7 +1077,7 @@ class BillApp(QMainWindow):
         for rec in self.records:
             if self.is_row_saved(rec) and not str(rec.get("created_at", "")).strip():
                 rec["created_at"] = stamp
-        DATA_FILE.write_text(json.dumps(self.records, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._current_data_file().write_text(json.dumps(self.records, ensure_ascii=False, indent=2), encoding="utf-8")
         self.lbl_save.setText("已自动保存")
 
     def save_history_data(self):
@@ -925,12 +1133,14 @@ class BillApp(QMainWindow):
                 "node_type": ntype,
                 "desc": str(node.get("desc", "") or "").strip(),
                 "url": str(node.get("url", "") or "").strip(),
+                "remark": str(node.get("remark", "") or "").strip(),
                 "created_at": str(node.get("created_at", "") or "").strip() or datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
                 "children": [],
             }
             if ntype in ("root", "branch"):
                 out["desc"] = ""
                 out["url"] = ""
+                out["remark"] = ""
                 for ch in node.get("children", []) or []:
                     if isinstance(ch, dict):
                         out["children"].append(normalize(ch))
@@ -983,6 +1193,7 @@ class BillApp(QMainWindow):
                                 "node_type": "leaf",
                                 "desc": lf["desc"],
                                 "url": lf["url"],
+                                "remark": str(lf.get("remark", "") or ""),
                                 "created_at": lf["created_at"],
                                 "children": [],
                             }
@@ -1093,14 +1304,6 @@ class BillApp(QMainWindow):
                 missing.append(d)
         return out, missing
 
-    @staticmethod
-    def _is_valid_http_url(url: str) -> bool:
-        u = str(url or "").strip()
-        if not u:
-            return False
-        p = urlparse(u)
-        return p.scheme.lower() in ("http", "https") and bool(p.netloc)
-
     def refresh_accessory_tree(self):
         if not hasattr(self, "accessory_graph"):
             return
@@ -1110,9 +1313,542 @@ class BillApp(QMainWindow):
             btn_center_global = self.btn_acc_add.mapToGlobal(self.btn_acc_add.rect().center())
             scene_pt = self.accessory_graph.mapToScene(self.accessory_graph.mapFromGlobal(btn_center_global))
             self.accessory_graph.set_root_anchor_scene_x(scene_pt.x())
+        self._refresh_accessory_list_table(kw)
+        self._refresh_accessory_list_table(kw)
 
     def _on_accessory_graph_selected(self, node_id: str):
         self._accessory_selected_node_id = node_id
+
+    def on_accessory_mode_changed(self, *_args):
+        mode = str(self.accessory_mode_combo.currentData() or "tree")
+        if mode == "list":
+            self.accessory_view_stack.setCurrentWidget(self.accessory_list_split)
+            self.btn_acc_add.hide()
+            self.btn_acc_add_row.show()
+            self.btn_acc_delete_selected.show()
+            self.btn_acc_delete.hide()
+        else:
+            self.accessory_view_stack.setCurrentWidget(self.accessory_graph)
+            self.btn_acc_add.show()
+            self.btn_acc_add_row.hide()
+            self.btn_acc_delete.show()
+            self.btn_acc_delete_selected.hide()
+        self.refresh_accessory_tree()
+
+    def clear_accessory_search_and_filters(self):
+        self.accessory_search.setText("")
+        self.accessory_header_filters.clear()
+        self.accessory_sort_field = None
+        self.accessory_sort_order = Qt.SortOrder.AscendingOrder
+        self.refresh_accessory_tree()
+
+    def _refresh_accessory_list_table(self, kw: str):
+        if not hasattr(self, "accessory_list_table"):
+            return
+        selected_id = str(getattr(self, "_accessory_selected_node_id", "root") or "root")
+        rows: list[dict[str, str]] = []
+        for d in list(self._accessory_draft_rows):
+            rows.append(
+                {
+                    "id": str(d.get("id", "") or ""),
+                    "type": str(d.get("type", "") or ""),
+                    "channel": str(d.get("channel", "") or ""),
+                    "name": str(d.get("name", "") or ""),
+                    "desc": str(d.get("desc", "") or ""),
+                    "url": str(d.get("url", "") or ""),
+                    "remark": str(d.get("remark", "") or ""),
+                    "created": str(d.get("created", "") or ""),
+                }
+            )
+        for node, parent in self._iter_accessory_nodes():
+            ntype = str(node.get("node_type", ""))
+            if ntype != "leaf":
+                continue
+            nid = str(node.get("id", ""))
+            path = self._find_node_path_names(nid)
+            acc_type = path[0] if len(path) > 0 else ""
+            channel = path[1] if len(path) > 1 else ""
+            name = path[2] if len(path) > 2 else ""
+            desc = str(node.get("desc", "") or "")
+            url = str(node.get("url", "") or "")
+            remark = str(node.get("remark", "") or "")
+            created = str(node.get("created_at", "") or "")
+            text_blob = f"{acc_type} {channel} {name} {desc} {url} {remark}".lower()
+            if kw and kw not in text_blob:
+                continue
+            if not self._accessory_row_matches_header_filters_except(node, parent, None):
+                continue
+            rows.append(
+                {
+                    "id": nid,
+                    "type": acc_type,
+                    "channel": channel,
+                    "name": name,
+                    "desc": desc,
+                    "url": url,
+                    "remark": remark,
+                    "created": created,
+                }
+            )
+        draft_count = len(self._accessory_draft_rows)
+        draft_rows = rows[:draft_count]
+        data_rows = rows[draft_count:]
+        if self.accessory_sort_field:
+            rev = self.accessory_sort_order == Qt.SortOrder.DescendingOrder
+            sf = self.accessory_sort_field
+            key_map = {
+                "acc_type": "type",
+                "acc_channel": "channel",
+                "acc_name": "name",
+                "acc_desc": "desc",
+                "acc_url": "url",
+                "acc_remark": "remark",
+                "acc_created": "created",
+            }
+            data_rows.sort(key=lambda r, f=sf: str(r.get(key_map.get(f, "name"), "") or "").lower(), reverse=rev)
+        else:
+            data_rows.sort(key=lambda r: (str(r.get("type", "")).lower(), str(r.get("channel", "")).lower(), str(r.get("name", "")).lower(), str(r.get("desc", "")).lower()))
+        rows = draft_rows + data_rows
+        self.accessory_list_row_node_ids = [r["id"] for r in rows]
+        self.accessory_list_frozen.blockSignals(True)
+        self.accessory_list_table.blockSignals(True)
+        self._acc_list_updating = True
+        try:
+            self.accessory_list_frozen.setRowCount(len(rows))
+            self.accessory_list_table.setRowCount(len(rows))
+            for row, rec in enumerate(rows):
+                ph0f = QTableWidgetItem("")
+                ph0f.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                if rec["id"] in self._accessory_checked_node_ids:
+                    ph0f.setCheckState(Qt.CheckState.Checked)
+                else:
+                    ph0f.setCheckState(Qt.CheckState.Unchecked)
+                ph0f.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.accessory_list_frozen.setItem(row, 0, ph0f)
+                n_item = QTableWidgetItem(rec["type"])
+                n_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                n_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
+                self.accessory_list_frozen.setItem(row, 1, n_item)
+                vals = [rec["channel"], rec["name"], rec["desc"], first_url(rec["url"]), rec["remark"], rec["created"]]
+                for col, val in enumerate(vals):
+                    it = QTableWidgetItem(val)
+                    table_col = col
+                    if col in (0, 1, 2, 3, 4):
+                        it.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                    else:
+                        it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    if col <= 4 and col != 3:
+                        flags |= Qt.ItemFlag.ItemIsEditable
+                    it.setFlags(flags)
+                    self.accessory_list_table.setItem(row, table_col, it)
+                op_wrap = QWidget()
+                op_lo = QHBoxLayout(op_wrap)
+                op_lo.setContentsMargins(4, 2, 4, 2)
+                op_lo.setSpacing(0)
+                op_lo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                bdel = QPushButton("🗑 删除")
+                bdel.setObjectName("btnDanger")
+                bdel.setFixedSize(92, 30)
+                nid = rec["id"]
+                if nid.startswith("draft-"):
+                    bdel.clicked.connect(lambda _=False, x=nid: self._remove_accessory_draft_row(x))
+                else:
+                    bdel.clicked.connect(lambda _=False, x=nid: self.delete_accessory_leaf_by_id(x))
+                op_lo.addWidget(bdel)
+                self.accessory_list_table.setCellWidget(row, 6, op_wrap)
+                self.accessory_list_frozen.setRowHeight(row, self._data_row_height)
+                self.accessory_list_table.setRowHeight(row, self._data_row_height)
+        finally:
+            self._acc_list_updating = False
+            self.accessory_list_frozen.blockSignals(False)
+            self.accessory_list_table.blockSignals(False)
+        if not rows:
+            self._update_accessory_header_check()
+            self._refresh_accessory_header_labels()
+            self._update_accessory_header_sort_indicator()
+            self._update_accessory_header_tooltips()
+            return
+        target_row = 0
+        for i, nid in enumerate(self.accessory_list_row_node_ids):
+            if nid == selected_id:
+                target_row = i
+                break
+        self.accessory_list_frozen.selectRow(target_row)
+        self._refresh_accessory_header_labels()
+        self._update_accessory_header_check()
+        self._update_accessory_header_sort_indicator()
+        self._update_accessory_header_tooltips()
+
+    def _on_accessory_list_selection_changed(self):
+        if not hasattr(self, "accessory_list_table"):
+            return
+        row = self.accessory_list_frozen.currentRow()
+        if row < 0:
+            row = self.accessory_list_table.currentRow()
+        if row < 0 or row >= len(self.accessory_list_row_node_ids):
+            return
+        self._accessory_selected_node_id = self.accessory_list_row_node_ids[row]
+
+    def _on_accessory_list_frozen_cell_clicked(self, row: int, col: int):
+        if self._acc_list_updating:
+            return
+        if col != 0:
+            return
+        it = self.accessory_list_frozen.item(row, 0)
+        if it is None:
+            return
+        nxt = Qt.CheckState.Unchecked if it.checkState() == Qt.CheckState.Checked else Qt.CheckState.Checked
+        it.setCheckState(nxt)
+
+    def _on_accessory_list_cell_double_clicked(self, row: int, col: int):
+        # URL 列使用弹窗多行编辑，列表仅展示第一条。
+        if col != 3:
+            return
+        if row < 0 or row >= len(self.accessory_list_row_node_ids):
+            return
+        node_id = self.accessory_list_row_node_ids[row]
+        if str(node_id).startswith("draft-"):
+            cur = str((self.accessory_list_table.item(row, 3).text() if self.accessory_list_table.item(row, 3) else "")).strip()
+        else:
+            node, _parent = self._find_accessory_node(node_id)
+            if node is None or node.get("node_type") != "leaf":
+                return
+            cur = str(node.get("url", "") or "")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("编辑URL（多行）")
+        dlg.resize(620, 420)
+        lo = QVBoxLayout(dlg)
+        lo.setContentsMargins(12, 12, 12, 12)
+        lo.setSpacing(8)
+        lo.addWidget(QLabel("每行一个URL："))
+        ed = QPlainTextEdit(cur)
+        ed.setPlaceholderText("可输入多行URL")
+        lo.addWidget(ed, 1)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        lo.addWidget(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        idx = self.accessory_list_table.model().index(row, 3)
+        rect = self.accessory_list_table.visualRect(idx)
+        anchor = self.accessory_list_table.viewport().mapToGlobal(rect.bottomLeft())
+        self._place_dialog_below_rect(dlg, anchor, rect.width())
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_url = str(ed.toPlainText() or "").strip()
+        if str(node_id).startswith("draft-"):
+            self._acc_list_updating = True
+            try:
+                show_first = first_url(new_url)
+                cur_item = self.accessory_list_table.item(row, 3)
+                if cur_item is None:
+                    cur_item = QTableWidgetItem(show_first)
+                    self.accessory_list_table.setItem(row, 3, cur_item)
+                else:
+                    cur_item.setText(show_first)
+            finally:
+                self._acc_list_updating = False
+            self._commit_or_update_accessory_draft_row(row, node_id, url_override=new_url)
+            return
+        node["url"] = new_url
+        self.save_accessories()
+        self.refresh_accessory_tree()
+
+    def _on_accessory_list_item_changed(self, _item: QTableWidgetItem):
+        if self._acc_list_updating:
+            return
+        if _item.tableWidget() is self.accessory_list_frozen and _item.column() == 0:
+            self._on_accessory_list_checkbox_changed(
+                _item.row(), _item.checkState() == Qt.CheckState.Checked
+            )
+            return
+        row = self.accessory_list_frozen.currentRow()
+        if row < 0:
+            row = self.accessory_list_table.currentRow()
+        if row < 0 or row >= len(self.accessory_list_row_node_ids):
+            return
+        node_id = self.accessory_list_row_node_ids[row]
+        if str(node_id).startswith("draft-"):
+            self._commit_or_update_accessory_draft_row(row, node_id)
+            return
+        node, old_parent = self._find_accessory_node(node_id)
+        if node is None or old_parent is None or node.get("node_type") != "leaf":
+            return
+        acc_type = str((self.accessory_list_frozen.item(row, 1).text() if self.accessory_list_frozen.item(row, 1) else "")).strip()
+        channel = str((self.accessory_list_table.item(row, 0).text() if self.accessory_list_table.item(row, 0) else "")).strip()
+        name = str((self.accessory_list_table.item(row, 1).text() if self.accessory_list_table.item(row, 1) else "")).strip()
+        desc = str((self.accessory_list_table.item(row, 2).text() if self.accessory_list_table.item(row, 2) else "")).strip()
+        url = str((self.accessory_list_table.item(row, 3).text() if self.accessory_list_table.item(row, 3) else "")).strip()
+        remark = str((self.accessory_list_table.item(row, 4).text() if self.accessory_list_table.item(row, 4) else "")).strip()
+        if not all([acc_type, channel, name, desc, url]):
+            QMessageBox.warning(self, "提示", "类型、渠道、名称、描述、URL 不能为空")
+            self.refresh_accessory_tree()
+            return
+        target_branch = self._ensure_accessory_branch_path(acc_type, channel, name)
+        key = self._leaf_unique_key(target_branch, desc)
+        if self._leaf_key_exists(key, exclude_id=node_id):
+            QMessageBox.warning(self, "提示", "同一“类目+渠道+名称+描述”不允许重复")
+            self.refresh_accessory_tree()
+            return
+        if str(old_parent.get("id", "")) != str(target_branch.get("id", "")):
+            old_parent["children"] = [x for x in (old_parent.get("children", []) or []) if str(x.get("id", "")) != node_id]
+            target_branch.setdefault("children", []).append(node)
+        node["name"] = desc
+        node["desc"] = desc
+        node["url"] = url
+        node["remark"] = remark
+        self.save_accessories()
+        self.refresh_accessory_tree()
+
+    def _remove_accessory_draft_row(self, draft_id: str):
+        before = len(self._accessory_draft_rows)
+        self._accessory_draft_rows = [r for r in self._accessory_draft_rows if str(r.get("id", "")) != draft_id]
+        if len(self._accessory_draft_rows) == before:
+            return
+        self._accessory_checked_node_ids.discard(draft_id)
+        self._accessory_selected_node_id = "root"
+        self.refresh_accessory_tree()
+
+    def _commit_or_update_accessory_draft_row(self, row: int, draft_id: str, url_override: str | None = None):
+        acc_type = str((self.accessory_list_frozen.item(row, 1).text() if self.accessory_list_frozen.item(row, 1) else "")).strip()
+        channel = str((self.accessory_list_table.item(row, 0).text() if self.accessory_list_table.item(row, 0) else "")).strip()
+        name = str((self.accessory_list_table.item(row, 1).text() if self.accessory_list_table.item(row, 1) else "")).strip()
+        desc = str((self.accessory_list_table.item(row, 2).text() if self.accessory_list_table.item(row, 2) else "")).strip()
+        if url_override is None:
+            url = str((self.accessory_list_table.item(row, 3).text() if self.accessory_list_table.item(row, 3) else "")).strip()
+        else:
+            url = str(url_override).strip()
+        remark = str((self.accessory_list_table.item(row, 4).text() if self.accessory_list_table.item(row, 4) else "")).strip()
+        created = str((self.accessory_list_table.item(row, 5).text() if self.accessory_list_table.item(row, 5) else "")).strip()
+        for d in self._accessory_draft_rows:
+            if str(d.get("id", "")) == draft_id:
+                d["type"] = acc_type
+                d["channel"] = channel
+                d["name"] = name
+                d["desc"] = desc
+                d["url"] = url
+                d["remark"] = remark
+                d["created"] = created or str(d.get("created", "") or datetime.now().strftime("%Y/%m/%d %H:%M:%S"))
+                break
+        if not all([acc_type, channel, name, desc, url]):
+            return
+        target_branch = self._ensure_accessory_branch_path(acc_type, channel, name)
+        key = self._leaf_unique_key(target_branch, desc)
+        if self._leaf_key_exists(key):
+            QMessageBox.warning(self, "提示", "同一“类目+渠道+名称+描述”不允许重复")
+            return
+        child = {
+            "id": str(uuid.uuid4()),
+            "name": desc,
+            "node_type": "leaf",
+            "desc": desc,
+            "url": url,
+            "remark": remark,
+            "created_at": created or datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+            "children": [],
+        }
+        target_branch.setdefault("children", []).append(child)
+        self._remove_accessory_draft_row(draft_id)
+        self._accessory_selected_node_id = str(child["id"])
+        self.save_accessories()
+        self.refresh_accessory_tree()
+
+    def _accessory_row_display_value(self, node: dict[str, Any], parent: dict[str, Any] | None, field: str) -> str:
+        nid = str(node.get("id", ""))
+        path = self._find_node_path_names(nid)
+        if field == "acc_type":
+            return path[0] if len(path) > 0 else ""
+        if field == "acc_channel":
+            return path[1] if len(path) > 1 else ""
+        if field == "acc_name":
+            return path[2] if len(path) > 2 else ""
+        if field == "acc_desc":
+            return str(node.get("desc", "") or "")
+        if field == "acc_url":
+            return str(node.get("url", "") or "")
+        if field == "acc_remark":
+            return str(node.get("remark", "") or "")
+        if field == "acc_created":
+            return str(node.get("created_at", "") or "")
+        return ""
+
+    def _accessory_row_matches_header_filters_except(self, node: dict[str, Any], parent: dict[str, Any] | None, skip_field: str | None) -> bool:
+        for field, vals in self.accessory_header_filters.items():
+            if skip_field and field == skip_field:
+                continue
+            if not vals:
+                continue
+            if self._accessory_row_display_value(node, parent, field) not in vals:
+                return False
+        return True
+
+    def _unique_display_values_accessory(self, field: str) -> list[str]:
+        kw = self.accessory_search.text().strip().lower()
+        out: list[str] = []
+        seen: set[str] = set()
+        for node, parent in self._iter_accessory_nodes():
+            ntype = str(node.get("node_type", ""))
+            if ntype != "leaf":
+                continue
+            text_blob = " ".join(
+                [
+                    self._accessory_row_display_value(node, parent, "acc_type"),
+                    self._accessory_row_display_value(node, parent, "acc_channel"),
+                    self._accessory_row_display_value(node, parent, "acc_name"),
+                    self._accessory_row_display_value(node, parent, "acc_desc"),
+                    self._accessory_row_display_value(node, parent, "acc_url"),
+                    self._accessory_row_display_value(node, parent, "acc_remark"),
+                ]
+            ).lower()
+            if kw and kw not in text_blob:
+                continue
+            if not self._accessory_row_matches_header_filters_except(node, parent, field):
+                continue
+            dv = self._accessory_row_display_value(node, parent, field)
+            if dv not in seen:
+                seen.add(dv)
+                out.append(dv)
+        out.sort(key=lambda s: (s == "", s.casefold()))
+        return out
+
+    def _toggle_accessory_sort_for_field(self, field: str):
+        if self.accessory_sort_field == field:
+            if self.accessory_sort_order == Qt.SortOrder.AscendingOrder:
+                self.accessory_sort_order = Qt.SortOrder.DescendingOrder
+            else:
+                self.accessory_sort_field = None
+                self.accessory_sort_order = Qt.SortOrder.AscendingOrder
+        else:
+            self.accessory_sort_field = field
+            self.accessory_sort_order = Qt.SortOrder.AscendingOrder
+        self.refresh_accessory_tree()
+
+    def _on_accessory_frozen_header_clicked(self, section: int):
+        if section == 0:
+            self._on_frozen_header_col0_clicked("acc_frozen")
+            return
+        field = self._field_for_header_section("acc_frozen", section)
+        if not field:
+            return
+        self._toggle_accessory_sort_for_field(field)
+
+    def _on_accessory_scroll_header_clicked(self, section: int):
+        field = self._field_for_header_section("acc_scroll", section)
+        if not field:
+            return
+        self._toggle_accessory_sort_for_field(field)
+
+    def _sync_accessory_v_scroll(self, value: int, source: str):
+        if self._acc_v_sync:
+            return
+        self._acc_v_sync = True
+        try:
+            if source == "scroll":
+                self.accessory_list_frozen.verticalScrollBar().setValue(value)
+            else:
+                self.accessory_list_table.verticalScrollBar().setValue(value)
+        finally:
+            self._acc_v_sync = False
+
+    def _sync_selection_accessory_to_frozen(self):
+        if self._acc_sel_sync or self.accessory_list_table.selectionModel() is None:
+            return
+        self._acc_sel_sync = True
+        try:
+            self.accessory_list_frozen.clearSelection()
+            for idx in self.accessory_list_table.selectionModel().selectedRows():
+                self.accessory_list_frozen.selectRow(idx.row())
+        finally:
+            self._acc_sel_sync = False
+
+    def _sync_selection_accessory_frozen_to_scroll(self):
+        if self._acc_sel_sync or self.accessory_list_frozen.selectionModel() is None:
+            return
+        self._acc_sel_sync = True
+        try:
+            self.accessory_list_table.clearSelection()
+            for idx in self.accessory_list_frozen.selectionModel().selectedRows():
+                self.accessory_list_table.selectRow(idx.row())
+        finally:
+            self._acc_sel_sync = False
+
+    def _update_accessory_header_sort_indicator(self):
+        hf = self.accessory_list_frozen.horizontalHeader()
+        hs = self.accessory_list_table.horizontalHeader()
+        hf.setSortIndicatorShown(False)
+        hs.setSortIndicatorShown(False)
+        if not self.accessory_sort_field:
+            return
+        if self.accessory_sort_field == "acc_type":
+            hf.setSortIndicatorShown(True)
+            hf.setSortIndicator(1, self.accessory_sort_order)
+            return
+        fmap = ["acc_channel", "acc_name", "acc_desc", "acc_url", "acc_remark", "acc_created", None]
+        if self.accessory_sort_field in fmap:
+            sec = fmap.index(self.accessory_sort_field)
+            hs.setSortIndicatorShown(True)
+            hs.setSortIndicator(sec, self.accessory_sort_order)
+
+    def _update_accessory_header_tooltips(self):
+        frozen_title = self.accessory_list_frozen.horizontalHeaderItem(1)
+        if frozen_title:
+            tip = "类型\n单击：排序；悬停右侧 ▼ 筛选"
+            vals = self.accessory_header_filters.get("acc_type", set())
+            if vals:
+                tip += f"\n已选 {len(vals)} 项"
+            frozen_title.setToolTip(tip)
+        titles = ["渠道", "名称", "描述", "URL", "备注", "创建时间", "操作"]
+        for sec, title in enumerate(titles):
+            field = self._field_for_header_section("acc_scroll", sec)
+            if not field:
+                continue
+            tip = title + "\n单击：排序；悬停右侧 ▼ 筛选"
+            vals = self.accessory_header_filters.get(field, set())
+            if vals:
+                tip += f"\n已选 {len(vals)} 项"
+            it = self.accessory_list_table.horizontalHeaderItem(sec)
+            if it:
+                it.setToolTip(tip)
+
+    def _refresh_accessory_header_labels(self):
+        def filtered_text(base: str, field: str) -> str:
+            vals = self.accessory_header_filters.get(field, set())
+            return f"{base} (筛:{len(vals)})" if vals else base
+
+        self.accessory_list_frozen.setHorizontalHeaderItem(0, QTableWidgetItem("☐"))
+        self.accessory_list_frozen.setHorizontalHeaderItem(1, QTableWidgetItem(filtered_text("类型", "acc_type")))
+        titles = [
+            ("渠道", "acc_channel"),
+            ("名称", "acc_name"),
+            ("描述", "acc_desc"),
+            ("URL", "acc_url"),
+            ("备注", "acc_remark"),
+            ("创建时间", "acc_created"),
+            ("操作", ""),
+        ]
+        for sec, (base, field) in enumerate(titles):
+            txt = filtered_text(base, field) if field else base
+            self.accessory_list_table.setHorizontalHeaderItem(sec, QTableWidgetItem(txt))
+
+    def _update_accessory_header_check(self):
+        if not hasattr(self, "accessory_list_frozen"):
+            return
+        it = self.accessory_list_frozen.horizontalHeaderItem(0)
+        if it is None:
+            return
+        n = len(self.accessory_list_row_node_ids)
+        if n == 0:
+            it.setText("☐")
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            return
+        checked_count = sum(1 for nid in self.accessory_list_row_node_ids if nid in self._accessory_checked_node_ids)
+        symbol = "☐" if checked_count == 0 else ("☑" if checked_count == n else "◩")
+        it.setText(symbol)
+        it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
     def _selected_accessory_node(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         rid = str(getattr(self, "_accessory_selected_node_id", "root") or "root")
@@ -1123,6 +1859,12 @@ class BillApp(QMainWindow):
         dlg.setWindowTitle(title)
         dlg.resize(600, 400)
         form = QFormLayout(dlg)
+        # Mac 下原生控件视觉更紧凑，统一放大输入控件与间距，减少跨平台观感差异。
+        is_mac = sys.platform == "darwin"
+        form.setContentsMargins(22, 20, 22, 18)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(14 if is_mac else 12)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         cmb_type = QComboBox()
         cmb_type.addItem("枝干", "branch")
         cmb_type.addItem("叶子", "leaf")
@@ -1131,6 +1873,13 @@ class BillApp(QMainWindow):
         name = QLineEdit(str((preset or {}).get("name", "") or ""))
         desc = QLineEdit(str((preset or {}).get("desc", "") or ""))
         url = QLineEdit(str((preset or {}).get("url", "") or ""))
+        ctrl_h = 38 if is_mac else 34
+        cmb_type.setMinimumHeight(ctrl_h)
+        cmb_type.setMinimumWidth(220)
+        name.setMinimumHeight(ctrl_h)
+        desc.setMinimumHeight(ctrl_h)
+        url.setMinimumHeight(ctrl_h)
+        btn_h = 40 if is_mac else 36
         row_type = "节点种类"
         row_name = "名称"
         row_desc = "描述"
@@ -1140,6 +1889,9 @@ class BillApp(QMainWindow):
         form.addRow(row_desc, desc)
         form.addRow(row_url, url)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        for b in btns.buttons():
+            b.setMinimumHeight(btn_h)
+            b.setMinimumWidth(96)
         form.addRow(btns)
 
         def update_visible():
@@ -1189,11 +1941,6 @@ class BillApp(QMainWindow):
             out["name"] = out["desc"]
         return out
 
-    @staticmethod
-    def _is_http_url(text: str) -> bool:
-        u = str(text or "").strip().lower()
-        return u.startswith("http://") or u.startswith("https://")
-
     def add_accessory(self):
         node, _parent = self._selected_accessory_node()
         if node is None:
@@ -1203,9 +1950,6 @@ class BillApp(QMainWindow):
             return
         data = self._open_accessory_node_dialog("新增节点")
         if not data:
-            return
-        if data["node_type"] == "leaf" and not self._is_http_url(data["url"]):
-            QMessageBox.warning(self, "提示", "URL格式错误（必须以 http:// 或 https:// 开头）")
             return
         if data["node_type"] == "leaf":
             key = self._leaf_unique_key(node, data["desc"])
@@ -1225,20 +1969,34 @@ class BillApp(QMainWindow):
         self.save_accessories()
         self.refresh_accessory_tree()
 
+    def add_accessory_row(self):
+        mode = str(self.accessory_mode_combo.currentData() or "tree")
+        if mode != "list":
+            return
+        draft_id = f"draft-{uuid.uuid4()}"
+        now_ts = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        self._accessory_draft_rows.insert(
+            0,
+            {
+                "id": draft_id,
+                "type": "",
+                "channel": "",
+                "name": "",
+                "desc": "",
+                "url": "",
+                "remark": "",
+                "created": now_ts,
+            },
+        )
+        self._accessory_selected_node_id = draft_id
+        self.refresh_accessory_tree()
+
     def update_accessory(self):
         node, _parent = self._selected_accessory_node()
         if node is None or node.get("node_type") == "root":
             return
         data = self._open_accessory_node_dialog("编辑节点", preset=node, allow_type_change=False)
         if not data:
-            return
-        if node.get("node_type") == "leaf" and not self._is_http_url(data["url"]):
-            QMessageBox.warning(self, "提示", "URL格式错误，已删除该叶子节点")
-            _cur, parent = self._find_accessory_node(str(node.get("id", "")))
-            if parent is not None:
-                parent["children"] = [x for x in (parent.get("children", []) or []) if x.get("id") != node.get("id")]
-                self.save_accessories()
-                self.refresh_accessory_tree()
             return
         if node.get("node_type") == "leaf":
             _cur, parent = self._find_accessory_node(str(node.get("id", "")))
@@ -1253,6 +2011,94 @@ class BillApp(QMainWindow):
         self.save_accessories()
         self.refresh_accessory_tree()
 
+    def copy_accessory_leaf(self):
+        node, _parent = self._selected_accessory_node()
+        if node is None:
+            return
+        if node.get("node_type") != "leaf":
+            QMessageBox.information(self, "提示", "请选择叶子节点后再复制")
+            return
+        base_desc = str(node.get("desc", "") or node.get("name", "") or "").strip()
+        if not base_desc:
+            QMessageBox.warning(self, "提示", "当前叶子节点描述为空，无法复制")
+            return
+        target_branch = self._pick_accessory_branch_for_copy()
+        if target_branch is None:
+            return
+        if self._leaf_key_exists(self._leaf_unique_key(target_branch, base_desc)):
+            QMessageBox.warning(self, "提示", "目标枝干下已存在同描述叶子，无法复制")
+            return
+        child = {
+            "id": str(uuid.uuid4()),
+            "name": base_desc,
+            "node_type": "leaf",
+            "desc": base_desc,
+            "url": str(node.get("url", "") or ""),
+            "created_at": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+            "children": [],
+        }
+        target_branch.setdefault("children", []).append(child)
+        self.save_accessories()
+        self.refresh_accessory_tree()
+        target_name = str(target_branch.get("name", "") or "配件表")
+        QMessageBox.information(self, "复制成功", f"已复制叶子节点：{base_desc}\n目标枝干：{target_name}")
+
+    def _pick_accessory_branch_for_copy(self) -> dict[str, Any] | None:
+        """弹窗选择复制目标枝干（树形，仅显示根/枝干）。"""
+        if not isinstance(self.accessories_root, dict):
+            QMessageBox.warning(self, "提示", "未找到可用枝干节点")
+            return None
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("选择目标枝干")
+        dlg.resize(520, 420)
+        lo = QVBoxLayout(dlg)
+        lo.setContentsMargins(12, 12, 12, 12)
+        lo.setSpacing(8)
+        lo.addWidget(QLabel("请选择要复制到的枝干："))
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["枝干"])
+        tree.header().setStretchLastSection(True)
+        tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
+        lo.addWidget(tree, 1)
+
+        def add_branch_item(node: dict[str, Any], parent_item: QTreeWidgetItem | None):
+            ntype = str(node.get("node_type", "") or "")
+            if ntype not in ("root", "branch"):
+                return
+            txt = str(node.get("name", "") or "").strip() or "配件表"
+            item = QTreeWidgetItem([txt])
+            item.setData(0, Qt.ItemDataRole.UserRole, str(node.get("id", "")))
+            if parent_item is None:
+                tree.addTopLevelItem(item)
+            else:
+                parent_item.addChild(item)
+            for ch in node.get("children", []) or []:
+                if isinstance(ch, dict):
+                    add_branch_item(ch, item)
+
+        add_branch_item(self.accessories_root, None)
+        tree.expandAll()
+        if tree.topLevelItemCount() > 0:
+            tree.setCurrentItem(tree.topLevelItem(0))
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        lo.addWidget(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        tree.itemDoubleClicked.connect(lambda _it, _col: dlg.accept())
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        it = tree.currentItem()
+        if it is None:
+            QMessageBox.information(self, "提示", "请先选择目标枝干")
+            return None
+        nid = str(it.data(0, Qt.ItemDataRole.UserRole) or "")
+        node, _p = self._find_accessory_node(nid)
+        if node is None or node.get("node_type") not in ("root", "branch"):
+            QMessageBox.warning(self, "提示", "目标枝干无效，请重试")
+            return None
+        return node
+
     def _used_urls_in_bills(self) -> set[str]:
         used: set[str] = set()
         for rec in self.records:
@@ -1263,9 +2109,105 @@ class BillApp(QMainWindow):
                     used.add(s)
         return used
 
-    def _node_or_descendants_used(self, node: dict[str, Any], used_urls: set[str]) -> bool:
-        if node.get("node_type") == "leaf" and str(node.get("url", "")).strip() in used_urls:
+    def _ensure_accessory_branch_path(self, acc_type: str, channel: str, name: str) -> dict[str, Any]:
+        def ensure_child(parent: dict[str, Any], child_name: str) -> dict[str, Any]:
+            for ch in parent.get("children", []) or []:
+                if isinstance(ch, dict) and ch.get("node_type") == "branch" and str(ch.get("name", "")) == child_name:
+                    return ch
+            new_node = {
+                "id": str(uuid.uuid4()),
+                "name": child_name,
+                "node_type": "branch",
+                "desc": "",
+                "url": "",
+                "remark": "",
+                "created_at": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+                "children": [],
+            }
+            parent.setdefault("children", []).append(new_node)
+            return new_node
+
+        type_node = ensure_child(self.accessories_root, acc_type)
+        channel_node = ensure_child(type_node, channel)
+        name_node = ensure_child(channel_node, name)
+        return name_node
+
+    def _leaf_desc_used_in_bills(self, desc: str) -> bool:
+        used = self._used_urls_in_bills()
+        return str(desc or "").strip() in used
+
+    def _on_accessory_list_checkbox_changed(self, row: int, checked: bool):
+        if self._acc_list_updating:
+            return
+        if row < 0:
+            return
+        if row >= len(self.accessory_list_row_node_ids):
+            return
+        node_id = str(self.accessory_list_row_node_ids[row] or "")
+        if not node_id:
+            return
+        if checked:
+            self._accessory_checked_node_ids.add(node_id)
+        else:
+            self._accessory_checked_node_ids.discard(node_id)
+        self._update_accessory_header_check()
+        self.accessory_list_table.selectRow(row)
+        self.accessory_list_frozen.selectRow(row)
+
+    def _checked_accessory_leaf_node_ids(self) -> list[str]:
+        return [nid for nid in self.accessory_list_row_node_ids if nid in self._accessory_checked_node_ids]
+
+    def _delete_checked_accessory_leaves(self) -> bool:
+        node_ids = self._checked_accessory_leaf_node_ids()
+        if not node_ids:
+            return False
+        used = self._used_urls_in_bills()
+        blocked: list[str] = []
+        targets: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+        for node_id in node_ids:
+            node, parent = self._find_accessory_node(node_id)
+            if node is None or parent is None or node.get("node_type") != "leaf":
+                continue
+            desc = str(node.get("desc", "") or node.get("name", "")).strip()
+            url = str(node.get("url", "") or "").strip()
+            if desc in used or url in used:
+                blocked.append(desc or url or "（空描述）")
+                continue
+            targets.append((node_id, node, parent))
+        if blocked:
+            show = "、".join(blocked[:5])
+            more = f" 等{len(blocked)}项" if len(blocked) > 5 else ""
+            QMessageBox.warning(
+                self,
+                "提示",
+                f"以下配件已被{self._current_business_table_name()}引用，不允许删除：\n{show}{more}",
+            )
             return True
+        if not targets:
+            QMessageBox.information(self, "提示", "未找到可删除的勾选叶子")
+            return True
+        if QMessageBox.question(self, "确认删除", f"确认删除已勾选的 {len(targets)} 个叶子节点吗？此操作不可撤销。") != QMessageBox.Yes:
+            return True
+        by_parent: dict[str, tuple[dict[str, Any], set[str]]] = {}
+        for node_id, _node, parent in targets:
+            pid = str(parent.get("id", ""))
+            if pid not in by_parent:
+                by_parent[pid] = (parent, set())
+            by_parent[pid][1].add(node_id)
+        for parent, del_ids in by_parent.values():
+            parent["children"] = [
+                x for x in (parent.get("children", []) or []) if str(x.get("id", "")) not in del_ids
+            ]
+        self.save_accessories()
+        self.refresh_accessory_tree()
+        return True
+
+    def _node_or_descendants_used(self, node: dict[str, Any], used_urls: set[str]) -> bool:
+        if node.get("node_type") == "leaf":
+            desc = str(node.get("desc", "") or node.get("name", "")).strip()
+            url = str(node.get("url", "") or "").strip()
+            if desc in used_urls or url in used_urls:
+                return True
         for ch in node.get("children", []) or []:
             if isinstance(ch, dict) and self._node_or_descendants_used(ch, used_urls):
                 return True
@@ -1280,7 +2222,7 @@ class BillApp(QMainWindow):
             return
         used_urls = self._used_urls_in_bills()
         if self._node_or_descendants_used(node, used_urls):
-            QMessageBox.warning(self, "提示", "该节点（或其子节点）已被提单表使用，不可删除")
+            QMessageBox.warning(self, "提示", f"该节点（或其子节点）已被{self._current_business_table_name()}使用，不可删除")
             return
         node_name = str(node.get("desc", "") or node.get("name", "") or "该节点")
         if QMessageBox.question(self, "确认删除", f"确认删除“{node_name}”节点吗？此操作不可撤销。") != QMessageBox.Yes:
@@ -1288,6 +2230,120 @@ class BillApp(QMainWindow):
         parent["children"] = [x for x in (parent.get("children", []) or []) if x.get("id") != node.get("id")]
         self.save_accessories()
         self.refresh_accessory_tree()
+
+    def delete_accessory_selected(self):
+        if self._delete_checked_accessory_leaves():
+            return
+        QMessageBox.information(self, "提示", "请先勾选要删除的配件叶子")
+
+    def delete_accessory_leaf_by_id(self, node_id: str):
+        node, parent = self._find_accessory_node(node_id)
+        if node is None or parent is None or node.get("node_type") != "leaf":
+            return
+        desc = str(node.get("desc", "") or node.get("name", "")).strip()
+        url = str(node.get("url", "") or "").strip()
+        used = self._used_urls_in_bills()
+        if desc in used or url in used:
+            QMessageBox.warning(self, "提示", f"该配件已被{self._current_business_table_name()}引用，不允许删除")
+            return
+        if QMessageBox.question(self, "确认删除", f"确认删除叶子“{desc}”吗？此操作不可撤销。") != QMessageBox.Yes:
+            return
+        parent["children"] = [x for x in (parent.get("children", []) or []) if str(x.get("id", "")) != node_id]
+        self.save_accessories()
+        self.refresh_accessory_tree()
+
+    def import_accessories_from_excel(self):
+        default_tpl = APP_DIR / "input-template.xlsx"
+        start_dir = str(default_tpl.parent if default_tpl.exists() else APP_DIR)
+        in_file, _ = QFileDialog.getOpenFileName(self, "选择配件导入文件", start_dir, "Excel (*.xlsx *.xlsm)")
+        if not in_file:
+            return
+        try:
+            wb = load_workbook(str(in_file), read_only=True, data_only=True)
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", f"读取文件失败：\n{e}")
+            return
+        added = 0
+        updated = 0
+        skipped = 0
+        progress: QProgressDialog | None = None
+        try:
+            ws = wb[wb.sheetnames[0]]
+            rows_all = list(ws.iter_rows(values_only=True))
+            if not rows_all:
+                QMessageBox.information(self, "导入提示", "文件为空")
+                return
+            now_ts = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+            rows_data = rows_all[1:]
+            total_rows = len(rows_data)
+            progress = QProgressDialog("正在导入配件数据...", "取消", 0, max(1, total_rows), self)
+            progress.setWindowTitle("导入中")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.setValue(0)
+            progress.show()
+            QApplication.processEvents()
+
+            for idx, row in enumerate(rows_data, start=1):
+                if progress.wasCanceled():
+                    break
+                vals = [str(x or "").strip() for x in row]
+                if len(vals) < 6:
+                    vals.extend([""] * (6 - len(vals)))
+                acc_type, channel, name, desc, url, remark = vals[:6]
+                if not any([acc_type, channel, name, desc, url, remark]):
+                    progress.setValue(idx)
+                    QApplication.processEvents()
+                    continue
+                if not all([acc_type, channel, name, desc, url]):
+                    skipped += 1
+                    progress.setValue(idx)
+                    QApplication.processEvents()
+                    continue
+                parent = self._ensure_accessory_branch_path(acc_type, channel, name)
+                key = self._leaf_unique_key(parent, desc)
+                existed = None
+                for ch in parent.get("children", []) or []:
+                    if isinstance(ch, dict) and ch.get("node_type") == "leaf":
+                        other = self._leaf_unique_key(parent, str(ch.get("desc", "") or ch.get("name", "")))
+                        if other == key:
+                            existed = ch
+                            break
+                if existed is not None:
+                    existed["name"] = desc
+                    existed["desc"] = desc
+                    existed["url"] = url
+                    existed["remark"] = remark
+                    existed["created_at"] = now_ts
+                    updated += 1
+                else:
+                    parent.setdefault("children", []).append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "name": desc,
+                            "node_type": "leaf",
+                            "desc": desc,
+                            "url": url,
+                            "remark": remark,
+                            "created_at": now_ts,
+                            "children": [],
+                        }
+                    )
+                    added += 1
+                progress.setValue(idx)
+                QApplication.processEvents()
+        finally:
+            if progress is not None:
+                progress.close()
+            wb.close()
+        self.save_accessories()
+        self.refresh_accessory_tree()
+        if progress is not None and progress.wasCanceled():
+            QMessageBox.information(self, "导入已取消", f"新增 {added} 条，更新 {updated} 条，跳过 {skipped} 条")
+            return
+        QMessageBox.information(self, "导入完成", f"新增 {added} 条，更新 {updated} 条，跳过 {skipped} 条")
 
     @staticmethod
     def _print_record_file_ok(rec: dict) -> bool:
@@ -1709,11 +2765,33 @@ class BillApp(QMainWindow):
         files.sort(key=lambda x: str(x).lower())
         return files
 
+    def _pick_merge_roots(self) -> list[Path]:
+        """选择多个待合并文件夹；不支持多选时回退为单选。"""
+        dlg = QFileDialog(self, "选择待合并文件夹", str(APP_DIR))
+        dlg.setFileMode(QFileDialog.FileMode.Directory)
+        dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        views = list(dlg.findChildren(QListView)) + list(dlg.findChildren(QTreeView))
+        for view in views:
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        picked: list[Path] = []
+        if dlg.exec():
+            seen: set[str] = set()
+            for p in dlg.selectedFiles():
+                sp = str(Path(p))
+                if sp in seen:
+                    continue
+                seen.add(sp)
+                picked.append(Path(p))
+        if picked:
+            return picked
+        single = QFileDialog.getExistingDirectory(self, "选择待合并文件夹", str(APP_DIR))
+        return [Path(single)] if single else []
+
     def open_merge_excel_dialog(self):
-        chosen_root = QFileDialog.getExistingDirectory(self, "选择待合并文件夹", str(APP_DIR))
-        if not chosen_root:
+        merge_roots = self._pick_merge_roots()
+        if not merge_roots:
             return
-        merge_root = Path(chosen_root)
         dlg = QDialog(self)
         dlg.setWindowTitle("合并Excel")
         dlg.resize(980, 640)
@@ -1721,9 +2799,16 @@ class BillApp(QMainWindow):
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(10)
 
-        root_tip = QLabel(f"当前路径：{merge_root}")
+        root_tip = QLabel("")
         root_tip.setObjectName("hintLabel")
         lay.addWidget(root_tip)
+
+        folder_bar = QHBoxLayout()
+        btn_add_folder = QPushButton("➕ 添加文件夹")
+        btn_add_folder.setObjectName("btnGhost")
+        folder_bar.addWidget(btn_add_folder)
+        folder_bar.addStretch(1)
+        lay.addLayout(folder_bar)
 
         top = QHBoxLayout()
         name_search = QLineEdit()
@@ -1857,6 +2942,13 @@ class BillApp(QMainWindow):
                     tip += f"\n已选 {len(vals)} 项"
                 it.setToolTip(tip)
 
+        def refresh_root_tip():
+            if not merge_roots:
+                root_tip.setText("当前路径：未选择")
+                return
+            names = "；".join(str(p) for p in merge_roots)
+            root_tip.setText(f"当前路径（{len(merge_roots)}个）：{names}")
+
         def render_table():
             nonlocal row_paths
             row_paths = []
@@ -1933,7 +3025,15 @@ class BillApp(QMainWindow):
 
         def load_files():
             nonlocal all_files
-            files = self._collect_excel_files_under(merge_root)
+            files: list[Path] = []
+            seen_paths: set[str] = set()
+            for root in merge_roots:
+                for p in self._collect_excel_files_under(root):
+                    sp = str(p)
+                    if sp in seen_paths:
+                        continue
+                    seen_paths.add(sp)
+                    files.append(p)
             all_files = []
             for p in files:
                 try:
@@ -1953,11 +3053,24 @@ class BillApp(QMainWindow):
                         "size": size,
                         "mtime": mtime_s,
                         "mtime_ts": mts,
-                        "path_display": str(p.parent.relative_to(merge_root)) if p.parent != merge_root else ".",
+                        "path_display": self._merge_path_display_for_roots(p, merge_roots),
                     }
                 )
                 checked_map.setdefault(str(p), False)
             render_table()
+
+        def add_merge_folder():
+            cur = str(merge_roots[-1] if merge_roots else APP_DIR)
+            picked = QFileDialog.getExistingDirectory(dlg, "添加待合并文件夹", cur)
+            if not picked:
+                return
+            new_root = Path(picked)
+            if any(str(x) == str(new_root) for x in merge_roots):
+                QMessageBox.information(dlg, "提示", "该文件夹已添加")
+                return
+            merge_roots.append(new_root)
+            refresh_root_tip()
+            load_files()
 
         def on_header_clicked(section: int):
             if section == 0:
@@ -2228,8 +3341,10 @@ class BillApp(QMainWindow):
         file_table.cellClicked.connect(on_cell_clicked)
         btn_search.clicked.connect(on_search_clicked)
         btn_clear.clicked.connect(on_clear_clicked)
+        btn_add_folder.clicked.connect(add_merge_folder)
         btn_merge.clicked.connect(merge_selected)
         btn_cancel.clicked.connect(dlg.reject)
+        refresh_root_tip()
         load_files()
         dlg.exec()
         self._merge_header_filters = {}
@@ -2239,6 +3354,16 @@ class BillApp(QMainWindow):
         self._merge_filter_parent = None
         self._merge_on_header_click_cb = None
         self._merge_file_table = None
+
+    @staticmethod
+    def _merge_path_display_for_roots(path: Path, roots: list[Path]) -> str:
+        for root in roots:
+            try:
+                rel = path.parent.relative_to(root)
+                return f"{root.name}/{rel}" if str(rel) != "." else root.name
+            except ValueError:
+                continue
+        return str(path.parent)
 
     def delete_selected_print_records(self):
         to_del = [i for i, r in enumerate(self.print_records) if r.get("checked")]
@@ -2265,6 +3390,112 @@ class BillApp(QMainWindow):
         self._shift_field_errors_after_insert(insert_at)
         self.save_data()
         self.refresh_table()
+
+    def import_bill_excel(self):
+        in_file, _ = QFileDialog.getOpenFileName(
+            self,
+            f"选择{self._current_business_noun()}导入文件",
+            str(APP_DIR),
+            "Excel (*.xlsx *.xlsm)",
+        )
+        if not in_file:
+            return
+        try:
+            wb = load_workbook(in_file, read_only=True, data_only=True)
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", f"读取Excel失败：\n{e}")
+            return
+
+        # 第1行表头；第2行起为数据。从 A 列起依次为：
+        # 任务名、类型、运营商、行业编码、url、数量、时长、年龄上限、年龄下限、pv、省份、排除省份、地市、排除地市
+        col_map = {
+            "task_name": 1,
+            "type_code": 2,
+            "operator_code": 3,
+            "industry_code": 4,
+            "url": 5,
+            "quantity": 6,
+            "duration": 7,
+            "age_max": 8,
+            "age_min": 9,
+            "pv": 10,
+            "province": 11,
+            "exclude_province": 12,
+            "city": 13,
+            "exclude_city": 14,
+        }
+        type_name_to_code = {str(v): str(k) for k, v in TYPE_MAP.items()}
+        op_name_to_code = {str(v): str(k) for k, v in OP_MAP.items()}
+
+        def to_text(v: Any) -> str:
+            if v is None:
+                return ""
+            if isinstance(v, float) and v.is_integer():
+                return str(int(v))
+            return str(v).strip()
+
+        added = 0
+        skipped = 0
+        progress: QProgressDialog | None = None
+        try:
+            ws = wb[wb.sheetnames[0]]
+            start_row = 2
+            max_row = ws.max_row or 1
+            total_rows = max(0, max_row - start_row + 1)
+            progress = QProgressDialog(f"正在导入{self._current_business_noun()}数据...", "取消", 0, max(1, total_rows), self)
+            progress.setWindowTitle("导入中")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.setValue(0)
+            progress.show()
+            QApplication.processEvents()
+
+            for idx, r in enumerate(range(start_row, max_row + 1), start=1):
+                if progress.wasCanceled():
+                    break
+                vals: dict[str, str] = {}
+                for f, c in col_map.items():
+                    vals[f] = to_text(ws.cell(row=r, column=c).value)
+                if not any(vals.values()):
+                    progress.setValue(idx)
+                    QApplication.processEvents()
+                    continue
+                rec = self.default_record()
+                rec.update(vals)
+                rec["url"] = rec["url"].replace("\r\n", "\n").replace("\r", "\n")
+                if not str(rec.get("age_max", "")).strip():
+                    rec["age_max"] = "55"
+                if not str(rec.get("pv", "")).strip():
+                    rec["pv"] = "1"
+                tp = rec.get("type_code", "")
+                op = rec.get("operator_code", "")
+                rec["type_code"] = type_name_to_code.get(tp, tp)
+                rec["operator_code"] = op_name_to_code.get(op, op)
+                self.records.append(rec)
+                added += 1
+                progress.setValue(idx)
+                QApplication.processEvents()
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", f"读取数据失败：\n{e}")
+            return
+        finally:
+            if progress is not None:
+                progress.close()
+            wb.close()
+
+        if progress is not None and progress.wasCanceled():
+            self.save_data()
+            self.refresh_table()
+            QMessageBox.information(self, "导入已取消", f"已导入 {added} 条数据")
+            return
+        if added <= 0:
+            QMessageBox.information(self, "导入结果", "未导入任何数据（仅识别第2行起 B~O 列非空数据）")
+            return
+        self.save_data()
+        self.refresh_table()
+        QMessageBox.information(self, "导入成功", f"已导入 {added} 条数据")
 
     def is_row_saved(self, rec):
         return any(str(rec.get(k, "")).strip() for k in FIELDS if k != "allow_print_url")
@@ -2428,7 +3659,14 @@ class BillApp(QMainWindow):
         if not restore_idx:
             QMessageBox.information(self, "提示", "请先勾选要恢复的数据")
             return
-        if QMessageBox.question(self, "确认恢复", f"确认恢复 {len(restore_idx)} 条历史任务到提单表吗？") != QMessageBox.Yes:
+        if (
+            QMessageBox.question(
+                self,
+                "确认恢复",
+                f"确认恢复 {len(restore_idx)} 条历史任务到{self._current_business_table_name()}吗？",
+            )
+            != QMessageBox.Yes
+        ):
             return
         for idx in sorted(restore_idx):
             src = self.history_records[idx]
@@ -2448,7 +3686,11 @@ class BillApp(QMainWindow):
         self.save_history_data()
         self.refresh_table()
         self.refresh_history_table()
-        QMessageBox.information(self, "恢复成功", f"已恢复 {len(restore_idx)} 条数据到提单表")
+        QMessageBox.information(
+            self,
+            "恢复成功",
+            f"已恢复 {len(restore_idx)} 条数据到{self._current_business_table_name()}",
+        )
 
     def delete_selected_history(self):
         to_del = [i for i, rec in enumerate(self.history_records) if rec.get("checked")]
@@ -2471,7 +3713,7 @@ class BillApp(QMainWindow):
             return "是" if coerce_allow_print_url(rec.get("allow_print_url")) else "否"
         if field == "url":
             descs = self._selected_url_descs_for_record(rec)
-            return "|".join(descs)
+            return "\n".join(descs)
         if field == "print_count":
             return str(int(rec.get("print_count", 0) or 0))
         if field == "last_printed_at":
@@ -2712,6 +3954,13 @@ class BillApp(QMainWindow):
             if section == 4:
                 return "merge_path"
             return None
+        if mode == "acc_frozen":
+            return "acc_type" if section == 1 else None
+        if mode == "acc_scroll":
+            fmap = ["acc_channel", "acc_name", "acc_desc", "acc_url", "acc_remark", "acc_created", None]
+            if 0 <= section < len(fmap):
+                return fmap[section]
+            return None
         if mode == "main_scroll":
             return self._main_scroll_field_for_section(section)
         if mode == "hist_scroll":
@@ -2782,6 +4031,10 @@ class BillApp(QMainWindow):
             if mt is None:
                 return None
             h = mt.horizontalHeader()
+        elif mode == "acc_frozen":
+            h = self.accessory_list_frozen.horizontalHeader()
+        elif mode == "acc_scroll":
+            h = self.accessory_list_table.horizontalHeader()
         else:
             return None
         if not isinstance(h, HoverFilterHeaderView):
@@ -2802,12 +4055,24 @@ class BillApp(QMainWindow):
         elif mode.startswith("merge"):
             opts = self._unique_display_values_merge(field)
             cur = set(getattr(self, "_merge_header_filters", {}).get(field, ()))
+        elif mode.startswith("acc"):
+            opts = self._unique_display_values_accessory(field)
+            cur = set(self.accessory_header_filters.get(field, ()))
         else:
             opts = self._unique_display_values_hist(field)
             cur = set(self.history_header_filters.get(field, ()))
         if field in ("created_at", "last_printed_at", "printed_at"):
             cur = {BillApp._created_at_filter_key(x) for x in cur}
-        title = HEADERS.get(field, field)
+        acc_titles = {
+            "acc_name": "名称",
+            "acc_type": "类型",
+            "acc_channel": "渠道",
+            "acc_desc": "描述",
+            "acc_url": "URL",
+            "acc_remark": "备注",
+            "acc_created": "创建时间",
+        }
+        title = HEADERS.get(field, acc_titles.get(field, field))
         self._close_column_filter_popup()
         anchor = self._filter_button_global_bottom_right(mode, section)
         if anchor is None:
@@ -3288,9 +4553,12 @@ class BillApp(QMainWindow):
                     self.table.setItem(row, sc, aw_item)
                     continue
                 if f == "url":
-                    item = QTableWidgetItem(self.display_val(rec, f))
+                    url_text = self.display_val(rec, f)
+                    item = QTableWidgetItem(url_text)
                     item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+                    if url_text.strip():
+                        item.setToolTip(url_text)
                     if self.field_errors.get((rec_idx, f)):
                         item.setBackground(QColor("#e05263"))
                         item.setToolTip(self.field_error_msgs.get((rec_idx, f), "字段校验失败"))
@@ -3352,7 +4620,7 @@ class BillApp(QMainWindow):
         for r, rh in enumerate(per_row_heights):
             self.table.setRowHeight(r, rh)
             self.table_frozen.setRowHeight(r, rh)
-        self.lbl_count.setText(f"提单数: {len(self.filtered_indices)}")
+        self.lbl_count.setText(f"{self._current_business_noun()}数: {len(self.filtered_indices)}")
         self.update_header_check()
         self._update_main_header_sort_indicator()
         self._update_main_header_tooltips()
@@ -3389,6 +4657,17 @@ class BillApp(QMainWindow):
                 self.history_records[i]["checked"] = not all_checked
             self.save_history_data()
             self.refresh_history_table()
+            return
+        if mode == "acc_frozen":
+            if not self.accessory_list_row_node_ids:
+                return
+            all_checked = all(nid in self._accessory_checked_node_ids for nid in self.accessory_list_row_node_ids)
+            if all_checked:
+                for nid in self.accessory_list_row_node_ids:
+                    self._accessory_checked_node_ids.discard(nid)
+            else:
+                self._accessory_checked_node_ids.update(self.accessory_list_row_node_ids)
+            self.refresh_accessory_tree()
 
     def on_cell_clicked(self, row, col):
         if self.updating_table:
@@ -3855,6 +5134,12 @@ class BillApp(QMainWindow):
             return
         rec = self.records[rec_idx]
         cleaned = value.replace("\n", " ").replace("\r", " ").strip() if field == "task_name" else value
+        if field == "age_max":
+            s = str(cleaned or "").strip()
+            cleaned = s if s else "55"
+        elif field == "pv":
+            s = str(cleaned or "").strip()
+            cleaned = s if s else "1"
         if field == "task_name":
             hint = self.task_name_hint(cleaned)
             if hint:
@@ -3893,29 +5178,15 @@ class BillApp(QMainWindow):
         return True, ""
 
     def validate_urls(self, raw: str):
-        desc_map = self._accessory_desc_url_map()
         lines = [x.strip() for x in str(raw or "").replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n").split("\n") if x.strip()]
-        for idx, line in enumerate(lines, start=1):
-            resolved = desc_map.get(line, "")
-            if not resolved:
-                return False, f"URL 第{idx}行描述“{line}”不在配件表中"
-            if not self._is_valid_http_url(resolved):
-                return False, f"URL 第{idx}行描述“{line}”对应URL格式错误（需为http/https）"
+        if not lines:
+            return False, "URL 为必填项"
         return True, ""
 
     def _validate_urls_collect(self, raw: str) -> list[str]:
-        """逐行收集 URL 描述问题（必须能在配件表中命中）。"""
-        desc_map = self._accessory_desc_url_map()
+        """URL 字段仅做必填校验。"""
         lines = [x.strip() for x in str(raw or "").replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n").split("\n") if x.strip()]
-        out: list[str] = []
-        for idx, line in enumerate(lines, start=1):
-            resolved = desc_map.get(line, "")
-            if not resolved:
-                out.append(f"URL 第{idx}行描述“{line}”不在配件表中")
-                continue
-            if not self._is_valid_http_url(resolved):
-                out.append(f"URL 第{idx}行描述“{line}”对应URL格式错误（需为http/https）")
-        return out
+        return [] if lines else ["URL 为必填项"]
 
     def validate_export_record(self, rec):
         required_fields = [
@@ -4084,7 +5355,7 @@ class BillApp(QMainWindow):
         lo.addWidget(btns)
         picked: dict[str, Any] = {"urls": [], "descs": []}
         rec = self.records[rec_idx] if 0 <= rec_idx < len(self.records) else {}
-        pre_descs = set(self._selected_url_descs_for_record(rec))
+        pre_values = set(self._selected_url_descs_for_record(rec))
 
         def on_item_double_clicked(item: QTreeWidgetItem, _col: int):
             node_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
@@ -4120,7 +5391,9 @@ class BillApp(QMainWindow):
                 if node.get("node_type") == "leaf":
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     desc_name = str(node.get("desc", "") or node.get("name", "") or "")
-                    item.setCheckState(0, Qt.CheckState.Checked if desc_name in pre_descs else Qt.CheckState.Unchecked)
+                    node_url = str(node.get("url", "") or "").strip()
+                    checked = desc_name in pre_values or node_url in pre_values
+                    item.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
                 if parent_item is None:
                     tree.addTopLevelItem(item)
                 else:
@@ -4184,7 +5457,7 @@ class BillApp(QMainWindow):
             p = anchor_widget.mapToGlobal(anchor_widget.rect().bottomLeft())
             self._place_dialog_below_rect(dlg, p, anchor_widget.width())
         if dlg.exec() == QDialog.Accepted:
-            self.apply_field_update(rec_idx, "url", "\n".join(picked["descs"]))
+            self.apply_field_update(rec_idx, "url", "\n".join(picked["urls"]))
 
     def _write_merge_stats_sheet(self, wb: Workbook, merged_rows: list[list[Any]]) -> None:
         """统计页来源于 sum-template.xlsx 的统计页模板，再按规则填充数据。"""
@@ -4196,7 +5469,25 @@ class BillApp(QMainWindow):
             dst_ws.page_margins = copy(src_ws.page_margins)
             dst_ws.page_setup = copy(src_ws.page_setup)
             dst_ws.print_options = copy(src_ws.print_options)
+            dst_ws.sheet_view = copy(src_ws.sheet_view)
+            dst_ws.views = copy(src_ws.views)
+            dst_ws.protection = copy(src_ws.protection)
+            dst_ws.sheet_state = src_ws.sheet_state
+            dst_ws.auto_filter.ref = src_ws.auto_filter.ref
             dst_ws.freeze_panes = src_ws.freeze_panes
+            # 复制打印区域/打印标题（跨系统显示差异较大，尽量保真）
+            try:
+                dst_ws.print_title_rows = src_ws.print_title_rows
+            except Exception:
+                pass
+            try:
+                dst_ws.print_title_cols = src_ws.print_title_cols
+            except Exception:
+                pass
+            try:
+                dst_ws.print_area = src_ws.print_area
+            except Exception:
+                pass
             # 复制列宽/隐藏/分组
             for col_key, dim in src_ws.column_dimensions.items():
                 dst = dst_ws.column_dimensions[col_key]
@@ -4204,12 +5495,16 @@ class BillApp(QMainWindow):
                 dst.hidden = dim.hidden
                 dst.outlineLevel = dim.outlineLevel
                 dst.bestFit = dim.bestFit
+                dst.collapsed = dim.collapsed
+                dst.style = dim.style
             # 复制行高/隐藏/分组
             for row_idx, dim in src_ws.row_dimensions.items():
                 dst = dst_ws.row_dimensions[row_idx]
                 dst.height = dim.height
                 dst.hidden = dim.hidden
                 dst.outlineLevel = dim.outlineLevel
+                dst.collapsed = dim.collapsed
+                dst.style = dim.style
             # 复制单元格值与样式（避免直接拷贝 _style 造成样式索引错乱）
             for row in src_ws.iter_rows(min_row=1, max_row=src_ws.max_row, min_col=1, max_col=src_ws.max_column):
                 for cell in row:
@@ -4223,11 +5518,24 @@ class BillApp(QMainWindow):
             # 复制合并单元格
             for rg in src_ws.merged_cells.ranges:
                 dst_ws.merge_cells(str(rg))
+            # 复制条件格式（Mac 端显示差异常见于此）
+            try:
+                for cf_range, rules in src_ws.conditional_formatting._cf_rules.items():
+                    for rule in rules:
+                        dst_ws.conditional_formatting.add(str(cf_range), copy(rule))
+            except Exception:
+                pass
+            # 复制数据验证
+            try:
+                for dv in src_ws.data_validations.dataValidation:
+                    dst_ws.add_data_validation(deepcopy(dv))
+            except Exception:
+                pass
 
         if "统计" in wb.sheetnames:
             del wb["统计"]
 
-        sum_tpl = APP_DIR / "sum-template.xlsx"
+        sum_tpl = SUM_TEMPLATE_FILE
         if sum_tpl.exists():
             try:
                 sum_wb = load_workbook(str(sum_tpl))
@@ -4447,16 +5755,6 @@ class BillApp(QMainWindow):
         for rec_idx, rec in selected_with_index:
             self._clear_main_row_validation_errors(rec_idx)
             issues = self.collect_record_validation_issues(rec)
-            resolved_urls, missing_descs = self._resolve_urls_from_descs_with_missing(str(rec.get("url", "")))
-            if missing_descs:
-                show = "、".join(missing_descs[:3])
-                more = f" 等{len(missing_descs)}项" if len(missing_descs) > 3 else ""
-                issues.append(("url", f"URL 描述未匹配到配件表URL：{show}{more}"))
-            bad_urls = [u for u in resolved_urls if not self._is_valid_http_url(u)]
-            if bad_urls:
-                show = "、".join(bad_urls[:2])
-                more = f" 等{len(bad_urls)}项" if len(bad_urls) > 2 else ""
-                issues.append(("url", f"描述映射出的URL格式错误（需为http/https）：{show}{more}"))
             if not issues:
                 continue
             has_invalid = True
@@ -4495,7 +5793,16 @@ class BillApp(QMainWindow):
                     raw_descs = str(rec.get("url", ""))
                     row_allow = coerce_allow_print_url(rec.get("allow_print_url"))
                     if include_url and row_allow:
-                        lines, _missing = self._resolve_urls_from_descs_with_missing(raw_descs)
+                        desc_map = self._accessory_desc_url_map()
+                        raw_lines = [
+                            x.strip()
+                            for x in raw_descs.replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n").split("\n")
+                            if x.strip()
+                        ]
+                        lines: list[str] = []
+                        for line in raw_lines:
+                            # 兼容历史数据（保存的是描述）与新数据（保存的是 URL）。
+                            lines.append(desc_map.get(line, line))
                         cell = ws[f"{c}{rr}"]
                         # URL 以多行写入单元格，便于在 Excel 中直接逐行查看。
                         cell.value = "\r\n".join(lines)

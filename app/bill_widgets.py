@@ -278,7 +278,7 @@ class ColumnPickFilterPopup(QDialog):
                 else (
                     self._bill._merge_header_filters
                     if self._mode.startswith("merge")
-                    else self._bill.history_header_filters
+                    else (self._bill.accessory_header_filters if self._mode.startswith("acc") else self._bill.history_header_filters)
                 )
             )
         )
@@ -294,6 +294,8 @@ class ColumnPickFilterPopup(QDialog):
             cb = getattr(self._bill, "_merge_render_cb", None)
             if callable(cb):
                 cb()
+        elif self._mode.startswith("acc"):
+            self._bill.refresh_accessory_tree()
         else:
             self._bill.refresh_history_table()
 
@@ -408,6 +410,14 @@ class HoverFilterHeaderView(QHeaderView):
                     self._bill._on_merge_header_section_clicked(idx)
                     event.accept()
                     return
+                if self._mode == "acc_frozen":
+                    self._bill._on_accessory_frozen_header_clicked(idx)
+                    event.accept()
+                    return
+                if self._mode == "acc_scroll":
+                    self._bill._on_accessory_scroll_header_clicked(idx)
+                    event.accept()
+                    return
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
@@ -415,6 +425,14 @@ class HoverFilterHeaderView(QHeaderView):
             idx = self.logicalIndexAt(event.position().toPoint())
             if idx >= 0 and self._mode == "merge_excel":
                 self._bill._on_merge_header_section_clicked(idx)
+                event.accept()
+                return
+            if idx >= 0 and self._mode == "acc_frozen":
+                self._bill._on_accessory_frozen_header_clicked(idx)
+                event.accept()
+                return
+            if idx >= 0 and self._mode == "acc_scroll":
+                self._bill._on_accessory_scroll_header_clicked(idx)
                 event.accept()
                 return
         super().mouseDoubleClickEvent(event)

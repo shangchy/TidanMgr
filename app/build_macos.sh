@@ -29,6 +29,12 @@ if [ -f "template.xlsx" ]; then
 else
   echo "Warning: template.xlsx missing; place it in app/ before packaging for export."
 fi
+if [ -f "sum-template.xlsx" ]; then
+  ADD_DATA_ARGS+=(--add-data "sum-template.xlsx:.")
+  echo "Bundled: sum-template.xlsx"
+else
+  echo "Warning: sum-template.xlsx missing; merge stats sheet may lose template style."
+fi
 
 echo "Running PyInstaller..."
 pyinstaller \

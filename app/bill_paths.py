@@ -25,6 +25,7 @@ def _app_dir() -> Path:
 
 APP_DIR = _app_dir()
 DATA_FILE = APP_DIR / "data.json"
+RECEIPT_DATA_FILE = APP_DIR / "receipt_data.json"
 HISTORY_FILE = APP_DIR / "history_data.json"
 THEME_FILE = APP_DIR / "theme.json"
 PICKER_RECENT_FILE = APP_DIR / "picker_recent.json"
@@ -34,8 +35,11 @@ ACCESSORIES_FILE = APP_DIR / "accessories.json"
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     _bundled_tpl = Path(sys._MEIPASS) / "template.xlsx"
     TEMPLATE_FILE = _bundled_tpl if _bundled_tpl.exists() else (APP_DIR / "template.xlsx")
+    _bundled_sum_tpl = Path(sys._MEIPASS) / "sum-template.xlsx"
+    SUM_TEMPLATE_FILE = _bundled_sum_tpl if _bundled_sum_tpl.exists() else (APP_DIR / "sum-template.xlsx")
 else:
     TEMPLATE_FILE = APP_DIR / "template.xlsx"
+    SUM_TEMPLATE_FILE = APP_DIR / "sum-template.xlsx"
 
 _LICENSE_EXPIRE_AT = datetime(2026, 12, 31, 23, 0, 0)
 LICENSE_EXPIRED_MSG = "程序启动异常，请联系管理员。"
