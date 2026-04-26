@@ -5,7 +5,7 @@ a = Analysis(
     ['bill_app.py'],
     pathex=[],
     binaries=[],
-    datas=[('template.xlsx', '.')],
+    datas=[('template.xlsx', '.'), ('sum-template.xlsx', '.')],
     hiddenimports=['bill_theme'],
     hookspath=[],
     hooksconfig={},

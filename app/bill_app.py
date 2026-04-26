@@ -55,6 +55,7 @@ from bill_constants import (
     sanitize_filename,
     split_multi,
     cities_under_provinces,
+    normalize_city_name,
 )
 from bill_paths import (
     ACCESSORIES_FILE,
@@ -2269,24 +2270,26 @@ class BillApp(QMainWindow):
         progress: QProgressDialog | None = None
         try:
             ws = wb[wb.sheetnames[0]]
-            rows_all = list(ws.iter_rows(values_only=True))
-            if not rows_all:
+            max_row = ws.max_row or 1
+            if max_row < 2:
                 QMessageBox.information(self, "导入提示", "文件为空")
                 return
             now_ts = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-            rows_data = rows_all[1:]
-            total_rows = len(rows_data)
+            total_rows = max_row - 1
             progress = QProgressDialog("正在导入配件数据...", "取消", 0, max(1, total_rows), self)
             progress.setWindowTitle("导入中")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(0)
-            progress.setAutoClose(False)
-            progress.setAutoReset(False)
+            progress.setAutoClose(True)
+            progress.setAutoReset(True)
             progress.setValue(0)
             progress.show()
             QApplication.processEvents()
 
-            for idx, row in enumerate(rows_data, start=1):
+            for idx, row in enumerate(
+                ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=6, values_only=True),
+                start=1,
+            ):
                 if progress.wasCanceled():
                     break
                 vals = [str(x or "").strip() for x in row]
@@ -2295,12 +2298,14 @@ class BillApp(QMainWindow):
                 acc_type, channel, name, desc, url, remark = vals[:6]
                 if not any([acc_type, channel, name, desc, url, remark]):
                     progress.setValue(idx)
-                    QApplication.processEvents()
+                    if idx % 50 == 0 or idx == total_rows:
+                        QApplication.processEvents()
                     continue
                 if not all([acc_type, channel, name, desc, url]):
                     skipped += 1
                     progress.setValue(idx)
-                    QApplication.processEvents()
+                    if idx % 50 == 0 or idx == total_rows:
+                        QApplication.processEvents()
                     continue
                 parent = self._ensure_accessory_branch_path(acc_type, channel, name)
                 key = self._leaf_unique_key(parent, desc)
@@ -2333,17 +2338,28 @@ class BillApp(QMainWindow):
                     )
                     added += 1
                 progress.setValue(idx)
-                QApplication.processEvents()
+                if idx % 10 == 0 or idx == total_rows:
+                    QApplication.processEvents()
         finally:
             if progress is not None:
+                progress.setValue(progress.maximum())
+                QApplication.processEvents()
                 progress.close()
+                progress.deleteLater()
+                QApplication.processEvents()
             wb.close()
         self.save_accessories()
         self.refresh_accessory_tree()
         if progress is not None and progress.wasCanceled():
-            QMessageBox.information(self, "导入已取消", f"新增 {added} 条，更新 {updated} 条，跳过 {skipped} 条")
+            self.statusBar().showMessage(
+                f"导入已取消：新增 {added} 条，更新 {updated} 条，跳过 {skipped} 条",
+                5000,
+            )
             return
-        QMessageBox.information(self, "导入完成", f"新增 {added} 条，更新 {updated} 条，跳过 {skipped} 条")
+        self.statusBar().showMessage(
+            f"导入完成：新增 {added} 条，更新 {updated} 条，跳过 {skipped} 条",
+            5000,
+        )
 
     @staticmethod
     def _print_record_file_ok(rec: dict) -> bool:
@@ -3446,21 +3462,26 @@ class BillApp(QMainWindow):
             progress.setWindowTitle("导入中")
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(0)
-            progress.setAutoClose(False)
-            progress.setAutoReset(False)
+            progress.setAutoClose(True)
+            progress.setAutoReset(True)
             progress.setValue(0)
             progress.show()
             QApplication.processEvents()
 
-            for idx, r in enumerate(range(start_row, max_row + 1), start=1):
+            fields_in_order = list(col_map.keys())
+            for idx, row_vals in enumerate(
+                ws.iter_rows(min_row=start_row, max_row=max_row, min_col=1, max_col=14, values_only=True),
+                start=1,
+            ):
                 if progress.wasCanceled():
                     break
                 vals: dict[str, str] = {}
-                for f, c in col_map.items():
-                    vals[f] = to_text(ws.cell(row=r, column=c).value)
+                for i, f in enumerate(fields_in_order):
+                    vals[f] = to_text(row_vals[i] if i < len(row_vals) else "")
                 if not any(vals.values()):
                     progress.setValue(idx)
-                    QApplication.processEvents()
+                    if idx % 10 == 0 or idx == total_rows:
+                        QApplication.processEvents()
                     continue
                 rec = self.default_record()
                 rec.update(vals)
@@ -3473,29 +3494,39 @@ class BillApp(QMainWindow):
                 op = rec.get("operator_code", "")
                 rec["type_code"] = type_name_to_code.get(tp, tp)
                 rec["operator_code"] = op_name_to_code.get(op, op)
+                if str(rec.get("task_name", "")).strip() and (
+                    not str(rec.get("province", "")).strip() and not str(rec.get("city", "")).strip()
+                ):
+                    # 导入时若省/市为空，则按任务名自动解析地域并回填。
+                    self.after_field_change(rec, "task_name")
                 self.records.append(rec)
                 added += 1
                 progress.setValue(idx)
-                QApplication.processEvents()
+                if idx % 10 == 0 or idx == total_rows:
+                    QApplication.processEvents()
         except Exception as e:
             QMessageBox.warning(self, "导入失败", f"读取数据失败：\n{e}")
             return
         finally:
             if progress is not None:
+                progress.setValue(progress.maximum())
+                QApplication.processEvents()
                 progress.close()
+                progress.deleteLater()
+                QApplication.processEvents()
             wb.close()
 
         if progress is not None and progress.wasCanceled():
             self.save_data()
             self.refresh_table()
-            QMessageBox.information(self, "导入已取消", f"已导入 {added} 条数据")
+            self.statusBar().showMessage(f"导入已取消：已导入 {added} 条数据", 5000)
             return
         if added <= 0:
-            QMessageBox.information(self, "导入结果", "未导入任何数据（仅识别第2行起 B~O 列非空数据）")
+            self.statusBar().showMessage("导入结果：未导入任何数据（仅识别第2行起 A~N 列非空数据）", 5000)
             return
         self.save_data()
         self.refresh_table()
-        QMessageBox.information(self, "导入成功", f"已导入 {added} 条数据")
+        self.statusBar().showMessage(f"导入成功：已导入 {added} 条数据", 5000)
 
     def is_row_saved(self, rec):
         return any(str(rec.get(k, "")).strip() for k in FIELDS if k != "allow_print_url")
@@ -3740,6 +3771,20 @@ class BillApp(QMainWindow):
         if not text:
             return ""
         parts = split_multi(text.replace("，", "|").replace(",", "|"))
+        if field in ("city", "exclude_city"):
+            allow_set: set[str] | None = None
+            if field == "exclude_city" and rec is not None:
+                provs = split_multi(rec.get("province", ""))
+                if provs:
+                    allow_set = set(cities_under_provinces(provs))
+            norm_parts: list[str] = []
+            for p in parts:
+                n = normalize_city_name(p, allow_set)
+                if n is None:
+                    return None
+                if n and n not in norm_parts:
+                    norm_parts.append(n)
+            return "|".join(norm_parts)
         if BillApp._geo_tokens_invalid(field, parts, rec):
             return None
         return "|".join(parts)
@@ -5403,7 +5448,34 @@ class BillApp(QMainWindow):
                         add_node(ch, item)
 
             add_node(self.accessories_root, None)
-            tree.expandAll()
+            # 首次选择（无已选且无搜索）默认全收缩；其余仅展开 URL 命中（或已勾选）路径。
+            tree.collapseAll()
+            if not kw and not pre_values:
+                return
+
+            def mark_expand_path(it: QTreeWidgetItem) -> bool:
+                has_child_match = False
+                for i in range(it.childCount()):
+                    if mark_expand_path(it.child(i)):
+                        has_child_match = True
+                node_id = str(it.data(0, Qt.ItemDataRole.UserRole) or "")
+                node, _ = self._find_accessory_node(node_id)
+                self_match = False
+                if node and node.get("node_type") == "leaf":
+                    node_url = str(node.get("url", "") or "").strip().lower()
+                    desc_name = str(node.get("desc", "") or node.get("name", "") or "").strip()
+                    checked = it.checkState(0) == Qt.CheckState.Checked or desc_name in pre_values
+                    if kw:
+                        self_match = kw in node_url
+                    else:
+                        self_match = checked
+                should_expand = has_child_match or self_match
+                if should_expand and it.childCount() > 0:
+                    it.setExpanded(True)
+                return should_expand
+
+            for i in range(tree.topLevelItemCount()):
+                mark_expand_path(tree.topLevelItem(i))
 
         def on_accept():
             picked_urls: list[str] = []
