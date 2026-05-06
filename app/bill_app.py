@@ -4598,16 +4598,30 @@ class BillApp(QMainWindow):
                     self.table.setItem(row, sc, aw_item)
                     continue
                 if f == "url":
-                    url_text = self.display_val(rec, f)
-                    item = QTableWidgetItem(url_text)
-                    item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-                    if url_text.strip():
-                        item.setToolTip(url_text)
-                    if self.field_errors.get((rec_idx, f)):
-                        item.setBackground(QColor("#e05263"))
-                        item.setToolTip(self.field_error_msgs.get((rec_idx, f), "字段校验失败"))
-                    self.table.setItem(row, sc, item)
+                    url_raw = str(rec.get("url", "") or "")
+                    url_wrap = QWidget()
+                    url_wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+                    url_lo = QHBoxLayout(url_wrap)
+                    url_lo.setContentsMargins(2, 2, 2, 2)
+                    url_lo.setSpacing(4)
+                    ed = UrlCellEditor(self, rec_idx)
+                    ed.setPlainText(url_raw)
+                    ed_h = self._url_cell_editor_display_height()
+                    ed.setFixedHeight(ed_h)
+                    ok_u, _msg_u = self.validate_urls(url_raw)
+                    url_marked = bool(self.field_errors.get((rec_idx, f)))
+                    ed.setStyleSheet(self._url_editor_stylesheet(url_marked or not ok_u))
+                    ed.setToolTip("可直接输入或粘贴 URL（多行用换行）；双击编辑区或点「选择」从配件表勾选")
+                    ed.textChanged.connect(lambda _=None, x=rec_idx, e=ed: self._on_url_cell_text_changed(x, e))
+                    btn_pick = QPushButton("选择")
+                    btn_pick.setObjectName("btnGhost")
+                    btn_pick.setFixedHeight(max(26, ed_h))
+                    btn_pick.setMinimumWidth(48)
+                    btn_pick.setToolTip("从配件表勾选 URL 写入本行")
+                    btn_pick.clicked.connect(lambda _=False, ridx=rec_idx, w=url_wrap: self._open_url_picker_anchored_to_widget(ridx, w))
+                    url_lo.addWidget(ed, 1)
+                    url_lo.addWidget(btn_pick, 0)
+                    self.table.setCellWidget(row, sc, url_wrap)
                     continue
                 item = QTableWidgetItem(self.display_val(rec, f))
                 if f in ("province", "exclude_province", "city", "exclude_city"):
@@ -4757,12 +4771,9 @@ class BillApp(QMainWindow):
             return
         if field == "url":
             sc = FIELDS.index("url") - 1
-            idx0 = self.table.model().index(row, sc)
-            rect = self.table.visualRect(idx0)
-            anchor = self.table.viewport()
-            anchor.setProperty("_url_anchor_global", self.table.viewport().mapToGlobal(rect.bottomLeft()))
-            anchor.setProperty("_url_anchor_width", rect.width())
-            self._open_url_picker_dialog(rec_idx, anchor)
+            rect = self.table.visualRect(self.table.model().index(row, sc))
+            vp = self.table.viewport()
+            self._open_url_picker_with_anchor_rect(rec_idx, vp.mapToGlobal(rect.bottomLeft()), rect.width())
             return
         if field in ("province", "exclude_province", "city", "exclude_city"):
             if field == "city" and rec.get("province", "").strip():
@@ -5381,6 +5392,19 @@ class BillApp(QMainWindow):
                     prefix = first_task_no
         return f"{sanitize_filename(prefix)}-{max(0, merged_data_rows)}.xlsx"
 
+    def _open_url_picker_with_anchor_rect(self, rec_idx: int, bottom_left_global: QPoint, width: int):
+        """在屏幕坐标下将配件 URL 弹窗锚定到某控件底边（宽度用于水平居中）。"""
+        if rec_idx < 0 or rec_idx >= len(self.records):
+            return
+        vp = self.table.viewport()
+        vp.setProperty("_url_anchor_global", bottom_left_global)
+        vp.setProperty("_url_anchor_width", max(280, int(width)))
+        self._open_url_picker_dialog(rec_idx, vp)
+
+    def _open_url_picker_anchored_to_widget(self, rec_idx: int, anchor_widget: QWidget):
+        p = anchor_widget.mapToGlobal(QPoint(0, anchor_widget.height()))
+        self._open_url_picker_with_anchor_rect(rec_idx, p, anchor_widget.width())
+
     def _open_url_picker_dialog(self, rec_idx: int, anchor_widget: QWidget):
         dlg = QDialog(self)
         dlg.setWindowTitle("选择配件URL")
@@ -5534,6 +5558,12 @@ class BillApp(QMainWindow):
     def _write_merge_stats_sheet(self, wb: Workbook, merged_rows: list[list[Any]]) -> None:
         """统计页来源于 sum-template.xlsx 的统计页模板，再按规则填充数据。"""
 
+        def _remove_stat_like_sheets(book: Workbook) -> None:
+            """删除「统计」「统计1」等，避免与模板残留页重复。"""
+            for title in list(book.sheetnames):
+                if re.fullmatch(r"统计\d*", title):
+                    book.remove(book[title])
+
         def _copy_sheet_template(src_ws, dst_ws):
             # 复制基础表级属性
             dst_ws.sheet_format = copy(src_ws.sheet_format)
@@ -5541,12 +5571,26 @@ class BillApp(QMainWindow):
             dst_ws.page_margins = copy(src_ws.page_margins)
             dst_ws.page_setup = copy(src_ws.page_setup)
             dst_ws.print_options = copy(src_ws.print_options)
-            dst_ws.sheet_view = copy(src_ws.sheet_view)
-            dst_ws.views = copy(src_ws.views)
-            dst_ws.protection = copy(src_ws.protection)
+            # openpyxl 3.x 中 worksheet.sheet_view / views 多为只读派生属性，赋值会抛 AttributeError，
+            # 会导致整块模板复制失败并退化为空「统计」页（公式与版式全部丢失）。
+            for _attr in ("sheet_view", "views"):
+                try:
+                    setattr(dst_ws, _attr, copy(getattr(src_ws, _attr)))
+                except Exception:
+                    pass
+            try:
+                dst_ws.protection = copy(src_ws.protection)
+            except Exception:
+                pass
             dst_ws.sheet_state = src_ws.sheet_state
-            dst_ws.auto_filter.ref = src_ws.auto_filter.ref
-            dst_ws.freeze_panes = src_ws.freeze_panes
+            try:
+                dst_ws.auto_filter.ref = src_ws.auto_filter.ref
+            except Exception:
+                pass
+            try:
+                dst_ws.freeze_panes = src_ws.freeze_panes
+            except Exception:
+                pass
             # 复制打印区域/打印标题（跨系统显示差异较大，尽量保真）
             try:
                 dst_ws.print_title_rows = src_ws.print_title_rows
@@ -5560,7 +5604,7 @@ class BillApp(QMainWindow):
                 dst_ws.print_area = src_ws.print_area
             except Exception:
                 pass
-            # 复制列宽/隐藏/分组
+            # 复制列宽/隐藏/分组（style 在部分 openpyxl 版本上不可写，跳过即可）
             for col_key, dim in src_ws.column_dimensions.items():
                 dst = dst_ws.column_dimensions[col_key]
                 dst.width = dim.width
@@ -5568,7 +5612,10 @@ class BillApp(QMainWindow):
                 dst.outlineLevel = dim.outlineLevel
                 dst.bestFit = dim.bestFit
                 dst.collapsed = dim.collapsed
-                dst.style = dim.style
+                try:
+                    dst.style = dim.style
+                except Exception:
+                    pass
             # 复制行高/隐藏/分组
             for row_idx, dim in src_ws.row_dimensions.items():
                 dst = dst_ws.row_dimensions[row_idx]
@@ -5576,11 +5623,18 @@ class BillApp(QMainWindow):
                 dst.hidden = dim.hidden
                 dst.outlineLevel = dim.outlineLevel
                 dst.collapsed = dim.collapsed
-                dst.style = dim.style
-            # 复制单元格值与样式（避免直接拷贝 _style 造成样式索引错乱）
+                try:
+                    dst.style = dim.style
+                except Exception:
+                    pass
+            # 复制单元格值与样式（公式单元格单独赋值，避免丢公式）
             for row in src_ws.iter_rows(min_row=1, max_row=src_ws.max_row, min_col=1, max_col=src_ws.max_column):
                 for cell in row:
-                    dcell = dst_ws.cell(row=cell.row, column=cell.column, value=cell.value)
+                    dcell = dst_ws.cell(row=cell.row, column=cell.column)
+                    if cell.data_type == "f":
+                        dcell.value = cell.value
+                    else:
+                        dcell.value = cell.value
                     dcell.font = copy(cell.font)
                     dcell.fill = copy(cell.fill)
                     dcell.border = copy(cell.border)
@@ -5604,25 +5658,50 @@ class BillApp(QMainWindow):
             except Exception:
                 pass
 
-        if "统计" in wb.sheetnames:
-            del wb["统计"]
+        def _find_detail_start_row(ws) -> int:
+            """在模板中查找「序号」表头行，明细从下一行开始；找不到则默认第 4 行。"""
+            scan_r = min(ws.max_row or 1, 40)
+            for r in range(1, scan_r + 1):
+                for c in range(1, 8):
+                    v = ws.cell(row=r, column=c).value
+                    if v is not None and str(v).strip() == "序号":
+                        return r + 1
+            return 4
+
+        _remove_stat_like_sheets(wb)
 
         sum_tpl = SUM_TEMPLATE_FILE
-        if sum_tpl.exists():
-            try:
-                sum_wb = load_workbook(str(sum_tpl))
-                try:
-                    src_ws = sum_wb["统计"] if "统计" in sum_wb.sheetnames else sum_wb[sum_wb.sheetnames[0]]
-                    ws = wb.create_sheet("统计")
-                    _copy_sheet_template(src_ws, ws)
-                finally:
-                    sum_wb.close()
-            except Exception:
+        ws = None
+        sum_wb = None
+        try:
+            if sum_tpl.exists():
+                sum_wb = load_workbook(str(sum_tpl), data_only=False)
+                src_ws = sum_wb["统计"] if "统计" in sum_wb.sheetnames else sum_wb[sum_wb.sheetnames[0]]
                 ws = wb.create_sheet("统计")
-        else:
+                _copy_sheet_template(src_ws, ws)
+        except Exception:
+            if ws is not None:
+                wb.remove(ws)
+                ws = None
+        finally:
+            if sum_wb is not None:
+                sum_wb.close()
+
+        if ws is None:
             ws = wb.create_sheet("统计")
 
-        ws["C1"] = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        detail_start = _find_detail_start_row(ws)
+        clear_end = max(detail_start, ws.max_row or detail_start, 200)
+        for r in range(detail_start, clear_end + 1):
+            for c in (2, 3, 4):
+                cell = ws.cell(row=r, column=c)
+                if cell.data_type == "f":
+                    continue
+                cell.value = None
+
+        stamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        ws["C1"] = stamp
+
         counts: Counter[str] = Counter()
         for vals in merged_rows:
             if len(vals) < 2:
@@ -5630,12 +5709,12 @@ class BillApp(QMainWindow):
             name = str(vals[1] or "").strip()
             if name:
                 counts[name] += 1
-        row = 4
+        row = detail_start
         serial = 1
         for name, cnt in counts.most_common():
             ws.cell(row=row, column=2, value=serial)  # B列 序号
-            ws.cell(row=row, column=3, value=name)    # C列 任务名
-            ws.cell(row=row, column=4, value=cnt)     # D列 统计行数
+            ws.cell(row=row, column=3, value=name)  # C列 任务名
+            ws.cell(row=row, column=4, value=cnt)  # D列 统计行数
             row += 1
             serial += 1
         # 默认打开定位到统计页 A1

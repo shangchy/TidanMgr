@@ -166,6 +166,11 @@ class UrlCellEditor(QPlainTextEdit):
         super().focusOutEvent(event)
         self._bill._on_url_cell_focus_out(self._rec_idx, self)
 
+    def mouseDoubleClickEvent(self, event):
+        """双击打开配件 URL 选择弹窗（与主表「选择」按钮一致）。"""
+        self._bill._open_url_picker_anchored_to_widget(self._rec_idx, self)
+        event.accept()
+
 
 def style_combo_centered(combo: QComboBox):
     """表格内下拉：Windows 等用只读 lineEdit 以便文字居中点击展开。
