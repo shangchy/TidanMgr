@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
 from PySide6.QtCore import QEvent, QObject, QModelIndex, QPoint, QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
@@ -29,14 +30,21 @@ from PySide6.QtGui import (
 )
 
 from bill_constants import (
+    ACCESSORY_TREE_LAYOUT_LEGACY_NAME_CHANNEL,
+    ACCESSORY_TREE_LAYOUT_V1,
+    ACCESSORY_TREE_LAYOUT_V2,
     ALLOW_PRINT_SCROLL_COL,
     ALLOW_PRINT_URL_DISPLAY_COL,
     CITIES,
+    EXPORT_COL_MAP,
     FROZEN_COLUMNS,
+    FROZEN_TABLE_FIELD_COUNT,
     DISPLAY_FIELDS,
     DURATIONS,
     FIELDS,
     HEADERS,
+    IS_ACTIVE_DISPLAY_COL,
+    TABLE_FIELDS,
     HISTORY_SCROLL_COLUMNS,
     HISTORY_SCROLL_FIELDS,
     MAIN_SCROLL_COLUMNS,
@@ -48,6 +56,8 @@ from bill_constants import (
     PROVINCES,
     TYPE_MAP,
     coerce_allow_print_url,
+    coerce_is_active,
+    coerce_is_added_row,
     find_earliest_region_in_left,
     first_url,
     int_to_cn,
@@ -78,7 +88,11 @@ from bill_widgets import (
     BadgeCellDelegate,
     ColumnPickFilterPopup,
     HoverFilterHeaderView,
+    IsActiveCellDelegate,
     MultiSelectDialog,
+    NEW_ROW_FILL,
+    ROW_INACTIVE_ROLE,
+    ROW_NEW_ROLE,
     UrlCellEditor,
     make_sidebar_logo_pixmap,
     style_combo_centered,
@@ -123,7 +137,6 @@ MAIN_ROW_VALIDATE_FIELDS = (
     "task_name",
     "type_code",
     "operator_code",
-    "industry_code",
     "url",
     "quantity",
     "duration",
@@ -146,6 +159,16 @@ class BillApp(QMainWindow):
         self.history_filtered_indices: list[int] = []
         self.filtered_indices: list[int] = []
         self.theme = self.load_theme()
+        self._loading_table_col_widths = True
+        self._main_col_width_save_timer = QTimer(self)
+        self._main_col_width_save_timer.setSingleShot(True)
+        self._main_col_width_save_timer.timeout.connect(self._save_main_table_col_widths)
+        self._history_col_width_save_timer = QTimer(self)
+        self._history_col_width_save_timer.setSingleShot(True)
+        self._history_col_width_save_timer.timeout.connect(self._save_history_table_col_widths)
+        self._accessory_col_width_save_timer = QTimer(self)
+        self._accessory_col_width_save_timer.setSingleShot(True)
+        self._accessory_col_width_save_timer.timeout.connect(self._save_accessory_list_col_widths)
         self.updating_table = False
         self.select_all_state = False
         self.field_errors: dict[tuple[int, str], bool] = {}
@@ -368,7 +391,9 @@ class BillApp(QMainWindow):
         split_lo.setSpacing(0)
         self.table_frozen = QTableWidget(0, FROZEN_COLUMNS)
         self.table_frozen.setObjectName("tableFrozenCol")
-        self.table_frozen.setHorizontalHeaderLabels([HEADERS["checked"], HEADERS["task_name"]])
+        self.table_frozen.setHorizontalHeaderLabels(
+            [HEADERS["checked"], HEADERS["is_active"], HEADERS["task_name"]]
+        )
         self.table_frozen.verticalHeader().setVisible(False)
         self.table_frozen.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_frozen.setAlternatingRowColors(True)
@@ -403,16 +428,20 @@ class BillApp(QMainWindow):
         self.table_frozen.setHorizontalHeader(hdr_main_f)
         self.table.setHorizontalHeader(hdr_main_s)
         hdr_main_f.setSectionResizeMode(0, QHeaderView.Fixed)
-        hdr_main_f.setSectionResizeMode(1, QHeaderView.Interactive)
+        hdr_main_f.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr_main_f.setSectionResizeMode(2, QHeaderView.Interactive)
         hdr_main_s.setSectionResizeMode(QHeaderView.Interactive)
         self.table.setItemDelegateForColumn(ALLOW_PRINT_SCROLL_COL, AllowPrintUrlCellDelegate(self.table))
+        self.table_frozen.setItemDelegateForColumn(1, IsActiveCellDelegate(self.table_frozen))
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         # 列总宽很大时，勿把整表宽度当作窗口最小宽度，否则初始宽度无效且无法横向缩小
         self.table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         hdr_main_f.sectionClicked.connect(self._on_main_frozen_header_section_clicked)
         hdr_main_s.sectionClicked.connect(self._on_main_scroll_header_clicked)
         self.table.horizontalHeader().sectionResized.connect(self._on_main_scroll_column_resized_for_url)
+        self.table.horizontalHeader().sectionResized.connect(self._schedule_save_main_table_col_widths)
         self.table_frozen.horizontalHeader().sectionResized.connect(self._on_main_frozen_section_resized)
+        self.table_frozen.horizontalHeader().sectionResized.connect(self._schedule_save_main_table_col_widths)
         self.table.verticalScrollBar().valueChanged.connect(lambda v: self._sync_main_v_scroll(v, "scroll"))
         self.table_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_main_v_scroll(v, "frozen"))
         self.table.itemSelectionChanged.connect(self._sync_selection_main_to_frozen)
@@ -471,7 +500,9 @@ class BillApp(QMainWindow):
         hist_lo.setSpacing(0)
         self.history_table_frozen = QTableWidget(0, FROZEN_COLUMNS)
         self.history_table_frozen.setObjectName("tableFrozenCol")
-        self.history_table_frozen.setHorizontalHeaderLabels([HEADERS["checked"], HEADERS["task_name"]])
+        self.history_table_frozen.setHorizontalHeaderLabels(
+            [HEADERS["checked"], HEADERS["is_active"], HEADERS["task_name"]]
+        )
         self.history_table_frozen.verticalHeader().setVisible(False)
         self.history_table_frozen.setSelectionBehavior(QTableWidget.SelectRows)
         self.history_table_frozen.setAlternatingRowColors(True)
@@ -496,14 +527,18 @@ class BillApp(QMainWindow):
         self.history_table_frozen.setHorizontalHeader(hdr_hist_f)
         self.history_table.setHorizontalHeader(hdr_hist_s)
         hdr_hist_f.setSectionResizeMode(0, QHeaderView.Fixed)
-        hdr_hist_f.setSectionResizeMode(1, QHeaderView.Interactive)
+        hdr_hist_f.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr_hist_f.setSectionResizeMode(2, QHeaderView.Interactive)
         hdr_hist_s.setSectionResizeMode(QHeaderView.Interactive)
         self.history_table.setItemDelegateForColumn(ALLOW_PRINT_SCROLL_COL, AllowPrintUrlCellDelegate(self.history_table))
+        self.history_table_frozen.setItemDelegateForColumn(1, IsActiveCellDelegate(self.history_table_frozen))
         self.history_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.history_table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         hdr_hist_f.sectionClicked.connect(self._on_hist_frozen_header_section_clicked)
         hdr_hist_s.sectionClicked.connect(self._on_history_scroll_header_clicked)
         self.history_table_frozen.horizontalHeader().sectionResized.connect(self._on_hist_frozen_section_resized)
+        self.history_table_frozen.horizontalHeader().sectionResized.connect(self._schedule_save_history_table_col_widths)
+        self.history_table.horizontalHeader().sectionResized.connect(self._schedule_save_history_table_col_widths)
         self.history_table.verticalScrollBar().valueChanged.connect(lambda v: self._sync_hist_v_scroll(v, "scroll"))
         self.history_table_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_hist_v_scroll(v, "frozen"))
         self.history_table.itemSelectionChanged.connect(self._sync_selection_hist_to_frozen)
@@ -653,7 +688,7 @@ class BillApp(QMainWindow):
         acc_split_lo.setSpacing(0)
         self.accessory_list_frozen = QTableWidget(0, 2)
         self.accessory_list_frozen.setObjectName("tableFrozenCol")
-        self.accessory_list_frozen.setHorizontalHeaderLabels(["☐", "类型"])
+        self.accessory_list_frozen.setHorizontalHeaderLabels(["☐", "渠道"])
         self.accessory_list_frozen.verticalHeader().setVisible(False)
         self.accessory_list_frozen.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.accessory_list_frozen.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -665,17 +700,17 @@ class BillApp(QMainWindow):
         self.accessory_list_frozen.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.accessory_list_table = QTableWidget(0, 7)
         self.accessory_list_table.setObjectName("historyScrollPart")
-        self.accessory_list_table.setHorizontalHeaderLabels(["渠道", "名称", "描述", "URL", "备注", "创建时间", "操作"])
+        self.accessory_list_table.setHorizontalHeaderLabels(["类型", "名称", "描述", "URL", "备注", "创建时间", "操作"])
         self.accessory_list_table.verticalHeader().setVisible(False)
         self.accessory_list_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.accessory_list_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.accessory_list_table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.SelectedClicked | QTableWidget.EditTrigger.EditKeyPressed)
         self.accessory_list_table.setAlternatingRowColors(True)
         fm_acc = QFontMetrics(self.font())
-        w_type = max(100, fm_acc.horizontalAdvance("[类目一123]") + 24)
+        w_channel = max(100, fm_acc.horizontalAdvance("渠道一123") + 24)
         self.accessory_list_frozen.setColumnWidth(0, 42)
-        self.accessory_list_frozen.setColumnWidth(1, w_type)
-        self.accessory_list_table.setColumnWidth(0, max(100, fm_acc.horizontalAdvance("渠道一123") + 24))
+        self.accessory_list_frozen.setColumnWidth(1, w_channel)
+        self.accessory_list_table.setColumnWidth(0, max(100, fm_acc.horizontalAdvance("[类目一123]") + 24))
         self.accessory_list_table.setColumnWidth(1, max(150, fm_acc.horizontalAdvance("名称一123456") + 28))
         self.accessory_list_table.setColumnWidth(2, max(150, fm_acc.horizontalAdvance("描述一123456") + 28))
         self.accessory_list_table.setColumnWidth(3, max(200, fm_acc.horizontalAdvance("https://example.com/xxx") + 28))
@@ -701,8 +736,8 @@ class BillApp(QMainWindow):
         self.accessory_list_frozen.itemChanged.connect(self._on_accessory_list_item_changed)
         self.accessory_list_table.itemChanged.connect(self._on_accessory_list_item_changed)
         self.accessory_list_frozen.horizontalHeader().sectionResized.connect(self._on_accessory_frozen_section_resized)
-        self.accessory_list_frozen.horizontalHeader().sectionResized.connect(self._save_accessory_list_col_widths)
-        self.accessory_list_table.horizontalHeader().sectionResized.connect(self._save_accessory_list_col_widths)
+        self.accessory_list_frozen.horizontalHeader().sectionResized.connect(self._schedule_save_accessory_list_col_widths)
+        self.accessory_list_table.horizontalHeader().sectionResized.connect(self._schedule_save_accessory_list_col_widths)
         self.accessory_list_table.cellDoubleClicked.connect(self._on_accessory_list_cell_double_clicked)
         self.accessory_list_row_node_ids: list[str] = []
         self._load_accessory_list_col_widths()
@@ -751,27 +786,9 @@ class BillApp(QMainWindow):
         root.addWidget(main_wrap, 1)
         self.show_bill_page()
 
-        # 与滚动区列顺序一致：类型…行业、「允许」、URL…；长度须 >= MAIN_SCROLL_COLUMNS+1（含 col_widths[0] 给冻结任务名列）
-        # 滚动区列序与 col_widths[1:] 对齐；末四列为 提单时间、打印次数、打印时间、操作（原打印相关宽顺序已随列序调整）
-        col_widths = [260, 150, 150, 120, 72, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 168, 88, 168, 128]
-        self.table_frozen.setColumnWidth(0, 42)
-        self.table_frozen.setColumnWidth(1, col_widths[0])
-        for s in range(MAIN_SCROLL_COLUMNS):
-            self.table.setColumnWidth(s, col_widths[s + 1])
-        self.history_table_frozen.setColumnWidth(0, 42)
-        self.history_table_frozen.setColumnWidth(1, col_widths[0])
-        hist_widths = col_widths + [160]
-        for s in range(HISTORY_SCROLL_COLUMNS):
-            self.history_table.setColumnWidth(s, hist_widths[s + 1])
-        self.print_log_table.setColumnWidth(0, 44)
-        _pw = [280, 92, 168, 88, 100, 88, 380, 228]
-        for s, w in enumerate(_pw, start=1):
-            self.print_log_table.setColumnWidth(s, w)
+        self._init_table_column_widths()
         self.table_frozen.itemChanged.connect(self.on_item_changed)
         self._apply_initial_window_geometry()
-        self._on_main_frozen_section_resized()
-        self._on_hist_frozen_section_resized()
-        self._on_accessory_frozen_section_resized()
 
     def _apply_initial_window_geometry(self):
         """初始窗口宽度 1500；高度为可用区估算值再加 50（无屏信息时 910）；窗口可自由拉伸。"""
@@ -794,16 +811,162 @@ class BillApp(QMainWindow):
         self._bill_post_show_geo = True
         QTimer.singleShot(0, self._apply_initial_window_geometry)
 
+    def closeEvent(self, event):
+        for timer in (
+            self._main_col_width_save_timer,
+            self._history_col_width_save_timer,
+            self._accessory_col_width_save_timer,
+        ):
+            if timer.isActive():
+                timer.stop()
+        self._save_main_table_col_widths()
+        self._save_history_table_col_widths()
+        self._save_accessory_list_col_widths()
+        self.save_data()
+        super().closeEvent(event)
+
+    def _init_table_column_widths(self):
+        """默认列宽 → 读取 theme.json 中保存的宽度；初始化期间不写回配置。"""
+        col_widths = [58, 260, 150, 150, 72, 72, 260, 90, 130, 90, 90, 90, 160, 160, 160, 160, 168, 88, 168, 128]
+        headers = (
+            self.table_frozen.horizontalHeader(),
+            self.table.horizontalHeader(),
+            self.history_table_frozen.horizontalHeader(),
+            self.history_table.horizontalHeader(),
+        )
+        self._loading_table_col_widths = True
+        for hf in headers:
+            hf.blockSignals(True)
+        try:
+            self.table_frozen.setColumnWidth(0, 42)
+            self.table_frozen.setColumnWidth(1, col_widths[0])
+            self.table_frozen.setColumnWidth(2, col_widths[1])
+            for s in range(MAIN_SCROLL_COLUMNS):
+                self.table.setColumnWidth(s, col_widths[s + 2])
+            self.history_table_frozen.setColumnWidth(0, 42)
+            self.history_table_frozen.setColumnWidth(1, col_widths[0])
+            self.history_table_frozen.setColumnWidth(2, col_widths[1])
+            hist_widths = col_widths + [160]
+            for s in range(HISTORY_SCROLL_COLUMNS):
+                self.history_table.setColumnWidth(s, hist_widths[s + 2])
+            self.print_log_table.setColumnWidth(0, 44)
+            for s, w in enumerate([280, 92, 168, 88, 100, 88, 380, 228], start=1):
+                self.print_log_table.setColumnWidth(s, w)
+            self._load_main_table_col_widths()
+            self._load_history_table_col_widths()
+        finally:
+            for hf in headers:
+                hf.blockSignals(False)
+        self._on_main_frozen_section_resized()
+        self._on_hist_frozen_section_resized()
+        self._on_accessory_frozen_section_resized()
+        self._loading_table_col_widths = False
+
+    def _schedule_save_main_table_col_widths(self, *_args):
+        if getattr(self, "_loading_table_col_widths", False):
+            return
+        self._main_col_width_save_timer.start(350)
+
+    def _schedule_save_history_table_col_widths(self, *_args):
+        if getattr(self, "_loading_table_col_widths", False):
+            return
+        self._history_col_width_save_timer.start(350)
+
+    def _schedule_save_accessory_list_col_widths(self, *_args):
+        if getattr(self, "_loading_table_col_widths", False):
+            return
+        self._accessory_col_width_save_timer.start(350)
+
+    @staticmethod
+    def _expected_main_table_col_width_count() -> int:
+        return FROZEN_COLUMNS + MAIN_SCROLL_COLUMNS
+
+    @staticmethod
+    def _expected_history_table_col_width_count() -> int:
+        return FROZEN_COLUMNS + HISTORY_SCROLL_COLUMNS
+
+    def _main_table_col_width_snapshot(self) -> list[int]:
+        return [self.table_frozen.columnWidth(i) for i in range(FROZEN_COLUMNS)] + [
+            self.table.columnWidth(i) for i in range(MAIN_SCROLL_COLUMNS)
+        ]
+
+    def _history_table_col_width_snapshot(self) -> list[int]:
+        return [self.history_table_frozen.columnWidth(i) for i in range(FROZEN_COLUMNS)] + [
+            self.history_table.columnWidth(i) for i in range(HISTORY_SCROLL_COLUMNS)
+        ]
+
+    def _load_main_table_col_widths(self):
+        widths = (getattr(self, "_ui_prefs", {}) or {}).get("main_table_col_widths", [])
+        need = self._expected_main_table_col_width_count()
+        if not isinstance(widths, list) or len(widths) < FROZEN_COLUMNS:
+            return
+        if len(widths) > need:
+            widths = widths[:need]
+        try:
+            for i in range(FROZEN_COLUMNS):
+                w = max(36, int(widths[i]))
+                if i == 1:
+                    w = max(52, min(w, 88))
+                elif i == 2:
+                    w = max(120, w)
+                self.table_frozen.setColumnWidth(i, w)
+            for i in range(MAIN_SCROLL_COLUMNS):
+                if FROZEN_COLUMNS + i >= len(widths):
+                    break
+                self.table.setColumnWidth(i, max(40, int(widths[FROZEN_COLUMNS + i])))
+        except (TypeError, ValueError):
+            return
+
+    def _save_main_table_col_widths(self, *_args):
+        if not hasattr(self, "table") or getattr(self, "_loading_table_col_widths", False):
+            return
+        widths = self._main_table_col_width_snapshot()
+        self._ui_prefs = dict(getattr(self, "_ui_prefs", {}))
+        self._ui_prefs["main_table_col_widths"] = widths
+        self.save_theme()
+
+    def _load_history_table_col_widths(self):
+        widths = (getattr(self, "_ui_prefs", {}) or {}).get("history_table_col_widths", [])
+        need = self._expected_history_table_col_width_count()
+        if not isinstance(widths, list) or len(widths) < FROZEN_COLUMNS:
+            return
+        if len(widths) > need:
+            widths = widths[:need]
+        try:
+            for i in range(FROZEN_COLUMNS):
+                w = max(36, int(widths[i]))
+                if i == 1:
+                    w = max(52, min(w, 88))
+                elif i == 2:
+                    w = max(120, w)
+                self.history_table_frozen.setColumnWidth(i, w)
+            for i in range(HISTORY_SCROLL_COLUMNS):
+                if FROZEN_COLUMNS + i >= len(widths):
+                    break
+                self.history_table.setColumnWidth(i, max(40, int(widths[FROZEN_COLUMNS + i])))
+        except (TypeError, ValueError):
+            return
+
+    def _save_history_table_col_widths(self, *_args):
+        if not hasattr(self, "history_table") or getattr(self, "_loading_table_col_widths", False):
+            return
+        widths = self._history_table_col_width_snapshot()
+        self._ui_prefs = dict(getattr(self, "_ui_prefs", {}))
+        self._ui_prefs["history_table_col_widths"] = widths
+        self.save_theme()
+
     def _on_main_frozen_section_resized(self, *_args):
-        """冻结区仅横向不滚动：勾选列固定宽，任务名列可调；总宽随两列之和更新。"""
+        """冻结区：勾选列固定；关停列固定；任务名列可调；总宽为三列之和。"""
         hf = self.table_frozen.horizontalHeader()
         hf.blockSignals(True)
         try:
             w0 = max(36, self.table_frozen.columnWidth(0))
-            w1 = max(120, min(self.table_frozen.columnWidth(1), 2000))
+            w1 = max(52, min(self.table_frozen.columnWidth(1), 88))
+            w2 = max(120, min(self.table_frozen.columnWidth(2), 2000))
             self.table_frozen.setColumnWidth(0, w0)
             self.table_frozen.setColumnWidth(1, w1)
-            self.table_frozen.setFixedWidth(w0 + w1)
+            self.table_frozen.setColumnWidth(2, w2)
+            self.table_frozen.setFixedWidth(w0 + w1 + w2)
         finally:
             hf.blockSignals(False)
 
@@ -812,10 +975,12 @@ class BillApp(QMainWindow):
         hf.blockSignals(True)
         try:
             w0 = max(36, self.history_table_frozen.columnWidth(0))
-            w1 = max(120, min(self.history_table_frozen.columnWidth(1), 2000))
+            w1 = max(52, min(self.history_table_frozen.columnWidth(1), 88))
+            w2 = max(120, min(self.history_table_frozen.columnWidth(2), 2000))
             self.history_table_frozen.setColumnWidth(0, w0)
             self.history_table_frozen.setColumnWidth(1, w1)
-            self.history_table_frozen.setFixedWidth(w0 + w1)
+            self.history_table_frozen.setColumnWidth(2, w2)
+            self.history_table_frozen.setFixedWidth(w0 + w1 + w2)
         finally:
             hf.blockSignals(False)
 
@@ -882,7 +1047,7 @@ class BillApp(QMainWindow):
             return
 
     def _save_accessory_list_col_widths(self, *_args):
-        if not hasattr(self, "accessory_list_frozen"):
+        if not hasattr(self, "accessory_list_frozen") or getattr(self, "_loading_table_col_widths", False):
             return
         widths = [self.accessory_list_frozen.columnWidth(0), self.accessory_list_frozen.columnWidth(1)] + [
             self.accessory_list_table.columnWidth(i) for i in range(7)
@@ -983,6 +1148,9 @@ class BillApp(QMainWindow):
     def default_record(self):
         d = {k: "" for k in FIELDS} | {"checked": False, "created_at": ""}
         d["allow_print_url"] = True
+        d["is_active"] = True
+        d["is_new_for_print"] = False
+        d["is_added_row"] = False
         d["print_count"] = 0
         d["last_printed_at"] = ""
         d["age_max"] = "55"
@@ -1024,15 +1192,7 @@ class BillApp(QMainWindow):
             except Exception:
                 self.records = []
         for rec in self.records:
-            rec.setdefault("created_at", "")
-            rec["allow_print_url"] = coerce_allow_print_url(rec.get("allow_print_url"))
-            rec.setdefault("print_count", 0)
-            try:
-                rec["print_count"] = int(rec.get("print_count", 0) or 0)
-            except (TypeError, ValueError):
-                rec["print_count"] = 0
-            rec.setdefault("last_printed_at", "")
-            rec["last_printed_at"] = str(rec.get("last_printed_at", "") or "")
+            self._normalize_record_meta(rec)
         if not self.records:
             self.records = [self.default_record()]
 
@@ -1043,10 +1203,12 @@ class BillApp(QMainWindow):
             except Exception:
                 self.history_records = []
         for rec in self.history_records:
+            rec.pop("industry_code", None)
             rec.setdefault("checked", False)
             rec.setdefault("deleted_at", "")
             rec.setdefault("created_at", "")
             rec["allow_print_url"] = coerce_allow_print_url(rec.get("allow_print_url"))
+            rec["is_active"] = coerce_is_active(rec.get("is_active"))
             rec.setdefault("print_count", 0)
             try:
                 rec["print_count"] = int(rec.get("print_count", 0) or 0)
@@ -1073,9 +1235,24 @@ class BillApp(QMainWindow):
         self.picker_recent[field] = merged[:20]
         self.save_picker_recent()
 
+    def _normalize_record_meta(self, rec: dict) -> None:
+        rec.pop("industry_code", None)
+        rec.setdefault("created_at", "")
+        rec["created_at"] = str(rec.get("created_at", "") or "")
+        rec["allow_print_url"] = coerce_allow_print_url(rec.get("allow_print_url"))
+        rec["is_active"] = coerce_is_active(rec.get("is_active"))
+        rec["is_new_for_print"] = bool(rec.get("is_new_for_print"))
+        rec["is_added_row"] = coerce_is_added_row(rec.get("is_added_row"))
+        try:
+            rec["print_count"] = int(rec.get("print_count", 0) or 0)
+        except (TypeError, ValueError):
+            rec["print_count"] = 0
+        rec["last_printed_at"] = str(rec.get("last_printed_at", "") or "")
+
     def save_data(self):
         stamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
         for rec in self.records:
+            self._normalize_record_meta(rec)
             if self.is_row_saved(rec) and not str(rec.get("created_at", "")).strip():
                 rec["created_at"] = stamp
         self._current_data_file().write_text(json.dumps(self.records, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1138,6 +1315,8 @@ class BillApp(QMainWindow):
                 "created_at": str(node.get("created_at", "") or "").strip() or datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
                 "children": [],
             }
+            if ntype == "root":
+                out["_tree_layout"] = str(node.get("_tree_layout", "") or "")
             if ntype in ("root", "branch"):
                 out["desc"] = ""
                 out["url"] = ""
@@ -1156,8 +1335,9 @@ class BillApp(QMainWindow):
                     self.accessories_root = normalize(raw)
                     self.accessories_root["id"] = "root"
                     self.accessories_root["name"] = "配件表"
+                    self._apply_accessory_tree_layout_migration(persist=True)
                     return
-                # 兼容旧版平铺数据，迁移为 root->branch(type)->branch(channel)->branch(name)->leaf(desc,url)
+                # 兼容旧版平铺数据，迁移为 root->branch(channel)->branch(type)->branch(name)->leaf(desc,url)
                 rows = [x for x in raw if isinstance(x, dict)] if isinstance(raw, list) else []
             except Exception:
                 rows = []
@@ -1169,7 +1349,7 @@ class BillApp(QMainWindow):
             tp = str(rec.get("type", "") or "").strip() or "未分类"
             ch = str(rec.get("channel", "") or "").strip() or "未分渠道"
             nm = str(rec.get("name", "") or "").strip() or "未命名"
-            type_map.setdefault(tp, {}).setdefault(ch, {}).setdefault(nm, []).append(
+            type_map.setdefault(ch, {}).setdefault(tp, {}).setdefault(nm, []).append(
                 {
                     "id": str(rec.get("id") or uuid.uuid4()),
                     "desc": str(rec.get("desc", "") or "").strip() or "（空描述）",
@@ -1177,15 +1357,15 @@ class BillApp(QMainWindow):
                     "created_at": str(rec.get("created_at", "") or "").strip() or datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
                 }
             )
-        for tp, chs in type_map.items():
-            tp_node = {"id": str(uuid.uuid4()), "name": tp, "node_type": "branch", "children": []}
-            root["children"].append(tp_node)
-            for ch, nms in chs.items():
-                ch_node = {"id": str(uuid.uuid4()), "name": ch, "node_type": "branch", "children": []}
-                tp_node["children"].append(ch_node)
+        for ch, tps in type_map.items():
+            ch_node = {"id": str(uuid.uuid4()), "name": ch, "node_type": "branch", "children": []}
+            root["children"].append(ch_node)
+            for tp, nms in tps.items():
+                tp_node = {"id": str(uuid.uuid4()), "name": tp, "node_type": "branch", "children": []}
+                ch_node["children"].append(tp_node)
                 for nm, leaves in nms.items():
                     nm_node = {"id": str(uuid.uuid4()), "name": nm, "node_type": "branch", "children": []}
-                    ch_node["children"].append(nm_node)
+                    tp_node["children"].append(nm_node)
                     for lf in leaves:
                         nm_node["children"].append(
                             {
@@ -1202,10 +1382,105 @@ class BillApp(QMainWindow):
         self.accessories_root = normalize(root)
         self.accessories_root["id"] = "root"
         self.accessories_root["name"] = "配件表"
+        self.accessories_root["_tree_layout"] = ACCESSORY_TREE_LAYOUT_V2
 
     def save_accessories(self):
+        if isinstance(self.accessories_root, dict) and self.accessories_root.get("node_type") == "root":
+            self.accessories_root.setdefault("_tree_layout", ACCESSORY_TREE_LAYOUT_V2)
         ACCESSORIES_FILE.write_text(json.dumps(self.accessories_root, ensure_ascii=False, indent=2), encoding="utf-8")
         self.lbl_save.setText("已自动保存")
+
+    @staticmethod
+    def _accessory_semantics_from_branch_path(path: list[str], layout: str) -> tuple[str, str, str]:
+        """从枝干路径解析 (类型, 渠道, 名称)。"""
+        p0 = path[0] if len(path) > 0 else ""
+        p1 = path[1] if len(path) > 1 else ""
+        p2 = path[2] if len(path) > 2 else ""
+        if layout == ACCESSORY_TREE_LAYOUT_V2:
+            return p1, p0, p2
+        if layout == ACCESSORY_TREE_LAYOUT_LEGACY_NAME_CHANNEL:
+            return p0, p2, p1
+        return p0, p1, p2
+
+    def _migrate_accessory_tree_to_channel_type_name(self, root: dict[str, Any], from_layout: str) -> bool:
+        """迁移为 渠道→类型→名称→leaf（兼容 V1 与误迁移的 type_name_channel）。"""
+        if not isinstance(root, dict) or root.get("node_type") != "root":
+            return False
+        if from_layout == ACCESSORY_TREE_LAYOUT_V2:
+            return False
+        ts = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        entries: list[tuple[str, str, str, dict[str, Any]]] = []
+
+        for node, parent in self._iter_accessory_nodes(root):
+            if node.get("node_type") != "leaf" or parent is None:
+                continue
+            path = self._find_node_path_names(str(parent.get("id", "")))
+            acc_type, channel, name = self._accessory_semantics_from_branch_path(path, from_layout)
+            leaf_copy = {k: v for k, v in node.items() if k != "children"}
+            leaf_copy["children"] = []
+            entries.append((acc_type, channel, name, leaf_copy))
+
+        if not entries:
+            return False
+
+        def branch_node(label: str, created_at: str = "") -> dict[str, Any]:
+            return {
+                "id": str(uuid.uuid4()),
+                "name": label,
+                "node_type": "branch",
+                "desc": "",
+                "url": "",
+                "remark": "",
+                "created_at": created_at or ts,
+                "children": [],
+            }
+
+        def find_branch(parent: dict[str, Any], label: str) -> dict[str, Any] | None:
+            for ch in parent.get("children", []) or []:
+                if isinstance(ch, dict) and ch.get("node_type") == "branch" and str(ch.get("name", "")) == label:
+                    return ch
+            return None
+
+        channel_map: dict[str, dict[str, Any]] = {}
+        for acc_type, channel, name, leaf in entries:
+            channel = channel or "未分渠道"
+            acc_type = acc_type or "未分类"
+            name = name or "未命名"
+            channel_node = channel_map.get(channel)
+            if channel_node is None:
+                channel_node = branch_node(channel)
+                channel_map[channel] = channel_node
+            type_node = find_branch(channel_node, acc_type)
+            if type_node is None:
+                type_node = branch_node(acc_type)
+                channel_node.setdefault("children", []).append(type_node)
+            name_node = find_branch(type_node, name)
+            if name_node is None:
+                name_node = branch_node(name)
+                type_node.setdefault("children", []).append(name_node)
+            name_node.setdefault("children", []).append(leaf)
+
+        root["children"] = list(channel_map.values())
+        return True
+
+    def _apply_accessory_tree_layout_migration(self, *, persist: bool) -> None:
+        root = self.accessories_root
+        if not isinstance(root, dict) or root.get("node_type") != "root":
+            return
+        layout = str(root.get("_tree_layout", "") or "").strip()
+        if layout == ACCESSORY_TREE_LAYOUT_V2:
+            return
+        migrated = False
+        if layout == ACCESSORY_TREE_LAYOUT_LEGACY_NAME_CHANNEL:
+            migrated = self._migrate_accessory_tree_to_channel_type_name(root, ACCESSORY_TREE_LAYOUT_LEGACY_NAME_CHANNEL)
+        elif layout in ("", ACCESSORY_TREE_LAYOUT_V1):
+            migrated = self._migrate_accessory_tree_to_channel_type_name(root, ACCESSORY_TREE_LAYOUT_V1)
+        elif layout == "type_name_channel":
+            migrated = self._migrate_accessory_tree_to_channel_type_name(root, ACCESSORY_TREE_LAYOUT_LEGACY_NAME_CHANNEL)
+        root["_tree_layout"] = ACCESSORY_TREE_LAYOUT_V2
+        if persist and migrated:
+            ACCESSORIES_FILE.write_text(json.dumps(root, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.lbl_save.setText("已自动保存（配件树层级已迁移）")
 
     def _iter_accessory_nodes(self, node: dict[str, Any] | None = None, parent: dict[str, Any] | None = None):
         cur = self.accessories_root if node is None else node
@@ -1243,15 +1518,15 @@ class BillApp(QMainWindow):
         return dfs(self.accessories_root, []) or []
 
     def _leaf_unique_key(self, parent: dict[str, Any] | None, desc: str) -> tuple[str, str, str, str]:
-        """唯一键：类目+渠道+名称+描述。"""
+        """唯一键：类型+渠道+名称+描述（与树路径 渠道→类型→名称→leaf 一致）。"""
         if parent is None:
             path = []
         else:
             path = self._find_node_path_names(str(parent.get("id", "")))
-        cat = path[0] if len(path) > 0 else ""
-        channel = path[1] if len(path) > 1 else ""
-        name = path[2] if len(path) > 2 else (path[-1] if path else "")
-        return (cat.strip(), channel.strip(), name.strip(), str(desc or "").strip())
+        channel = path[0] if len(path) > 0 else ""
+        acc_type = path[1] if len(path) > 1 else ""
+        name = path[2] if len(path) > 2 else ""
+        return (acc_type.strip(), channel.strip(), name.strip(), str(desc or "").strip())
 
     def _leaf_key_exists(self, key: tuple[str, str, str, str], *, exclude_id: str | None = None) -> bool:
         for node, parent in self._iter_accessory_nodes():
@@ -1367,8 +1642,8 @@ class BillApp(QMainWindow):
                 continue
             nid = str(node.get("id", ""))
             path = self._find_node_path_names(nid)
-            acc_type = path[0] if len(path) > 0 else ""
-            channel = path[1] if len(path) > 1 else ""
+            channel = path[0] if len(path) > 0 else ""
+            acc_type = path[1] if len(path) > 1 else ""
             name = path[2] if len(path) > 2 else ""
             desc = str(node.get("desc", "") or "")
             url = str(node.get("url", "") or "")
@@ -1408,7 +1683,7 @@ class BillApp(QMainWindow):
             }
             data_rows.sort(key=lambda r, f=sf: str(r.get(key_map.get(f, "name"), "") or "").lower(), reverse=rev)
         else:
-            data_rows.sort(key=lambda r: (str(r.get("type", "")).lower(), str(r.get("channel", "")).lower(), str(r.get("name", "")).lower(), str(r.get("desc", "")).lower()))
+            data_rows.sort(key=lambda r: (str(r.get("channel", "")).lower(), str(r.get("type", "")).lower(), str(r.get("name", "")).lower(), str(r.get("desc", "")).lower()))
         rows = draft_rows + data_rows
         self.accessory_list_row_node_ids = [r["id"] for r in rows]
         self.accessory_list_frozen.blockSignals(True)
@@ -1430,11 +1705,11 @@ class BillApp(QMainWindow):
                     ph0f.setCheckState(Qt.CheckState.Unchecked)
                 ph0f.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.accessory_list_frozen.setItem(row, 0, ph0f)
-                n_item = QTableWidgetItem(rec["type"])
-                n_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-                n_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
-                self.accessory_list_frozen.setItem(row, 1, n_item)
-                vals = [rec["channel"], rec["name"], rec["desc"], first_url(rec["url"]), rec["remark"], rec["created"]]
+                ch_item = QTableWidgetItem(rec["channel"])
+                ch_item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                ch_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
+                self.accessory_list_frozen.setItem(row, 1, ch_item)
+                vals = [rec["type"], rec["name"], rec["desc"], first_url(rec["url"]), rec["remark"], rec["created"]]
                 for col, val in enumerate(vals):
                     it = QTableWidgetItem(val)
                     table_col = col
@@ -1579,20 +1854,20 @@ class BillApp(QMainWindow):
         node, old_parent = self._find_accessory_node(node_id)
         if node is None or old_parent is None or node.get("node_type") != "leaf":
             return
-        acc_type = str((self.accessory_list_frozen.item(row, 1).text() if self.accessory_list_frozen.item(row, 1) else "")).strip()
-        channel = str((self.accessory_list_table.item(row, 0).text() if self.accessory_list_table.item(row, 0) else "")).strip()
+        channel = str((self.accessory_list_frozen.item(row, 1).text() if self.accessory_list_frozen.item(row, 1) else "")).strip()
+        acc_type = str((self.accessory_list_table.item(row, 0).text() if self.accessory_list_table.item(row, 0) else "")).strip()
         name = str((self.accessory_list_table.item(row, 1).text() if self.accessory_list_table.item(row, 1) else "")).strip()
         desc = str((self.accessory_list_table.item(row, 2).text() if self.accessory_list_table.item(row, 2) else "")).strip()
         url = str((self.accessory_list_table.item(row, 3).text() if self.accessory_list_table.item(row, 3) else "")).strip()
         remark = str((self.accessory_list_table.item(row, 4).text() if self.accessory_list_table.item(row, 4) else "")).strip()
         if not all([acc_type, channel, name, desc, url]):
-            QMessageBox.warning(self, "提示", "类型、渠道、名称、描述、URL 不能为空")
+            QMessageBox.warning(self, "提示", "渠道、类型、名称、描述、URL 不能为空")
             self.refresh_accessory_tree()
             return
-        target_branch = self._ensure_accessory_branch_path(acc_type, channel, name)
+        target_branch = self._ensure_accessory_branch_path(channel, acc_type, name)
         key = self._leaf_unique_key(target_branch, desc)
         if self._leaf_key_exists(key, exclude_id=node_id):
-            QMessageBox.warning(self, "提示", "同一“类目+渠道+名称+描述”不允许重复")
+            QMessageBox.warning(self, "提示", "同一“类型+渠道+名称+描述”不允许重复")
             self.refresh_accessory_tree()
             return
         if str(old_parent.get("id", "")) != str(target_branch.get("id", "")):
@@ -1615,8 +1890,8 @@ class BillApp(QMainWindow):
         self.refresh_accessory_tree()
 
     def _commit_or_update_accessory_draft_row(self, row: int, draft_id: str, url_override: str | None = None):
-        acc_type = str((self.accessory_list_frozen.item(row, 1).text() if self.accessory_list_frozen.item(row, 1) else "")).strip()
-        channel = str((self.accessory_list_table.item(row, 0).text() if self.accessory_list_table.item(row, 0) else "")).strip()
+        channel = str((self.accessory_list_frozen.item(row, 1).text() if self.accessory_list_frozen.item(row, 1) else "")).strip()
+        acc_type = str((self.accessory_list_table.item(row, 0).text() if self.accessory_list_table.item(row, 0) else "")).strip()
         name = str((self.accessory_list_table.item(row, 1).text() if self.accessory_list_table.item(row, 1) else "")).strip()
         desc = str((self.accessory_list_table.item(row, 2).text() if self.accessory_list_table.item(row, 2) else "")).strip()
         if url_override is None:
@@ -1627,8 +1902,8 @@ class BillApp(QMainWindow):
         created = str((self.accessory_list_table.item(row, 5).text() if self.accessory_list_table.item(row, 5) else "")).strip()
         for d in self._accessory_draft_rows:
             if str(d.get("id", "")) == draft_id:
-                d["type"] = acc_type
                 d["channel"] = channel
+                d["type"] = acc_type
                 d["name"] = name
                 d["desc"] = desc
                 d["url"] = url
@@ -1637,10 +1912,10 @@ class BillApp(QMainWindow):
                 break
         if not all([acc_type, channel, name, desc, url]):
             return
-        target_branch = self._ensure_accessory_branch_path(acc_type, channel, name)
+        target_branch = self._ensure_accessory_branch_path(channel, acc_type, name)
         key = self._leaf_unique_key(target_branch, desc)
         if self._leaf_key_exists(key):
-            QMessageBox.warning(self, "提示", "同一“类目+渠道+名称+描述”不允许重复")
+            QMessageBox.warning(self, "提示", "同一“类型+渠道+名称+描述”不允许重复")
             return
         child = {
             "id": str(uuid.uuid4()),
@@ -1661,9 +1936,9 @@ class BillApp(QMainWindow):
     def _accessory_row_display_value(self, node: dict[str, Any], parent: dict[str, Any] | None, field: str) -> str:
         nid = str(node.get("id", ""))
         path = self._find_node_path_names(nid)
-        if field == "acc_type":
-            return path[0] if len(path) > 0 else ""
         if field == "acc_channel":
+            return path[0] if len(path) > 0 else ""
+        if field == "acc_type":
             return path[1] if len(path) > 1 else ""
         if field == "acc_name":
             return path[2] if len(path) > 2 else ""
@@ -1784,11 +2059,11 @@ class BillApp(QMainWindow):
         hs.setSortIndicatorShown(False)
         if not self.accessory_sort_field:
             return
-        if self.accessory_sort_field == "acc_type":
+        if self.accessory_sort_field == "acc_channel":
             hf.setSortIndicatorShown(True)
             hf.setSortIndicator(1, self.accessory_sort_order)
             return
-        fmap = ["acc_channel", "acc_name", "acc_desc", "acc_url", "acc_remark", "acc_created", None]
+        fmap = ["acc_type", "acc_name", "acc_desc", "acc_url", "acc_remark", "acc_created", None]
         if self.accessory_sort_field in fmap:
             sec = fmap.index(self.accessory_sort_field)
             hs.setSortIndicatorShown(True)
@@ -1797,12 +2072,12 @@ class BillApp(QMainWindow):
     def _update_accessory_header_tooltips(self):
         frozen_title = self.accessory_list_frozen.horizontalHeaderItem(1)
         if frozen_title:
-            tip = "类型\n单击：排序；悬停右侧 ▼ 筛选"
-            vals = self.accessory_header_filters.get("acc_type", set())
+            tip = "渠道\n单击：排序；悬停右侧 ▼ 筛选"
+            vals = self.accessory_header_filters.get("acc_channel", set())
             if vals:
                 tip += f"\n已选 {len(vals)} 项"
             frozen_title.setToolTip(tip)
-        titles = ["渠道", "名称", "描述", "URL", "备注", "创建时间", "操作"]
+        titles = ["类型", "名称", "描述", "URL", "备注", "创建时间", "操作"]
         for sec, title in enumerate(titles):
             field = self._field_for_header_section("acc_scroll", sec)
             if not field:
@@ -1821,9 +2096,9 @@ class BillApp(QMainWindow):
             return f"{base} (筛:{len(vals)})" if vals else base
 
         self.accessory_list_frozen.setHorizontalHeaderItem(0, QTableWidgetItem("☐"))
-        self.accessory_list_frozen.setHorizontalHeaderItem(1, QTableWidgetItem(filtered_text("类型", "acc_type")))
+        self.accessory_list_frozen.setHorizontalHeaderItem(1, QTableWidgetItem(filtered_text("渠道", "acc_channel")))
         titles = [
-            ("渠道", "acc_channel"),
+            ("类型", "acc_type"),
             ("名称", "acc_name"),
             ("描述", "acc_desc"),
             ("URL", "acc_url"),
@@ -1955,7 +2230,7 @@ class BillApp(QMainWindow):
         if data["node_type"] == "leaf":
             key = self._leaf_unique_key(node, data["desc"])
             if self._leaf_key_exists(key):
-                QMessageBox.warning(self, "提示", "同一“类目+渠道+名称+描述”不允许重复")
+                QMessageBox.warning(self, "提示", "同一“类型+渠道+名称+描述”不允许重复")
                 return
         child = {
             "id": str(uuid.uuid4()),
@@ -2003,7 +2278,7 @@ class BillApp(QMainWindow):
             _cur, parent = self._find_accessory_node(str(node.get("id", "")))
             key = self._leaf_unique_key(parent, data["desc"])
             if self._leaf_key_exists(key, exclude_id=str(node.get("id", ""))):
-                QMessageBox.warning(self, "提示", "同一“类目+渠道+名称+描述”不允许重复")
+                QMessageBox.warning(self, "提示", "同一“类型+渠道+名称+描述”不允许重复")
                 return
         node["name"] = data["name"]
         if node.get("node_type") == "leaf":
@@ -2110,7 +2385,7 @@ class BillApp(QMainWindow):
                     used.add(s)
         return used
 
-    def _ensure_accessory_branch_path(self, acc_type: str, channel: str, name: str) -> dict[str, Any]:
+    def _ensure_accessory_branch_path(self, channel: str, acc_type: str, name: str) -> dict[str, Any]:
         def ensure_child(parent: dict[str, Any], child_name: str) -> dict[str, Any]:
             for ch in parent.get("children", []) or []:
                 if isinstance(ch, dict) and ch.get("node_type") == "branch" and str(ch.get("name", "")) == child_name:
@@ -2128,9 +2403,9 @@ class BillApp(QMainWindow):
             parent.setdefault("children", []).append(new_node)
             return new_node
 
-        type_node = ensure_child(self.accessories_root, acc_type)
-        channel_node = ensure_child(type_node, channel)
-        name_node = ensure_child(channel_node, name)
+        channel_node = ensure_child(self.accessories_root, channel)
+        type_node = ensure_child(channel_node, acc_type)
+        name_node = ensure_child(type_node, name)
         return name_node
 
     def _leaf_desc_used_in_bills(self, desc: str) -> bool:
@@ -2253,8 +2528,56 @@ class BillApp(QMainWindow):
         self.save_accessories()
         self.refresh_accessory_tree()
 
+    @staticmethod
+    def _accessory_import_col_map(header_vals: list[Any]) -> dict[str, int]:
+        """按表头识别列；无表头时默认与列表显示一致：渠道、类型、名称、描述、URL、备注。"""
+        aliases: dict[str, tuple[str, ...]] = {
+            "channel": ("渠道",),
+            "type": ("类型", "类目"),
+            "name": ("名称",),
+            "desc": ("描述",),
+            "url": ("url", "URL"),
+            "remark": ("备注",),
+        }
+        cols: dict[str, int] = {}
+        for i, h in enumerate(header_vals):
+            hs = str(h or "").strip()
+            if not hs:
+                continue
+            hlow = hs.casefold()
+            for key, names in aliases.items():
+                if key in cols:
+                    continue
+                if any(hlow == n.casefold() for n in names):
+                    cols[key] = i
+        required = ("channel", "type", "name", "desc", "url")
+        if all(k in cols for k in required):
+            return cols
+        h0 = str(header_vals[0] or "").strip() if header_vals else ""
+        h1 = str(header_vals[1] or "").strip() if len(header_vals) > 1 else ""
+        if h0 == "类型" and h1 == "渠道":
+            return {"type": 0, "channel": 1, "name": 2, "desc": 3, "url": 4, "remark": 5}
+        return {"channel": 0, "type": 1, "name": 2, "desc": 3, "url": 4, "remark": 5}
+
+    @staticmethod
+    def _accessory_import_field_values(vals: list[str], col_map: dict[str, int]) -> dict[str, str]:
+        def pick(key: str) -> str:
+            idx = col_map.get(key)
+            if idx is None or idx < 0 or idx >= len(vals):
+                return ""
+            return str(vals[idx] or "").strip()
+
+        return {
+            "channel": pick("channel"),
+            "type": pick("type"),
+            "name": pick("name"),
+            "desc": pick("desc"),
+            "url": pick("url"),
+            "remark": pick("remark"),
+        }
+
     def import_accessories_from_excel(self):
-        default_tpl = APP_DIR / "input-template.xlsx"
+        default_tpl = APP_DIR / "配件表模板.xlsx"
         start_dir = str(default_tpl.parent if default_tpl.exists() else APP_DIR)
         in_file, _ = QFileDialog.getOpenFileName(self, "选择配件导入文件", start_dir, "Excel (*.xlsx *.xlsm)")
         if not in_file:
@@ -2274,6 +2597,12 @@ class BillApp(QMainWindow):
             if max_row < 2:
                 QMessageBox.information(self, "导入提示", "文件为空")
                 return
+            header_row = next(
+                ws.iter_rows(min_row=1, max_row=1, min_col=1, max_col=20, values_only=True),
+                (),
+            )
+            col_map = self._accessory_import_col_map(list(header_row or ()))
+            max_col = max(col_map.values(), default=5) + 1
             now_ts = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
             total_rows = max_row - 1
             progress = QProgressDialog("正在导入配件数据...", "取消", 0, max(1, total_rows), self)
@@ -2287,27 +2616,31 @@ class BillApp(QMainWindow):
             QApplication.processEvents()
 
             for idx, row in enumerate(
-                ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=6, values_only=True),
+                ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col, values_only=True),
                 start=1,
             ):
                 if progress.wasCanceled():
                     break
                 vals = [str(x or "").strip() for x in row]
-                if len(vals) < 6:
-                    vals.extend([""] * (6 - len(vals)))
-                acc_type, channel, name, desc, url, remark = vals[:6]
-                if not any([acc_type, channel, name, desc, url, remark]):
+                fields = self._accessory_import_field_values(vals, col_map)
+                channel_col = fields["channel"]
+                acc_type = fields["type"]
+                name_col = fields["name"]
+                desc = fields["desc"]
+                url = fields["url"]
+                remark = fields["remark"]
+                if not any([channel_col, acc_type, name_col, desc, url, remark]):
                     progress.setValue(idx)
                     if idx % 50 == 0 or idx == total_rows:
                         QApplication.processEvents()
                     continue
-                if not all([acc_type, channel, name, desc, url]):
+                if not all([channel_col, acc_type, name_col, desc, url]):
                     skipped += 1
                     progress.setValue(idx)
                     if idx % 50 == 0 or idx == total_rows:
                         QApplication.processEvents()
                     continue
-                parent = self._ensure_accessory_branch_path(acc_type, channel, name)
+                parent = self._ensure_accessory_branch_path(channel_col, acc_type, name_col)
                 key = self._leaf_unique_key(parent, desc)
                 existed = None
                 for ch in parent.get("children", []) or []:
@@ -3402,7 +3735,9 @@ class BillApp(QMainWindow):
 
     def add_row(self):
         insert_at = self.filtered_indices[0] if self.filtered_indices else 0
-        self.records.insert(insert_at, self.default_record())
+        rec = self.default_record()
+        rec["is_added_row"] = True
+        self.records.insert(insert_at, rec)
         self._shift_field_errors_after_insert(insert_at)
         self.save_data()
         self.refresh_table()
@@ -3422,23 +3757,22 @@ class BillApp(QMainWindow):
             QMessageBox.warning(self, "导入失败", f"读取Excel失败：\n{e}")
             return
 
-        # 第1行表头；第2行起为数据。从 A 列起依次为：
-        # 任务名、类型、运营商、行业编码、url、数量、时长、年龄上限、年龄下限、pv、省份、排除省份、地市、排除地市
+        # 第1行表头；第2行起为数据。从 A 列起依次为（与 template.xlsx 一致）：
+        # 任务名、类型、运营商、url、数量、时长、年龄下限、年龄上限、pv、省份、排除省份、地市、排除地市
         col_map = {
             "task_name": 1,
             "type_code": 2,
             "operator_code": 3,
-            "industry_code": 4,
-            "url": 5,
-            "quantity": 6,
-            "duration": 7,
+            "url": 4,
+            "quantity": 5,
+            "duration": 6,
+            "age_min": 7,
             "age_max": 8,
-            "age_min": 9,
-            "pv": 10,
-            "province": 11,
-            "exclude_province": 12,
-            "city": 13,
-            "exclude_city": 14,
+            "pv": 9,
+            "province": 10,
+            "exclude_province": 11,
+            "city": 12,
+            "exclude_city": 13,
         }
         type_name_to_code = {str(v): str(k) for k, v in TYPE_MAP.items()}
         op_name_to_code = {str(v): str(k) for k, v in OP_MAP.items()}
@@ -3470,7 +3804,7 @@ class BillApp(QMainWindow):
 
             fields_in_order = list(col_map.keys())
             for idx, row_vals in enumerate(
-                ws.iter_rows(min_row=start_row, max_row=max_row, min_col=1, max_col=14, values_only=True),
+                ws.iter_rows(min_row=start_row, max_row=max_row, min_col=1, max_col=13, values_only=True),
                 start=1,
             ):
                 if progress.wasCanceled():
@@ -3485,6 +3819,7 @@ class BillApp(QMainWindow):
                     continue
                 rec = self.default_record()
                 rec.update(vals)
+                rec["is_active"] = True
                 rec["url"] = rec["url"].replace("\r\n", "\n").replace("\r", "\n")
                 if not str(rec.get("age_max", "")).strip():
                     rec["age_max"] = "55"
@@ -3522,7 +3857,7 @@ class BillApp(QMainWindow):
             self.statusBar().showMessage(f"导入已取消：已导入 {added} 条数据", 5000)
             return
         if added <= 0:
-            self.statusBar().showMessage("导入结果：未导入任何数据（仅识别第2行起 A~N 列非空数据）", 5000)
+            self.statusBar().showMessage("导入结果：未导入任何数据（仅识别第2行起 A~M 列非空数据）", 5000)
             return
         self.save_data()
         self.refresh_table()
@@ -3603,6 +3938,7 @@ class BillApp(QMainWindow):
         for row, rec_idx in enumerate(self.history_filtered_indices):
             rec = self.history_records[rec_idx]
             box_wrap = QWidget()
+            box_wrap.setObjectName("histFrozenChkWrap")
             box_layout = QHBoxLayout(box_wrap)
             box_layout.setContentsMargins(0, 0, 0, 0)
             box_layout.setAlignment(Qt.AlignCenter)
@@ -3614,11 +3950,20 @@ class BillApp(QMainWindow):
             ph0 = QTableWidgetItem("")
             ph0.setFlags(Qt.ItemIsEnabled)
             self.history_table_frozen.setItem(row, 0, ph0)
+            active = coerce_is_active(rec.get("is_active"))
+            ia_item = QTableWidgetItem("开" if active else "关")
+            ia_item.setFont(QFont(self.history_table_frozen.font()))
+            ia_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            ia_item.setToolTip("历史记录：关停状态（只读）")
+            ia_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.history_table_frozen.setItem(row, 1, ia_item)
             tn_item = QTableWidgetItem(self.display_val(rec, "task_name"))
             tn_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             tn_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.history_table_frozen.setItem(row, 1, tn_item)
-            for sc, f in enumerate(FIELDS[1:]):
+            self.history_table_frozen.setItem(row, 2, tn_item)
+            nft = FROZEN_TABLE_FIELD_COUNT
+            meta0 = HISTORY_SCROLL_FIELDS.index("created_at")
+            for sc, f in enumerate(TABLE_FIELDS[nft:]):
                 if f == "allow_print_url":
                     yes = coerce_allow_print_url(rec.get("allow_print_url"))
                     aw_item = QTableWidgetItem("是" if yes else "否")
@@ -3635,19 +3980,34 @@ class BillApp(QMainWindow):
             ca_hist = QTableWidgetItem(str(rec.get("created_at", "")))
             ca_hist.setTextAlignment(Qt.AlignCenter)
             ca_hist.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.history_table.setItem(row, len(FIELDS) - 1, ca_hist)
+            self.history_table.setItem(row, meta0, ca_hist)
             pc_hist = QTableWidgetItem(str(int(rec.get("print_count", 0) or 0)))
             pc_hist.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             pc_hist.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.history_table.setItem(row, len(FIELDS), pc_hist)
+            self.history_table.setItem(row, meta0 + 1, pc_hist)
             pt_hist = QTableWidgetItem(str(rec.get("last_printed_at", "") or ""))
             pt_hist.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             pt_hist.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.history_table.setItem(row, len(FIELDS) + 1, pt_hist)
+            self.history_table.setItem(row, meta0 + 2, pt_hist)
             deleted_item = QTableWidgetItem(str(rec.get("deleted_at", "")))
             deleted_item.setTextAlignment(Qt.AlignCenter)
             deleted_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.history_table.setItem(row, len(FIELDS) + 2, deleted_item)
+            self.history_table.setItem(row, meta0 + 3, deleted_item)
+            inactive = not coerce_is_active(rec.get("is_active"))
+            if inactive:
+                rim = ROW_INACTIVE_ROLE
+                yb = QColor(255, 242, 204)
+                box_wrap.setStyleSheet("#histFrozenChkWrap { background-color: #fff2cc; }")
+                ph0.setData(rim, True)
+                ph0.setBackground(yb)
+                ia_item.setData(rim, True)
+                tn_item.setData(rim, True)
+                tn_item.setBackground(yb)
+                for sc in range(self.history_table.columnCount()):
+                    it = self.history_table.item(row, sc)
+                    if it:
+                        it.setData(rim, True)
+                        it.setBackground(yb)
         h = self._data_row_height
         for r in range(n):
             self.history_table.setRowHeight(r, h)
@@ -3703,6 +4063,7 @@ class BillApp(QMainWindow):
             src = self.history_records[idx]
             rec = {k: src.get(k, "") for k in FIELDS}
             rec["allow_print_url"] = coerce_allow_print_url(src.get("allow_print_url"))
+            rec["is_active"] = coerce_is_active(src.get("is_active"))
             try:
                 rec["print_count"] = int(src.get("print_count", 0) or 0)
             except (TypeError, ValueError):
@@ -3742,6 +4103,8 @@ class BillApp(QMainWindow):
             return OP_MAP.get(rec.get(field, ""), "")
         if field == "allow_print_url":
             return "是" if coerce_allow_print_url(rec.get("allow_print_url")) else "否"
+        if field == "is_active":
+            return "开" if coerce_is_active(rec.get("is_active")) else "关"
         if field == "url":
             descs = self._selected_url_descs_for_record(rec)
             return "\n".join(descs)
@@ -3910,6 +4273,8 @@ class BillApp(QMainWindow):
             return self.display_val(rec, field) or str(rec.get(field, "") or "")
         if field == "allow_print_url":
             return self.display_val(rec, "allow_print_url")
+        if field == "is_active":
+            return self.display_val(rec, "is_active")
         if field == "url":
             return first_url(rec.get(field, ""))
         return str(rec.get(field, "") or "")
@@ -3984,7 +4349,11 @@ class BillApp(QMainWindow):
 
     def _field_for_header_section(self, mode: str, section: int) -> str | None:
         if mode in ("main_frozen", "hist_frozen"):
-            return None if section == 0 else "task_name"
+            if section == 0:
+                return None
+            if 1 <= section < FROZEN_COLUMNS:
+                return TABLE_FIELDS[section - 1]
+            return None
         if mode == "print_rec":
             if section == 0 or section > len(PRINT_LOG_DATA_FIELDS):
                 return None
@@ -4000,9 +4369,9 @@ class BillApp(QMainWindow):
                 return "merge_path"
             return None
         if mode == "acc_frozen":
-            return "acc_type" if section == 1 else None
+            return "acc_channel" if section == 1 else None
         if mode == "acc_scroll":
-            fmap = ["acc_channel", "acc_name", "acc_desc", "acc_url", "acc_remark", "acc_created", None]
+            fmap = ["acc_type", "acc_name", "acc_desc", "acc_url", "acc_remark", "acc_created", None]
             if 0 <= section < len(fmap):
                 return fmap[section]
             return None
@@ -4152,18 +4521,22 @@ class BillApp(QMainWindow):
 
     def _on_main_frozen_header_section_clicked(self, section: int):
         if section == 0:
-            # 由 HoverFilterHeaderView.mouseReleaseEvent 统一处理，避免与 sectionClicked 重复触发
             return
-        self._toggle_main_sort_for_field("task_name")
+        if section == 1:
+            self._toggle_main_sort_for_field("is_active")
+            return
+        if section == 2:
+            self._toggle_main_sort_for_field("task_name")
 
     def _main_scroll_field_for_section(self, section: int) -> str | None:
-        if 0 <= section < len(FIELDS) - 1:
-            return FIELDS[section + 1]
-        if section == len(FIELDS) - 1:
+        nft = FROZEN_TABLE_FIELD_COUNT
+        if 0 <= section < len(TABLE_FIELDS) - nft:
+            return TABLE_FIELDS[nft + section]
+        if section == len(TABLE_FIELDS) - nft:
             return "created_at"
-        if section == len(FIELDS):
+        if section == len(TABLE_FIELDS) - nft + 1:
             return "print_count"
-        if section == len(FIELDS) + 1:
+        if section == len(TABLE_FIELDS) - nft + 2:
             return "last_printed_at"
         return None
 
@@ -4210,27 +4583,32 @@ class BillApp(QMainWindow):
         if not self.header_sort_field:
             return
         f = self.header_sort_field
-        if f == "task_name":
+        nft = FROZEN_TABLE_FIELD_COUNT
+        if f == "is_active":
             hf.setSortIndicatorShown(True)
             hf.setSortIndicator(1, self.header_sort_order)
             return
-        if f in FIELDS:
-            si = FIELDS.index(f) - 1
+        if f == "task_name":
+            hf.setSortIndicatorShown(True)
+            hf.setSortIndicator(2, self.header_sort_order)
+            return
+        if f in TABLE_FIELDS:
+            si = TABLE_FIELDS.index(f) - nft
             if si >= 0:
                 hs.setSortIndicatorShown(True)
                 hs.setSortIndicator(si, self.header_sort_order)
             return
         if f == "created_at":
             hs.setSortIndicatorShown(True)
-            hs.setSortIndicator(len(FIELDS) - 1, self.header_sort_order)
+            hs.setSortIndicator(len(TABLE_FIELDS) - nft, self.header_sort_order)
             return
         if f == "print_count":
             hs.setSortIndicatorShown(True)
-            hs.setSortIndicator(len(FIELDS), self.header_sort_order)
+            hs.setSortIndicator(len(TABLE_FIELDS) - nft + 1, self.header_sort_order)
             return
         if f == "last_printed_at":
             hs.setSortIndicatorShown(True)
-            hs.setSortIndicator(len(FIELDS) + 1, self.header_sort_order)
+            hs.setSortIndicator(len(TABLE_FIELDS) - nft + 2, self.header_sort_order)
             return
 
     def _update_main_header_tooltips(self):
@@ -4304,6 +4682,8 @@ class BillApp(QMainWindow):
             return self.display_val(rec, field) or str(rec.get(field, "") or "")
         if field == "allow_print_url":
             return self.display_val(rec, "allow_print_url")
+        if field == "is_active":
+            return self.display_val(rec, "is_active")
         if field == "url":
             return first_url(rec.get(field, ""))
         return str(rec.get(field, "") or "")
@@ -4395,7 +4775,11 @@ class BillApp(QMainWindow):
     def _on_hist_frozen_header_section_clicked(self, section: int):
         if section == 0:
             return
-        self._toggle_history_sort_for_field("task_name")
+        if section == 1:
+            self._toggle_history_sort_for_field("is_active")
+            return
+        if section == 2:
+            self._toggle_history_sort_for_field("task_name")
 
     def _on_history_scroll_header_clicked(self, section: int):
         field = self._history_scroll_field_for_section(section)
@@ -4411,31 +4795,20 @@ class BillApp(QMainWindow):
         if not self.history_sort_field:
             return
         f = self.history_sort_field
-        if f == "task_name":
+        if f == "is_active":
             hf.setSortIndicatorShown(True)
             hf.setSortIndicator(1, self.history_sort_order)
             return
-        if f in FIELDS:
-            si = FIELDS.index(f) - 1
+        if f == "task_name":
+            hf.setSortIndicatorShown(True)
+            hf.setSortIndicator(2, self.history_sort_order)
+            return
+        if f in HISTORY_SCROLL_FIELDS:
+            si = HISTORY_SCROLL_FIELDS.index(f)
             if si >= 0:
                 hs.setSortIndicatorShown(True)
                 hs.setSortIndicator(si, self.history_sort_order)
             return
-        if f == "created_at":
-            hs.setSortIndicatorShown(True)
-            hs.setSortIndicator(len(FIELDS) - 1, self.history_sort_order)
-            return
-        if f == "print_count":
-            hs.setSortIndicatorShown(True)
-            hs.setSortIndicator(len(FIELDS), self.history_sort_order)
-            return
-        if f == "last_printed_at":
-            hs.setSortIndicatorShown(True)
-            hs.setSortIndicator(len(FIELDS) + 1, self.history_sort_order)
-            return
-        if f == "deleted_at":
-            hs.setSortIndicatorShown(True)
-            hs.setSortIndicator(len(FIELDS) + 2, self.history_sort_order)
 
     def _update_history_header_tooltips(self):
         for s in range(self.history_table_frozen.columnCount()):
@@ -4479,7 +4852,7 @@ class BillApp(QMainWindow):
         return ed if isinstance(ed, QPlainTextEdit) else None
 
     def _on_main_scroll_column_resized_for_url(self, logical_index: int, _old_size: int, _new_size: int):
-        url_sc = FIELDS.index("url") - 1
+        url_sc = TABLE_FIELDS.index("url") - FROZEN_TABLE_FIELD_COUNT
         if logical_index != url_sc:
             return
         self._reflow_all_url_row_heights()
@@ -4488,7 +4861,7 @@ class BillApp(QMainWindow):
         """URL 列宽变化后，统一为单行框高（不随内容增高）。"""
         if self.updating_table:
             return
-        url_sc = FIELDS.index("url") - 1
+        url_sc = TABLE_FIELDS.index("url") - FROZEN_TABLE_FIELD_COUNT
         nh = self._url_cell_editor_display_height()
         rh = self._data_row_height
         for row in range(self.table.rowCount()):
@@ -4561,6 +4934,7 @@ class BillApp(QMainWindow):
             rec = self.records[rec_idx]
             row_max_h = self._data_row_height
             box_wrap = QWidget()
+            box_wrap.setObjectName("frozenChkWrap")
             box_layout = QHBoxLayout(box_wrap)
             box_layout.setContentsMargins(0, 0, 0, 0)
             box_layout.setAlignment(Qt.AlignCenter)
@@ -4572,6 +4946,13 @@ class BillApp(QMainWindow):
             ph0 = QTableWidgetItem("")
             ph0.setFlags(Qt.ItemIsEnabled)
             self.table_frozen.setItem(row, 0, ph0)
+            active = coerce_is_active(rec.get("is_active"))
+            ia_item = QTableWidgetItem("开" if active else "关")
+            ia_item.setFont(QFont(self.table_frozen.font()))
+            ia_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            ia_item.setToolTip("单击切换为关（关停后整行浅黄背景）" if active else "单击切换为开")
+            ia_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.table_frozen.setItem(row, 1, ia_item)
             tn_item = QTableWidgetItem(self.display_val(rec, "task_name"))
             tn_item.setFlags(
                 Qt.ItemFlag.ItemIsSelectable
@@ -4580,12 +4961,14 @@ class BillApp(QMainWindow):
             )
             tn_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             if not str(rec.get("task_name", "")).strip():
-                tn_item.setToolTip("示例：客户全国######-产品")
+                tn_item.setToolTip("示例：客户全国####-产品")
             if self.field_errors.get((rec_idx, "task_name")):
                 tn_item.setBackground(QColor("#e05263"))
                 tn_item.setToolTip(self.field_error_msgs.get((rec_idx, "task_name"), "字段校验失败"))
-            self.table_frozen.setItem(row, 1, tn_item)
-            for sc, f in enumerate(FIELDS[1:]):
+            self.table_frozen.setItem(row, 2, tn_item)
+            nft = FROZEN_TABLE_FIELD_COUNT
+            meta0 = len(TABLE_FIELDS) - nft
+            for sc, f in enumerate(TABLE_FIELDS[nft:]):
                 if f == "allow_print_url":
                     yes = coerce_allow_print_url(rec.get("allow_print_url"))
                     aw_item = QTableWidgetItem("是" if yes else "否")
@@ -4654,15 +5037,15 @@ class BillApp(QMainWindow):
             ca_item = QTableWidgetItem(str(rec.get("created_at", "")))
             ca_item.setTextAlignment(Qt.AlignCenter)
             ca_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.table.setItem(row, len(FIELDS) - 1, ca_item)
+            self.table.setItem(row, meta0, ca_item)
             pc_item = QTableWidgetItem(str(int(rec.get("print_count", 0) or 0)))
             pc_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             pc_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.table.setItem(row, len(FIELDS), pc_item)
+            self.table.setItem(row, meta0 + 1, pc_item)
             pt_item = QTableWidgetItem(str(rec.get("last_printed_at", "") or ""))
             pt_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             pt_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.table.setItem(row, len(FIELDS) + 1, pt_item)
+            self.table.setItem(row, meta0 + 2, pt_item)
             act_del = QWidget()
             del_lo = QHBoxLayout(act_del)
             del_lo.setContentsMargins(4, 2, 4, 2)
@@ -4675,6 +5058,65 @@ class BillApp(QMainWindow):
             btn.clicked.connect(lambda _=False, x=rec_idx: self.delete_row(x))
             del_lo.addWidget(btn)
             self.table.setCellWidget(row, MAIN_SCROLL_COLUMNS - 1, act_del)
+            inactive = not coerce_is_active(rec.get("is_active"))
+            is_new = coerce_is_added_row(rec.get("is_added_row"))
+            if inactive:
+                rim = ROW_INACTIVE_ROLE
+                yb = QColor(255, 242, 204)
+                box_wrap.setStyleSheet("#frozenChkWrap { background-color: #fff2cc; }")
+                ph0.setData(rim, True)
+                ia_item.setData(rim, True)
+                if not self.field_errors.get((rec_idx, "task_name")):
+                    tn_item.setData(rim, True)
+                    tn_item.setBackground(yb)
+                else:
+                    tn_item.setData(rim, True)
+                for sc in range(self.table.columnCount()):
+                    fld = DISPLAY_FIELDS[FROZEN_COLUMNS + sc]
+                    if fld in ("created_at", "print_count", "last_printed_at", "action"):
+                        continue
+                    it = self.table.item(row, sc)
+                    w = self.table.cellWidget(row, sc)
+                    if it:
+                        it.setData(rim, True)
+                        if not self.field_errors.get((rec_idx, fld)):
+                            it.setBackground(yb)
+                    if w:
+                        w.setStyleSheet("QWidget { background-color: #fff2cc; }")
+                ph0.setBackground(yb)
+                for meta_it in (ca_item, pc_item, pt_item):
+                    meta_it.setData(rim, True)
+                    meta_it.setBackground(yb)
+                act_del.setStyleSheet("QWidget { background-color: #fff2cc; }")
+            elif is_new:
+                rim = ROW_NEW_ROLE
+                gb = NEW_ROW_FILL
+                hex_gb = "#c6efce"
+                box_wrap.setStyleSheet(f"#frozenChkWrap {{ background-color: {hex_gb}; }}")
+                ph0.setData(rim, True)
+                ia_item.setData(rim, True)
+                if not self.field_errors.get((rec_idx, "task_name")):
+                    tn_item.setData(rim, True)
+                    tn_item.setBackground(gb)
+                else:
+                    tn_item.setData(rim, True)
+                for sc in range(self.table.columnCount()):
+                    fld = DISPLAY_FIELDS[FROZEN_COLUMNS + sc]
+                    if fld in ("created_at", "print_count", "last_printed_at", "action"):
+                        continue
+                    it = self.table.item(row, sc)
+                    w = self.table.cellWidget(row, sc)
+                    if it:
+                        it.setData(rim, True)
+                        if not self.field_errors.get((rec_idx, fld)):
+                            it.setBackground(gb)
+                    if w:
+                        w.setStyleSheet(f"QWidget {{ background-color: {hex_gb}; }}")
+                ph0.setBackground(gb)
+                for meta_it in (ca_item, pc_item, pt_item):
+                    meta_it.setData(rim, True)
+                    meta_it.setBackground(gb)
+                act_del.setStyleSheet(f"QWidget {{ background-color: {hex_gb}; }}")
             per_row_heights.append(row_max_h)
         for r, rh in enumerate(per_row_heights):
             self.table.setRowHeight(r, rh)
@@ -4744,6 +5186,13 @@ class BillApp(QMainWindow):
             self.records[rec_idx]["allow_print_url"] = not cur
             self.save_data()
             self.refresh_table()
+            return
+        if col == IS_ACTIVE_DISPLAY_COL:
+            rec_idx = self.filtered_indices[row]
+            cur = coerce_is_active(self.records[rec_idx].get("is_active"))
+            self.records[rec_idx]["is_active"] = not cur
+            self.save_data()
+            self.refresh_table()
 
     def on_row_checkbox_changed(self, rec_idx: int, checked: bool):
         if self.updating_table:
@@ -4769,8 +5218,14 @@ class BillApp(QMainWindow):
             self.save_data()
             self.refresh_table()
             return
+        if field == "is_active":
+            cur = coerce_is_active(rec.get("is_active"))
+            rec["is_active"] = not cur
+            self.save_data()
+            self.refresh_table()
+            return
         if field == "url":
-            sc = FIELDS.index("url") - 1
+            sc = TABLE_FIELDS.index("url") - FROZEN_TABLE_FIELD_COUNT
             rect = self.table.visualRect(self.table.model().index(row, sc))
             vp = self.table.viewport()
             self._open_url_picker_with_anchor_rect(rec_idx, vp.mapToGlobal(rect.bottomLeft()), rect.width())
@@ -4839,14 +5294,14 @@ class BillApp(QMainWindow):
                 self.table.setCurrentCell(current_row, current_col)
         if current_row < 0 or current_row >= len(self.filtered_indices):
             return
-        if current_col <= 0 or current_col >= len(DISPLAY_FIELDS) - 1:
+        if current_col < 0 or current_col >= len(DISPLAY_FIELDS) - 1:
             return
         name = DISPLAY_FIELDS[current_col]
-        if name in ("print_count", "last_printed_at", "created_at", "action"):
+        if name in ("print_count", "last_printed_at", "created_at", "action", "checked", "is_active"):
             return
         field = name
         if field == "task_name":
-            self.statusBar().showMessage("任务名格式：客户名+省份/地市/全国/几省/几市+运营商码值+类型码值+行业编码-产品名", 5000)
+            self.statusBar().showMessage("任务名格式：客户名+省份/地市/全国/几省/几市+运营商码值+类型码值-产品名", 5000)
 
     def on_table_context_menu(self, pos):
         idx = self.table.indexAt(pos)
@@ -4871,7 +5326,7 @@ class BillApp(QMainWindow):
         if field == "task_name":
             sample = (
                 f"客户{self.region_part(rec)}{rec.get('operator_code') or '##'}"
-                f"{rec.get('type_code') or '##'}{rec.get('industry_code') or '##'}-产品"
+                f"{rec.get('type_code') or '##'}-产品"
             )
             action_fill = menu.addAction("套用任务名示例")
             action_map[action_fill] = ("task_name", sample)
@@ -4909,7 +5364,6 @@ class BillApp(QMainWindow):
         field_combo.addItem("运营商", "operator_code")
         field_combo.addItem("类型", "type_code")
         field_combo.addItem("时长", "duration")
-        field_combo.addItem("行业编码", "industry_code")
         field_combo.addItem("数量", "quantity")
         field_combo.addItem("年龄上限", "age_max")
         field_combo.addItem("年龄下限", "age_min")
@@ -4944,10 +5398,6 @@ class BillApp(QMainWindow):
             elif field == "duration":
                 for val in DURATIONS:
                     value_combo.addItem(val, val)
-            elif field == "industry_code":
-                value_combo.hide()
-                value_edit.show()
-                value_edit.setPlaceholderText("请输入行业编码（字母或数字）")
             else:
                 value_combo.hide()
                 value_edit.show()
@@ -4983,7 +5433,7 @@ class BillApp(QMainWindow):
                 return
         if mode == "clear":
             value = ""
-        elif field in ("industry_code", "quantity", "age_max", "age_min", "pv"):
+        elif field in ("quantity", "age_max", "age_min", "pv"):
             value = value_edit.text().strip()
         else:
             value = value_combo.currentData() or ""
@@ -5054,8 +5504,8 @@ class BillApp(QMainWindow):
         try:
             col = DISPLAY_FIELDS.index(field)
         except ValueError:
-            col = 1
-        if col <= 1:
+            col = 2
+        if col <= 2:
             self.table_frozen.setCurrentCell(row, col)
             it0 = self.table_frozen.item(row, col)
             if it0:
@@ -5094,7 +5544,7 @@ class BillApp(QMainWindow):
         if name in ("print_count", "last_printed_at", "created_at", "checked"):
             return
         field = name
-        if field in ("type_code", "operator_code", "duration", "url", "allow_print_url"):
+        if field in ("type_code", "operator_code", "duration", "url", "allow_print_url", "is_active"):
             return
         if field in ("province", "exclude_province", "city", "exclude_city"):
             raw = item.text()
@@ -5128,7 +5578,7 @@ class BillApp(QMainWindow):
         left = value.split("-", 1)[0]
         parsed = self.parse_left(left)
         if not parsed:
-            return "任务名前半段未识别到完整码值段（运营商+类型+行业编码）"
+            return "任务名前半段未识别到完整码值段（运营商+类型）"
         if not parsed.get("customer", "").strip():
             return "任务名建议包含客户名"
         if not parsed.get("region", "").strip():
@@ -5249,7 +5699,6 @@ class BillApp(QMainWindow):
             ("task_name", "任务名"),
             ("type_code", "类型"),
             ("operator_code", "运营商"),
-            ("industry_code", "行业编码"),
             ("url", "URL"),
             ("quantity", "数量"),
             ("duration", "时长"),
@@ -5264,13 +5713,11 @@ class BillApp(QMainWindow):
         if perrs:
             return False, perrs[0]
         if not parsed:
-            return False, "任务名格式错误：无法解析运营商/类型/行业编码"
+            return False, "任务名格式错误：无法解析运营商/类型"
         if parsed["op"] != rec.get("operator_code", ""):
             return False, "任务名中的运营商码值与运营商字段不匹配"
         if parsed["tp"] != rec.get("type_code", ""):
             return False, "任务名中的类型码值与类型字段不匹配"
-        if parsed["ind"] != rec.get("industry_code", ""):
-            return False, "任务名中的行业编码与行业编码字段不匹配"
         region_from_task = parsed.get("region", "") or "全国"
         region_from_fields = self.region_part(rec)
         if region_from_task != region_from_fields:
@@ -5297,7 +5744,6 @@ class BillApp(QMainWindow):
             ("task_name", "任务名"),
             ("type_code", "类型"),
             ("operator_code", "运营商"),
-            ("industry_code", "行业编码"),
             ("url", "URL"),
             ("quantity", "数量"),
             ("duration", "时长"),
@@ -5315,7 +5761,7 @@ class BillApp(QMainWindow):
                 for msg in perrs:
                     issues.append(("task_name", msg))
             elif not parsed:
-                issues.append(("task_name", "任务名格式错误：无法解析运营商/类型/行业编码"))
+                issues.append(("task_name", "任务名格式错误：无法解析运营商/类型"))
             else:
                 if parsed["op"] != rec.get("operator_code", ""):
                     m = "任务名中的运营商码值与运营商字段不匹配"
@@ -5324,10 +5770,6 @@ class BillApp(QMainWindow):
                 if parsed["tp"] != rec.get("type_code", ""):
                     m = "任务名中的类型码值与类型字段不匹配"
                     issues.append(("type_code", m))
-                    issues.append(("task_name", m))
-                if parsed["ind"] != rec.get("industry_code", ""):
-                    m = "任务名中的行业编码与行业编码字段不匹配"
-                    issues.append(("industry_code", m))
                     issues.append(("task_name", m))
                 region_from_task = parsed.get("region", "") or "全国"
                 region_from_fields = self.region_part(rec)
@@ -5759,17 +6201,16 @@ class BillApp(QMainWindow):
             return c[0] if len(c) == 1 else f"{int_to_cn(len(c))}市"
         return "全国"
 
-    def _try_parse_left_region_six(self, left: str) -> tuple[dict | None, list[str]]:
-        """地域（最前中文地域词）+ 紧随 6 位字母数字码；失败时返回 (None, 错误文案列表)。"""
+    def _try_parse_left_region_code(self, left: str) -> tuple[dict | None, list[str]]:
+        """地域（最前中文地域词）+ 紧随 4 位字母数字码（运营商2+类型2）。兼容旧版在类型后再跟 2 位行业码（共 6 位）。"""
         reg = find_earliest_region_in_left(left)
         if not reg:
             return None, []
         start, end, region = reg
         tail = left[end:].lstrip()
-        if len(tail) < 6 or not re.match(r"^[A-Za-z0-9]{6}$", tail[:6]):
+        if len(tail) < 4 or not re.match(r"^[A-Za-z0-9]{4}", tail[:4]):
             return None, []
-        code6 = tail[:6]
-        op, tp, ind = code6[0:2], code6[2:4], code6[4:6]
+        op, tp = tail[0:2], tail[2:4]
         errs: list[str] = []
         if op not in OP_MAP:
             errs.append(f"运营商编码「{op}」输入不正确")
@@ -5777,22 +6218,25 @@ class BillApp(QMainWindow):
             errs.append(f"类型编码「{tp}」输入不正确")
         if errs:
             return None, errs
-        customer_raw = (left[:start] + tail[6:]).strip()
+        code_len = 4
+        if len(tail) >= 6 and re.match(r"^[A-Za-z0-9]{6}$", tail[:6]):
+            code_len = 6
+        customer_raw = (left[:start] + tail[code_len:]).strip()
         if region_in_task_name_requires_customer_prefix(region) and not customer_raw:
             return None, ["请输入任务编号"]
         customer = customer_raw or "客户"
-        return {"customer": customer, "region": region, "op": op, "tp": tp, "ind": ind}, []
+        return {"customer": customer, "region": region, "op": op, "tp": tp}, []
 
     def parse_left_with_errors(self, left: str) -> tuple[dict | None, list[str]]:
         left = (left or "").strip()
         if not left:
             return None, []
-        v2, errs = self._try_parse_left_region_six(left)
+        v2, errs = self._try_parse_left_region_code(left)
         if errs:
             return None, errs
         if v2:
             return v2, []
-        m = re.search(r"(YD|LT|DX|YX)(DB|DJ|XC|DH|DY)([A-Za-z0-9]+)$", left)
+        m = re.search(r"(YD|LT|DX|YX)(DB|DJ|XC|DH|DY)([A-Za-z0-9]{2})?$", left)
         if not m:
             return None, []
         prefix = left[: m.start()]
@@ -5808,7 +6252,7 @@ class BillApp(QMainWindow):
                 customer = prefix[: -len(region)]
         if region_in_task_name_requires_customer_prefix(region) and not str(customer or "").strip():
             return None, ["请输入任务编号"]
-        return {"customer": customer or "客户", "region": region, "op": m.group(1), "tp": m.group(2), "ind": m.group(3)}, []
+        return {"customer": customer or "客户", "region": region, "op": m.group(1), "tp": m.group(2)}, []
 
     def parse_left(self, left):
         d, _ = self.parse_left_with_errors(left)
@@ -5819,10 +6263,7 @@ class BillApp(QMainWindow):
         product = old.split("-", 1)[1] if "-" in old else "产品"
         parsed = self.parse_left(old.split("-", 1)[0]) if "-" in old else None
         customer = parsed["customer"] if parsed else "客户"
-        return (
-            f"{customer}{self.region_part(rec)}{rec.get('operator_code') or '##'}"
-            f"{rec.get('type_code') or '##'}{rec.get('industry_code') or '##'}-{product}"
-        )
+        return f"{customer}{self.region_part(rec)}{rec.get('operator_code') or '##'}{rec.get('type_code') or '##'}-{product}"
 
     def parse_task_name(self, rec, rec_idx: int | None = None):
         self._task_name_parse_err_marked = False
@@ -5830,7 +6271,7 @@ class BillApp(QMainWindow):
         if "-" not in tn:
             return False
         left = tn.split("-", 1)[0]
-        snap = {k: rec.get(k, "") for k in ("operator_code", "type_code", "industry_code", "province", "city")}
+        snap = {k: rec.get(k, "") for k in ("operator_code", "type_code", "province", "city")}
         parsed, errs = self.parse_left_with_errors(left)
         if errs:
             for k, v in snap.items():
@@ -5840,10 +6281,15 @@ class BillApp(QMainWindow):
             return False
         if not parsed:
             return False
-        rec["operator_code"], rec["type_code"], rec["industry_code"] = parsed["op"], parsed["tp"], parsed["ind"]
+        rec["operator_code"], rec["type_code"] = parsed["op"], parsed["tp"]
         region = parsed["region"]
-        if not region or region == "全国" or re.fullmatch(r"[一二两三四五六七八九十\d]+[省市]", region):
+        if not region:
             rec["province"], rec["city"] = "", ""
+        elif region == "全国":
+            rec["province"], rec["city"] = "", ""
+        elif re.fullmatch(r"[一二两三四五六七八九十\d]+[省市]", region):
+            # 「两省」「四市」等仅表示数量，具体省/市在表格字段中；改任务名码段时不要清空
+            pass
         elif region in PROVINCES:
             rec["province"], rec["city"] = region, ""
         elif region in CITIES:
@@ -5871,7 +6317,7 @@ class BillApp(QMainWindow):
             rec["city"] = ""
         if field == "task_name":
             return self.parse_task_name(rec, rec_idx)
-        elif field in ("province", "city", "type_code", "operator_code", "industry_code"):
+        elif field in ("province", "city", "type_code", "operator_code"):
             rec["task_name"] = self.build_task_name(rec)
         return True
 
@@ -5884,8 +6330,12 @@ class BillApp(QMainWindow):
         fallback = left[:12] if left else "客户"
         return sanitize_filename(fallback)
 
+    def _checked_records_in_display_order(self) -> list[tuple[int, dict[str, Any]]]:
+        """已勾选记录按当前列表显示顺序（筛选 + 排序后）排列。"""
+        return [(i, self.records[i]) for i in self.filtered_indices if self.records[i].get("checked")]
+
     def export_excel(self):
-        selected_with_index = [(idx, r) for idx, r in enumerate(self.records) if r.get("checked")]
+        selected_with_index = self._checked_records_in_display_order()
         if not selected_with_index:
             QMessageBox.information(self, "提示", "请先勾选至少一条记录")
             return
@@ -5932,13 +6382,22 @@ class BillApp(QMainWindow):
             return
         wb = load_workbook(TEMPLATE_FILE)
         ws = wb[wb.sheetnames[0]]
-        col_map = {"task_name": "A", "type_code": "B", "operator_code": "C", "industry_code": "D", "url": "E", "quantity": "F", "duration": "G", "age_max": "H", "age_min": "I", "pv": "J", "province": "K", "exclude_province": "L", "city": "M", "exclude_city": "N"}
+        col_map = EXPORT_COL_MAP
+        fill_shutdown = PatternFill(fill_type="solid", fgColor="FFF2CC")
+        fill_green = PatternFill(fill_type="solid", fgColor="C6EFCE")
         start_row = 2
         for r in range(start_row, ws.max_row + 1):
             for f, c in col_map.items():
-                ws[f"{c}{r}"].value = None
+                cell = ws[f"{c}{r}"]
+                cell.value = None
+                cell.fill = PatternFill()
         for idx, rec in enumerate(selected):
             rr = start_row + idx
+            row_fill = None
+            if not coerce_is_active(rec.get("is_active")):
+                row_fill = fill_shutdown
+            elif coerce_is_added_row(rec.get("is_added_row")):
+                row_fill = fill_green
             for f, c in col_map.items():
                 if f == "url":
                     raw_descs = str(rec.get("url", ""))
@@ -5972,8 +6431,12 @@ class BillApp(QMainWindow):
                     ws[f"{c}{rr}"] = OP_MAP.get(rec.get(f, ""), "")
                 else:
                     ws[f"{c}{rr}"] = rec.get(f, "")
-        customer = self.export_customer_name(selected[0])
-        filename = f"{customer}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            if row_fill is not None:
+                for c in col_map.values():
+                    ws[f"{c}{rr}"].fill = row_fill
+        now = datetime.now()
+        suffix = "提单表" if self.current_business == "bill" else "回执表"
+        filename = f"LM.lemon {now.month}月{now.day}日{suffix}.xlsx"
         base_dir = self._default_output_dir_for("print")
         try:
             base_dir.mkdir(parents=True, exist_ok=True)
@@ -6012,6 +6475,7 @@ class BillApp(QMainWindow):
                 c = 0
             rr["print_count"] = c + 1
             rr["last_printed_at"] = stamp
+            rr["is_new_for_print"] = False
         self.save_data()
         self.refresh_table()
         self.print_records.insert(

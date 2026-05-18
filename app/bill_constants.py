@@ -8,7 +8,6 @@ FIELDS = [
     "task_name",
     "type_code",
     "operator_code",
-    "industry_code",
     "allow_print_url",
     "url",
     "quantity",
@@ -21,14 +20,32 @@ FIELDS = [
     "city",
     "exclude_city",
 ]
-DISPLAY_FIELDS = ["checked"] + FIELDS + ["created_at", "print_count", "last_printed_at", "action"]
+# 列表可见字段：关停在任务名前（与冻结区列序一致）
+TABLE_FIELDS = [
+    "is_active",
+    "task_name",
+    "type_code",
+    "operator_code",
+    "allow_print_url",
+    "url",
+    "quantity",
+    "duration",
+    "age_max",
+    "age_min",
+    "pv",
+    "province",
+    "exclude_province",
+    "city",
+    "exclude_city",
+]
+DISPLAY_FIELDS = ["checked"] + TABLE_FIELDS + ["created_at", "print_count", "last_printed_at", "action"]
 HEADERS = {
     "checked": "☐",
     "task_name": "任务名",
     "type_code": "类型",
     "operator_code": "运营商",
-    "industry_code": "行业编码",
     "allow_print_url": "允许",
+    "is_active": "关停",
     "url": "URL",
     "quantity": "数量",
     "duration": "时长",
@@ -60,13 +77,62 @@ def coerce_allow_print_url(raw: Any) -> bool:
     return True
 
 
-FROZEN_COLUMNS = 2
-# 「允许」列在右侧滚动表中的列索引；逻辑列号 = 滚动列 + 冻结列数
-ALLOW_PRINT_SCROLL_COL = FIELDS.index("allow_print_url") - 1
-ALLOW_PRINT_URL_DISPLAY_COL = ALLOW_PRINT_SCROLL_COL + FROZEN_COLUMNS
+def coerce_is_active(raw: Any) -> bool:
+    """订单是否启用（关停=False）；缺省为 True（兼容旧数据）。"""
+    if raw is None or raw == "":
+        return True
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if s in ("0", "false", "no", "否", "关停", "关闭", "关"):
+        return False
+    if s in ("1", "true", "yes", "是", "开启", "开"):
+        return True
+    return True
+
+
+def coerce_is_added_row(raw: Any) -> bool:
+    """是否通过「新增行」添加（用于绿底标记）；持久化到 data.json / receipt_data.json。"""
+    if raw is None or raw == "":
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return bool(raw)
+    s = str(raw).strip().lower()
+    if s in ("0", "false", "no", "否"):
+        return False
+    if s in ("1", "true", "yes", "是"):
+        return True
+    return False
+
+
+EXPORT_COL_MAP = {
+    "task_name": "A",
+    "type_code": "B",
+    "operator_code": "C",
+    "url": "D",
+    "quantity": "E",
+    "duration": "F",
+    "age_min": "G",
+    "age_max": "H",
+    "pv": "I",
+    "province": "J",
+    "exclude_province": "K",
+    "city": "L",
+    "exclude_city": "M",
+}
+
+FROZEN_COLUMNS = 3
+# 冻结区内除勾选列外，对应 TABLE_FIELDS 前若干列（关停 + 任务名）
+FROZEN_TABLE_FIELD_COUNT = FROZEN_COLUMNS - 1
+# 「允许」列在右侧滚动表中的列索引
+ALLOW_PRINT_SCROLL_COL = TABLE_FIELDS.index("allow_print_url") - FROZEN_TABLE_FIELD_COUNT
+ALLOW_PRINT_URL_DISPLAY_COL = 1 + TABLE_FIELDS.index("allow_print_url")
+IS_ACTIVE_DISPLAY_COL = 1 + TABLE_FIELDS.index("is_active")
 MAIN_SCROLL_COLUMNS = len(DISPLAY_FIELDS) - FROZEN_COLUMNS
-# 历史滚动区：与主表相同字段列 + 打印次数/时间 + 提单时间 + 删除时间，不含「操作」列
-HISTORY_SCROLL_FIELDS = FIELDS[1:] + ["created_at", "print_count", "last_printed_at", "deleted_at"]
+# 历史滚动区：与主表相同（冻结区后的字段）+ 提单时间 + …
+HISTORY_SCROLL_FIELDS = TABLE_FIELDS[FROZEN_TABLE_FIELD_COUNT:] + ["created_at", "print_count", "last_printed_at", "deleted_at"]
 HISTORY_SCROLL_COLUMNS = len(HISTORY_SCROLL_FIELDS)
 
 PRINT_LOG_DATA_FIELDS = [
@@ -88,6 +154,12 @@ PRINT_LOG_HEADERS = {
     "path": "路径",
 }
 PRINT_LOG_COL_COUNT = 1 + len(PRINT_LOG_DATA_FIELDS) + 1
+
+# 配件树层级：渠道 → 类型 → 名称 → leaf（旧版为 type → 渠道 → 名称 → leaf）
+ACCESSORY_TREE_LAYOUT_V2 = "channel_type_name"
+ACCESSORY_TREE_LAYOUT_V1 = "type_channel_name"
+# 曾误迁移的中间格式，启动时继续转换到 V2
+ACCESSORY_TREE_LAYOUT_LEGACY_NAME_CHANNEL = "type_name_channel"
 
 TYPE_MAP = {"DB": "dpi-白", "DJ": "106", "XC": "小程序", "DH": "dpi-灰", "DY": "抖音"}
 OP_MAP = {"YD": "移动", "LT": "联通", "DX": "电信", "YX": "移动|电信"}
@@ -201,7 +273,7 @@ def split_multi(value: str) -> list[str]:
     return [x.strip() for x in str(value or "").split("|") if x.strip()]
 
 
-# 任务名前半段：从前到后第一个「地域」中文词 + 紧随其后的 6 位字母数字（运营商2+类型2+行业2）
+# 任务名前半段：从前到后第一个「地域」中文词 + 紧随其后的 4 位字母数字（运营商2+类型2）；兼容旧数据末尾多 2 位行业码时跳过
 _REGION_NAME_TOKENS = sorted(set(PROVINCES + CITIES + ["全国"]), key=len, reverse=True)
 _REGION_NUM_RE = re.compile(r"^([一二两三四五六七八九十]+省|[一二两三四五六七八九十]+市|\d+省|\d+市)")
 

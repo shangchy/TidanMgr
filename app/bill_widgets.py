@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem,
     QGraphicsView,
     QHeaderView,
+    QStyle,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -337,6 +338,8 @@ class HoverFilterHeaderView(QHeaderView):
         self._bill = bill
         self._mode = mode
         self._hover_section = -1
+        self._press_pos: QPoint | None = None
+        self._press_on_resize_handle = False
         self.setMouseTracking(True)
         self.setDefaultAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
@@ -367,62 +370,128 @@ class HoverFilterHeaderView(QHeaderView):
             return idx
         return -1
 
+    def _header_grip_margin(self) -> int:
+        m = self.style().pixelMetric(QStyle.PixelMetric.PM_HeaderGripMargin, None, self)
+        return max(6, m) if m > 0 else 8
+
+    def _is_section_resize_handle(self, pos: QPoint) -> bool:
+        """是否点在列分隔拖拽区域（调整列宽，不应触发排序）。"""
+        idx = self.logicalIndexAt(pos)
+        if idx < 0:
+            return False
+        grip = self._header_grip_margin()
+        left = self.sectionViewportPosition(idx)
+        width = self.sectionSize(idx)
+        x = pos.x()
+        if x >= left + width - grip:
+            return True
+        if idx > 0 and x <= left + grip:
+            return True
+        return False
+
+    def _is_drag_not_click(self, release_pos: QPoint) -> bool:
+        """拖拽调宽或明显移动后的释放，不视为点击排序。"""
+        if self._press_on_resize_handle:
+            return True
+        if self._press_pos is None:
+            return False
+        threshold = max(8, QApplication.startDragDistance())
+        return (release_pos - self._press_pos).manhattanLength() > threshold
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            p = event.position().toPoint()
+            self._press_pos = p
+            self._press_on_resize_handle = self._is_section_resize_handle(p)
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
             fi = self._hit_filter_btn(pos)
             if fi >= 0:
+                self._press_pos = None
+                self._press_on_resize_handle = False
                 self._bill._open_header_filter_from_header(self._mode, fi)
                 event.accept()
+                return
+            if self._is_drag_not_click(pos):
+                self._press_pos = None
+                self._press_on_resize_handle = False
+                super().mouseReleaseEvent(event)
                 return
             idx = self.logicalIndexAt(pos)
             # 冻结首列勾选表头：自定义 HeaderView 下 sectionClicked 可能不触发，在此显式处理全选/取消全选
             if idx == 0 and self._mode == "print_rec":
+                self._press_pos = None
+                self._press_on_resize_handle = False
                 self._bill._on_print_log_header_col0_clicked()
                 event.accept()
                 return
             if idx == 0 and self._mode in ("main_frozen", "hist_frozen"):
+                self._press_pos = None
+                self._press_on_resize_handle = False
                 self._bill._on_frozen_header_col0_clicked(self._mode)
                 event.accept()
                 return
             if idx == 0 and self._mode == "merge_excel":
+                self._press_pos = None
+                self._press_on_resize_handle = False
                 self._bill._on_merge_header_section_clicked(idx)
                 event.accept()
                 return
             # 单击表头排序：与 sectionClicked 槽一致（避免仅 super 时不触发排序）
             if idx >= 0:
                 if self._mode == "print_rec" and 1 <= idx <= len(PRINT_LOG_DATA_FIELDS):
+                    self._press_pos = None
+                    self._press_on_resize_handle = False
                     self._bill._on_print_rec_header_section_clicked(idx)
                     event.accept()
                     return
                 if self._mode == "main_frozen" and idx == 1:
+                    self._press_pos = None
+                    self._press_on_resize_handle = False
                     self._bill._on_main_frozen_header_section_clicked(idx)
                     event.accept()
                     return
                 if self._mode == "main_scroll":
+                    self._press_pos = None
+                    self._press_on_resize_handle = False
                     self._bill._on_main_scroll_header_clicked(idx)
                     event.accept()
                     return
                 if self._mode == "hist_frozen" and idx == 1:
+                    self._press_pos = None
+                    self._press_on_resize_handle = False
                     self._bill._on_hist_frozen_header_section_clicked(idx)
                     event.accept()
                     return
                 if self._mode == "hist_scroll":
+                    self._press_pos = None
+                    self._press_on_resize_handle = False
                     self._bill._on_history_scroll_header_clicked(idx)
                     event.accept()
                     return
                 if self._mode == "merge_excel":
+                    self._press_pos = None
+                    self._press_on_resize_handle = False
                     self._bill._on_merge_header_section_clicked(idx)
                     event.accept()
                     return
                 if self._mode == "acc_frozen":
+                    self._press_pos = None
+                    self._press_on_resize_handle = False
                     self._bill._on_accessory_frozen_header_clicked(idx)
                     event.accept()
                     return
                 if self._mode == "acc_scroll":
+                    self._press_pos = None
+                    self._press_on_resize_handle = False
                     self._bill._on_accessory_scroll_header_clicked(idx)
                     event.accept()
                     return
+            self._press_pos = None
+            self._press_on_resize_handle = False
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
@@ -523,6 +592,13 @@ class MultiSelectDialog(QDialog):
         return [x for x in self._items if x in self._state_all]
 
 
+# 整行「关停」时标在单元格上，供「允许」等委托绘制浅黄底
+ROW_INACTIVE_ROLE = Qt.ItemDataRole.UserRole + 41
+# 新增行（待首次打印）整行浅绿底，与 Excel 导出 C6EFCE 一致
+ROW_NEW_ROLE = Qt.ItemDataRole.UserRole + 42
+NEW_ROW_FILL = QColor(198, 239, 206)
+
+
 class AllowPrintUrlCellDelegate(QStyledItemDelegate):
     """「允许」列：单元格为表格默认底色；中间绘制浅色圆形图标，「是/否」在圆内居中。"""
 
@@ -536,8 +612,14 @@ class AllowPrintUrlCellDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         pal = opt.palette
+        inactive = bool(index.data(ROW_INACTIVE_ROLE))
+        is_new = bool(index.data(ROW_NEW_ROLE))
         if opt.state & QStyle.StateFlag.State_Selected:
             painter.fillRect(rect, pal.brush(QPalette.ColorRole.Highlight))
+        elif inactive:
+            painter.fillRect(rect, QBrush(QColor(255, 242, 204)))
+        elif is_new:
+            painter.fillRect(rect, QBrush(NEW_ROW_FILL))
         elif opt.features & QStyleOptionViewItem.ViewItemFeature.Alternate:
             painter.fillRect(rect, pal.brush(QPalette.ColorRole.AlternateBase))
         else:
@@ -570,6 +652,67 @@ class AllowPrintUrlCellDelegate(QStyledItemDelegate):
         painter.setFont(f)
         painter.setPen(pen_text)
         painter.drawText(disc, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
+
+
+class IsActiveCellDelegate(QStyledItemDelegate):
+    """「关停」列：胶囊滑动开关 + 旁侧文字（与「允许」圆形徽标区分）。"""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = (opt.text or "").strip() or str(index.data(Qt.ItemDataRole.DisplayRole) or "").strip() or "开"
+        on = text == "开"
+        rect = option.rect
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        pal = opt.palette
+        inactive = bool(index.data(ROW_INACTIVE_ROLE))
+        is_new = bool(index.data(ROW_NEW_ROLE))
+        if opt.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(rect, pal.brush(QPalette.ColorRole.Highlight))
+        elif inactive:
+            painter.fillRect(rect, QBrush(QColor(255, 242, 204)))
+        elif is_new:
+            painter.fillRect(rect, QBrush(NEW_ROW_FILL))
+        elif opt.features & QStyleOptionViewItem.ViewItemFeature.Alternate:
+            painter.fillRect(rect, pal.brush(QPalette.ColorRole.AlternateBase))
+        else:
+            painter.fillRect(rect, pal.brush(QPalette.ColorRole.Base))
+
+        track_h = max(18, min(22, rect.height() - 8))
+        label_w = 18 if rect.width() >= 58 else 0
+        track_w = min(46, max(34, rect.width() - label_w - 12))
+        total_w = track_w + (4 + label_w if label_w else 0)
+        left = rect.left() + max(4, (rect.width() - total_w) // 2)
+        cy = rect.center().y()
+        track = QRect(left, int(cy - track_h / 2), track_w, track_h)
+        radius = track_h // 2
+        thumb_d = track_h - 4
+        thumb_margin = 2
+        if on:
+            track_fill = QColor(37, 99, 235)
+            thumb_x = track.right() - thumb_d - thumb_margin
+        else:
+            track_fill = QColor(148, 163, 184)
+            thumb_x = track.left() + thumb_margin
+        painter.setBrush(track_fill)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(track, radius, radius)
+        thumb = QRect(thumb_x, int(cy - thumb_d / 2), thumb_d, thumb_d)
+        painter.setBrush(QColor(255, 255, 255))
+        painter.setPen(QPen(QColor(0, 0, 0, 28), 1))
+        painter.drawEllipse(thumb)
+
+        if label_w:
+            f = QFont(opt.font)
+            f.setBold(True)
+            f.setPointSizeF(max(8.0, f.pointSizeF() - 0.5))
+            painter.setFont(f)
+            painter.setPen(QColor(51, 65, 85) if on else QColor(100, 116, 139))
+            label_rect = QRect(track.right() + 4, rect.top(), label_w + 4, rect.height())
+            painter.drawText(label_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
         painter.restore()
 
 
