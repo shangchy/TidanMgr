@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 
 from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -728,6 +729,7 @@ class AccessoryGraphView(QGraphicsView):
         self.setScene(self._scene)
         self._root: dict | None = None
         self._keyword = ""
+        self._leaf_visible: Callable[[dict, dict | None], bool] | None = None
         self._collapsed: set[str] = set()
         self._selected_id: str = "root"
         self._node_rects: dict[str, QRectF] = {}
@@ -749,9 +751,15 @@ class AccessoryGraphView(QGraphicsView):
     def selected_id(self) -> str:
         return self._selected_id
 
-    def set_tree_data(self, root: dict, keyword: str = ""):
+    def set_tree_data(
+        self,
+        root: dict,
+        keyword: str = "",
+        leaf_visible: Callable[[dict, dict | None], bool] | None = None,
+    ):
         self._root = root
         self._keyword = (keyword or "").strip().lower()
+        self._leaf_visible = leaf_visible
         self._render()
 
     def set_root_anchor_scene_x(self, x: float):
@@ -781,14 +789,21 @@ class AccessoryGraphView(QGraphicsView):
         h = 36.0
         return w, h
 
-    def _matches_or_has_match(self, node: dict) -> bool:
-        if not self._keyword:
+    def _node_visible(self, node: dict, parent: dict | None = None) -> bool:
+        """与列表模式共用：子节点可见则保留枝干；叶子由 leaf_visible 决定。"""
+        children = [ch for ch in node.get("children", []) or [] if isinstance(ch, dict)]
+        if any(self._node_visible(ch, node) for ch in children):
             return True
-        blob = f"{node.get('name','')} {node.get('desc','')} {node.get('url','')}".lower()
-        if self._keyword in blob:
-            return True
-        for ch in node.get("children", []) or []:
-            if isinstance(ch, dict) and self._matches_or_has_match(ch):
+        ntype = str(node.get("node_type", "") or "")
+        if ntype == "leaf":
+            if self._leaf_visible is not None:
+                return self._leaf_visible(node, parent)
+            if not self._keyword:
+                return True
+            blob = f"{node.get('name', '')} {node.get('desc', '')} {node.get('url', '')}".lower()
+            return self._keyword in blob
+        if self._keyword:
+            if self._keyword in str(node.get("name", "") or "").lower():
                 return True
         return False
 
@@ -797,7 +812,7 @@ class AccessoryGraphView(QGraphicsView):
         if node.get("id") in self._collapsed:
             return out
         for ch in node.get("children", []) or []:
-            if isinstance(ch, dict) and self._matches_or_has_match(ch):
+            if isinstance(ch, dict) and self._node_visible(ch, node):
                 out.append(ch)
         return out
 

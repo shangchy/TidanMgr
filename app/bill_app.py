@@ -730,7 +730,6 @@ class BillApp(QMainWindow):
         self.accessory_list_frozen.verticalScrollBar().valueChanged.connect(lambda v: self._sync_accessory_v_scroll(v, "frozen"))
         self.accessory_list_table.itemSelectionChanged.connect(self._sync_selection_accessory_to_frozen)
         self.accessory_list_frozen.itemSelectionChanged.connect(self._sync_selection_accessory_frozen_to_scroll)
-        self.accessory_list_frozen.cellClicked.connect(self._on_accessory_list_frozen_cell_clicked)
         self.accessory_list_frozen.itemSelectionChanged.connect(self._on_accessory_list_selection_changed)
         self.accessory_list_table.itemSelectionChanged.connect(self._on_accessory_list_selection_changed)
         self.accessory_list_frozen.itemChanged.connect(self._on_accessory_list_item_changed)
@@ -1469,6 +1468,10 @@ class BillApp(QMainWindow):
             return
         layout = str(root.get("_tree_layout", "") or "").strip()
         if layout == ACCESSORY_TREE_LAYOUT_V2:
+            rebuilt = self._rebuild_accessory_tree_v2_if_needed(root)
+            if persist and rebuilt:
+                ACCESSORIES_FILE.write_text(json.dumps(root, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.lbl_save.setText("已自动保存（配件树结构已整理）")
             return
         migrated = False
         if layout == ACCESSORY_TREE_LAYOUT_LEGACY_NAME_CHANNEL:
@@ -1478,9 +1481,83 @@ class BillApp(QMainWindow):
         elif layout == "type_name_channel":
             migrated = self._migrate_accessory_tree_to_channel_type_name(root, ACCESSORY_TREE_LAYOUT_LEGACY_NAME_CHANNEL)
         root["_tree_layout"] = ACCESSORY_TREE_LAYOUT_V2
-        if persist and migrated:
+        rebuilt = self._rebuild_accessory_tree_v2_if_needed(root)
+        if persist and (migrated or rebuilt):
             ACCESSORIES_FILE.write_text(json.dumps(root, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.lbl_save.setText("已自动保存（配件树层级已迁移）")
+            if migrated:
+                self.lbl_save.setText("已自动保存（配件树层级已迁移）")
+            elif rebuilt:
+                self.lbl_save.setText("已自动保存（配件树结构已整理）")
+
+    def _accessory_tree_needs_rebuild(self, root: dict[str, Any]) -> bool:
+        """叶子父路径应为 渠道→类型→名称 三层枝干。"""
+        for node, parent in self._iter_accessory_nodes(root):
+            if node.get("node_type") != "leaf" or parent is None:
+                continue
+            path = self._find_node_path_names(str(parent.get("id", "")))
+            if len(path) != 3:
+                return True
+        return False
+
+    def _collect_accessory_leaf_entries(self, root: dict[str, Any]) -> list[tuple[str, str, str, dict[str, Any]]]:
+        layout = str(root.get("_tree_layout", ACCESSORY_TREE_LAYOUT_V2) or ACCESSORY_TREE_LAYOUT_V2)
+        entries: list[tuple[str, str, str, dict[str, Any]]] = []
+        for node, parent in self._iter_accessory_nodes(root):
+            if node.get("node_type") != "leaf" or parent is None:
+                continue
+            path = self._find_node_path_names(str(parent.get("id", "")))
+            padded = (path + ["", "", ""])[:3]
+            channel, acc_type, name = self._accessory_semantics_from_branch_path(padded, layout)
+            leaf_copy = {k: v for k, v in node.items() if k != "children"}
+            leaf_copy["children"] = []
+            entries.append((channel or "未分渠道", acc_type or "未分类", name or "未命名", leaf_copy))
+        return entries
+
+    def _rebuild_accessory_tree_v2_if_needed(self, root: dict[str, Any]) -> bool:
+        if not self._accessory_tree_needs_rebuild(root):
+            return False
+        entries = self._collect_accessory_leaf_entries(root)
+        if not entries:
+            return False
+        ts = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+
+        def branch_node(label: str, created_at: str = "") -> dict[str, Any]:
+            return {
+                "id": str(uuid.uuid4()),
+                "name": label,
+                "node_type": "branch",
+                "desc": "",
+                "url": "",
+                "remark": "",
+                "created_at": created_at or ts,
+                "children": [],
+            }
+
+        def find_branch(parent: dict[str, Any], label: str) -> dict[str, Any] | None:
+            for ch in parent.get("children", []) or []:
+                if isinstance(ch, dict) and ch.get("node_type") == "branch" and str(ch.get("name", "")) == label:
+                    return ch
+            return None
+
+        channel_map: dict[str, dict[str, Any]] = {}
+        for channel, acc_type, name, leaf in entries:
+            channel_node = channel_map.get(channel)
+            if channel_node is None:
+                channel_node = branch_node(channel)
+                channel_map[channel] = channel_node
+            type_node = find_branch(channel_node, acc_type)
+            if type_node is None:
+                type_node = branch_node(acc_type)
+                channel_node.setdefault("children", []).append(type_node)
+            name_node = find_branch(type_node, name)
+            if name_node is None:
+                name_node = branch_node(name)
+                type_node.setdefault("children", []).append(name_node)
+            name_node.setdefault("children", []).append(leaf)
+
+        root["children"] = list(channel_map.values())
+        root["_tree_layout"] = ACCESSORY_TREE_LAYOUT_V2
+        return True
 
     def _iter_accessory_nodes(self, node: dict[str, Any] | None = None, parent: dict[str, Any] | None = None):
         cur = self.accessories_root if node is None else node
@@ -1517,15 +1594,21 @@ class BillApp(QMainWindow):
             return []
         return dfs(self.accessories_root, []) or []
 
+    def _leaf_channel_type_name(self, node: dict[str, Any], parent: dict[str, Any] | None) -> tuple[str, str, str]:
+        """叶子所属 渠道/类型/名称：按父枝干路径与 _tree_layout 解析（与列表列一致）。"""
+        if parent is None:
+            return "", "", ""
+        path = self._find_node_path_names(str(parent.get("id", "")))
+        layout = str((self.accessories_root or {}).get("_tree_layout", ACCESSORY_TREE_LAYOUT_V2) or ACCESSORY_TREE_LAYOUT_V2)
+        padded = (path + ["", "", ""])[:3]
+        return self._accessory_semantics_from_branch_path(padded, layout)
+
     def _leaf_unique_key(self, parent: dict[str, Any] | None, desc: str) -> tuple[str, str, str, str]:
         """唯一键：类型+渠道+名称+描述（与树路径 渠道→类型→名称→leaf 一致）。"""
         if parent is None:
-            path = []
+            channel, acc_type, name = "", "", ""
         else:
-            path = self._find_node_path_names(str(parent.get("id", "")))
-        channel = path[0] if len(path) > 0 else ""
-        acc_type = path[1] if len(path) > 1 else ""
-        name = path[2] if len(path) > 2 else ""
+            channel, acc_type, name = self._leaf_channel_type_name({"node_type": "leaf"}, parent)
         return (acc_type.strip(), channel.strip(), name.strip(), str(desc or "").strip())
 
     def _leaf_key_exists(self, key: tuple[str, str, str, str], *, exclude_id: str | None = None) -> bool:
@@ -1580,16 +1663,66 @@ class BillApp(QMainWindow):
                 missing.append(d)
         return out, missing
 
+    def _accessory_leaf_search_blob(self, node: dict[str, Any], parent: dict[str, Any] | None) -> str:
+        channel, acc_type, name = self._leaf_channel_type_name(node, parent)
+        return (
+            f"{channel} {acc_type} {name} "
+            f"{node.get('name', '')} {node.get('desc', '')} {node.get('url', '')} {node.get('remark', '')}"
+        ).lower()
+
+    def _accessory_leaf_matches_keyword(self, node: dict[str, Any], parent: dict[str, Any] | None, kw: str) -> bool:
+        if node.get("node_type") != "leaf":
+            return True
+        if kw and kw not in self._accessory_leaf_search_blob(node, parent):
+            return False
+        return True
+
+    def _accessory_leaf_visible_in_views(self, node: dict[str, Any], parent: dict[str, Any] | None, kw: str) -> bool:
+        if not self._accessory_leaf_matches_keyword(node, parent, kw):
+            return False
+        if not self._accessory_row_matches_header_filters_except(node, parent, None):
+            return False
+        return True
+
+    def _accessory_picker_node_visible(self, node: dict[str, Any], parent: dict[str, Any] | None, kw: str) -> bool:
+        """URL 选择弹窗：与配件表树形视图相同的可见性（含渠道/类型/名称搜索，不含配件页表头筛选）。"""
+        children = [ch for ch in node.get("children", []) or [] if isinstance(ch, dict)]
+        if any(self._accessory_picker_node_visible(ch, node, kw) for ch in children):
+            return True
+        ntype = str(node.get("node_type", "") or "")
+        if ntype == "leaf":
+            return self._accessory_leaf_matches_keyword(node, parent, kw)
+        if kw and kw in str(node.get("name", "") or "").lower():
+            return True
+        return False
+
+    def _accessory_picker_item_texts(
+        self, node: dict[str, Any], parent: dict[str, Any] | None
+    ) -> tuple[str, str, str]:
+        """返回 (名称列, URL列, tooltip)。"""
+        ntype = str(node.get("node_type", "") or "")
+        if ntype == "leaf":
+            channel, acc_type, name = self._leaf_channel_type_name(node, parent)
+            desc = str(node.get("desc", "") or node.get("name", "") or "")
+            raw_url = str(node.get("url", "") or "")
+            tip = f"渠道：{channel}\n类型：{acc_type}\n名称：{name}\nURL：{raw_url}"
+            return desc, first_url(raw_url), tip
+        label = str(node.get("name", "") or "")
+        return label, "", label
+
     def refresh_accessory_tree(self):
         if not hasattr(self, "accessory_graph"):
             return
         kw = self.accessory_search.text().strip().lower()
-        self.accessory_graph.set_tree_data(self.accessories_root, kw)
+
+        def leaf_visible(node: dict[str, Any], parent: dict[str, Any] | None) -> bool:
+            return self._accessory_leaf_visible_in_views(node, parent, kw)
+
+        self.accessory_graph.set_tree_data(self.accessories_root, kw, leaf_visible=leaf_visible)
         if hasattr(self, "btn_acc_add"):
             btn_center_global = self.btn_acc_add.mapToGlobal(self.btn_acc_add.rect().center())
             scene_pt = self.accessory_graph.mapToScene(self.accessory_graph.mapFromGlobal(btn_center_global))
             self.accessory_graph.set_root_anchor_scene_x(scene_pt.x())
-        self._refresh_accessory_list_table(kw)
         self._refresh_accessory_list_table(kw)
 
     def _on_accessory_graph_selected(self, node_id: str):
@@ -1641,18 +1774,12 @@ class BillApp(QMainWindow):
             if ntype != "leaf":
                 continue
             nid = str(node.get("id", ""))
-            path = self._find_node_path_names(nid)
-            channel = path[0] if len(path) > 0 else ""
-            acc_type = path[1] if len(path) > 1 else ""
-            name = path[2] if len(path) > 2 else ""
+            channel, acc_type, name = self._leaf_channel_type_name(node, parent)
             desc = str(node.get("desc", "") or "")
             url = str(node.get("url", "") or "")
             remark = str(node.get("remark", "") or "")
             created = str(node.get("created_at", "") or "")
-            text_blob = f"{acc_type} {channel} {name} {desc} {url} {remark}".lower()
-            if kw and kw not in text_blob:
-                continue
-            if not self._accessory_row_matches_header_filters_except(node, parent, None):
+            if not self._accessory_leaf_visible_in_views(node, parent, kw):
                 continue
             rows.append(
                 {
@@ -1769,17 +1896,6 @@ class BillApp(QMainWindow):
         if row < 0 or row >= len(self.accessory_list_row_node_ids):
             return
         self._accessory_selected_node_id = self.accessory_list_row_node_ids[row]
-
-    def _on_accessory_list_frozen_cell_clicked(self, row: int, col: int):
-        if self._acc_list_updating:
-            return
-        if col != 0:
-            return
-        it = self.accessory_list_frozen.item(row, 0)
-        if it is None:
-            return
-        nxt = Qt.CheckState.Unchecked if it.checkState() == Qt.CheckState.Checked else Qt.CheckState.Checked
-        it.setCheckState(nxt)
 
     def _on_accessory_list_cell_double_clicked(self, row: int, col: int):
         # URL 列使用弹窗多行编辑，列表仅展示第一条。
@@ -1934,14 +2050,13 @@ class BillApp(QMainWindow):
         self.refresh_accessory_tree()
 
     def _accessory_row_display_value(self, node: dict[str, Any], parent: dict[str, Any] | None, field: str) -> str:
-        nid = str(node.get("id", ""))
-        path = self._find_node_path_names(nid)
+        channel, acc_type, name = self._leaf_channel_type_name(node, parent)
         if field == "acc_channel":
-            return path[0] if len(path) > 0 else ""
+            return channel
         if field == "acc_type":
-            return path[1] if len(path) > 1 else ""
+            return acc_type
         if field == "acc_name":
-            return path[2] if len(path) > 2 else ""
+            return name
         if field == "acc_desc":
             return str(node.get("desc", "") or "")
         if field == "acc_url":
@@ -2375,15 +2490,60 @@ class BillApp(QMainWindow):
             return None
         return node
 
+    @staticmethod
+    def _bill_url_lines(raw: str) -> list[str]:
+        return [
+            x.strip()
+            for x in str(raw or "").replace("\r\n", "\n").replace("\r", "\n").replace("|", "\n").split("\n")
+            if x.strip()
+        ]
+
     def _used_urls_in_bills(self) -> set[str]:
         used: set[str] = set()
         for rec in self.records:
-            raw = str(rec.get("url", "") or "")
-            for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            used.update(self._bill_url_lines(str(rec.get("url", "") or "")))
+        return used
+
+    def _leaf_url_tokens(self, node: dict[str, Any]) -> set[str]:
+        """配件叶子在提单 url 字段中可能出现的标识（描述、整段 URL、多行 URL 各一行）。"""
+        tokens: set[str] = set()
+        desc = str(node.get("desc", "") or node.get("name", "")).strip()
+        if desc:
+            tokens.add(desc)
+        raw_url = str(node.get("url", "") or "").strip()
+        if raw_url:
+            tokens.add(raw_url)
+            for line in raw_url.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
                 s = line.strip()
                 if s:
-                    used.add(s)
-        return used
+                    tokens.add(s)
+        return tokens
+
+    def _collect_leaf_tokens_subtree(self, node: dict[str, Any]) -> set[str]:
+        tokens: set[str] = set()
+        if node.get("node_type") == "leaf":
+            tokens |= self._leaf_url_tokens(node)
+        for ch in node.get("children", []) or []:
+            if isinstance(ch, dict):
+                tokens |= self._collect_leaf_tokens_subtree(ch)
+        return tokens
+
+    def _purge_bill_urls_matching_tokens(self, removed_tokens: set[str]) -> None:
+        """删除配件后，从提单表各行的 url 字段移除对应描述/URL 行。"""
+        if not removed_tokens:
+            return
+        changed = False
+        for rec in self.records:
+            lines = self._bill_url_lines(str(rec.get("url", "") or ""))
+            new_lines = [ln for ln in lines if ln not in removed_tokens]
+            if new_lines != lines:
+                rec["url"] = "\n".join(new_lines)
+                changed = True
+        if not changed:
+            return
+        self.save_data()
+        if hasattr(self, "table"):
+            self.refresh_table()
 
     def _ensure_accessory_branch_path(self, channel: str, acc_type: str, name: str) -> dict[str, Any]:
         def ensure_child(parent: dict[str, Any], child_name: str) -> dict[str, Any]:
@@ -2464,6 +2624,10 @@ class BillApp(QMainWindow):
             return True
         if QMessageBox.question(self, "确认删除", f"确认删除已勾选的 {len(targets)} 个叶子节点吗？此操作不可撤销。") != QMessageBox.Yes:
             return True
+        removed_tokens: set[str] = set()
+        for node_id, node, _parent in targets:
+            removed_tokens |= self._leaf_url_tokens(node)
+            self._accessory_checked_node_ids.discard(node_id)
         by_parent: dict[str, tuple[dict[str, Any], set[str]]] = {}
         for node_id, _node, parent in targets:
             pid = str(parent.get("id", ""))
@@ -2475,6 +2639,7 @@ class BillApp(QMainWindow):
                 x for x in (parent.get("children", []) or []) if str(x.get("id", "")) not in del_ids
             ]
         self.save_accessories()
+        self._purge_bill_urls_matching_tokens(removed_tokens)
         self.refresh_accessory_tree()
         return True
 
@@ -2503,8 +2668,10 @@ class BillApp(QMainWindow):
         node_name = str(node.get("desc", "") or node.get("name", "") or "该节点")
         if QMessageBox.question(self, "确认删除", f"确认删除“{node_name}”节点吗？此操作不可撤销。") != QMessageBox.Yes:
             return
+        removed_tokens = self._collect_leaf_tokens_subtree(node)
         parent["children"] = [x for x in (parent.get("children", []) or []) if x.get("id") != node.get("id")]
         self.save_accessories()
+        self._purge_bill_urls_matching_tokens(removed_tokens)
         self.refresh_accessory_tree()
 
     def delete_accessory_selected(self):
@@ -2524,8 +2691,11 @@ class BillApp(QMainWindow):
             return
         if QMessageBox.question(self, "确认删除", f"确认删除叶子“{desc}”吗？此操作不可撤销。") != QMessageBox.Yes:
             return
+        removed_tokens = self._leaf_url_tokens(node)
+        self._accessory_checked_node_ids.discard(node_id)
         parent["children"] = [x for x in (parent.get("children", []) or []) if str(x.get("id", "")) != node_id]
         self.save_accessories()
+        self._purge_bill_urls_matching_tokens(removed_tokens)
         self.refresh_accessory_tree()
 
     @staticmethod
@@ -5848,6 +6018,8 @@ class BillApp(QMainWindow):
         self._open_url_picker_with_anchor_rect(rec_idx, p, anchor_widget.width())
 
     def _open_url_picker_dialog(self, rec_idx: int, anchor_widget: QWidget):
+        # 与配件表页共用 accessories.json / accessories_root，打开前重载避免两页数据分叉
+        self.load_accessories()
         dlg = QDialog(self)
         dlg.setWindowTitle("选择配件URL")
         dlg.resize(620, 460)
@@ -5855,12 +6027,15 @@ class BillApp(QMainWindow):
         lo.setContentsMargins(10, 10, 10, 10)
         lo.setSpacing(8)
         search = QLineEdit()
-        search.setPlaceholderText("搜索节点：名称/描述/URL...")
+        search.setPlaceholderText("搜索：渠道/类型/名称/描述/URL...")
         lo.addWidget(search)
         tree = QTreeWidget()
-        tree.setHeaderLabels(["名称", "URL"])
+        tree.setHeaderLabels(["描述/节点", "URL"])
         tree.setColumnWidth(0, 280)
         tree.setColumnWidth(1, 360)
+        # picker_hdr = tree.header()
+        # picker_hdr_h = max(24, int(picker_hdr.sizeHint().height() * 0.7))
+        # picker_hdr.setFixedHeight(picker_hdr_h)
         lo.addWidget(tree, 1)
         btns = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
         lo.addWidget(btns)
@@ -5879,31 +6054,28 @@ class BillApp(QMainWindow):
         def render():
             kw = search.text().strip().lower()
             tree.clear()
+            root = self.accessories_root
+            if not isinstance(root, dict):
+                return
 
-            def matches_or_has_match(node: dict[str, Any]) -> bool:
-                node_text = f"{node.get('name','')} {node.get('desc','')} {node.get('url','')}".lower()
-                if not kw or kw in node_text:
-                    return True
-                for ch in node.get("children", []) or []:
-                    if isinstance(ch, dict) and matches_or_has_match(ch):
-                        return True
-                return False
-
-            def add_node(node: dict[str, Any], parent_item: QTreeWidgetItem | None):
-                if not matches_or_has_match(node):
+            def add_node(node: dict[str, Any], parent: dict[str, Any] | None, parent_item: QTreeWidgetItem | None):
+                if not self._accessory_picker_node_visible(node, parent, kw):
                     return
-                item = QTreeWidgetItem(
-                    [
-                        str(node.get("name", "")),
-                        str(node.get("url", "")),
-                    ]
-                )
+                col0, col1, tip = self._accessory_picker_item_texts(node, parent)
+                item = QTreeWidgetItem([col0, col1])
                 item.setData(0, Qt.ItemDataRole.UserRole, str(node.get("id", "")))
+                if tip:
+                    item.setToolTip(0, tip)
+                    item.setToolTip(1, tip)
                 if node.get("node_type") == "leaf":
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     desc_name = str(node.get("desc", "") or node.get("name", "") or "")
                     node_url = str(node.get("url", "") or "").strip()
                     checked = desc_name in pre_values or node_url in pre_values
+                    for line in self._bill_url_lines(node_url):
+                        if line in pre_values:
+                            checked = True
+                            break
                     item.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
                 if parent_item is None:
                     tree.addTopLevelItem(item)
@@ -5911,12 +6083,11 @@ class BillApp(QMainWindow):
                     parent_item.addChild(item)
                 for ch in node.get("children", []) or []:
                     if isinstance(ch, dict):
-                        add_node(ch, item)
+                        add_node(ch, node, item)
 
-            add_node(self.accessories_root, None)
-            # 首次选择（无已选且无搜索）默认全收缩；其余仅展开 URL 命中（或已勾选）路径。
+            add_node(root, None, None)
             tree.collapseAll()
-            if not kw and not pre_values:
+            if tree.topLevelItemCount() <= 0:
                 return
 
             def mark_expand_path(it: QTreeWidgetItem) -> bool:
@@ -5925,23 +6096,35 @@ class BillApp(QMainWindow):
                     if mark_expand_path(it.child(i)):
                         has_child_match = True
                 node_id = str(it.data(0, Qt.ItemDataRole.UserRole) or "")
-                node, _ = self._find_accessory_node(node_id)
+                node, parent = self._find_accessory_node(node_id)
                 self_match = False
                 if node and node.get("node_type") == "leaf":
-                    node_url = str(node.get("url", "") or "").strip().lower()
                     desc_name = str(node.get("desc", "") or node.get("name", "") or "").strip()
+                    node_url = str(node.get("url", "") or "").strip()
                     checked = it.checkState(0) == Qt.CheckState.Checked or desc_name in pre_values
+                    if not checked:
+                        for line in self._bill_url_lines(node_url):
+                            if line in pre_values:
+                                checked = True
+                                break
                     if kw:
-                        self_match = kw in node_url
+                        self_match = kw in self._accessory_leaf_search_blob(node, parent)
                     else:
                         self_match = checked
+                elif kw and node:
+                    self_match = kw in str(node.get("name", "") or "").lower()
                 should_expand = has_child_match or self_match
                 if should_expand and it.childCount() > 0:
                     it.setExpanded(True)
                 return should_expand
 
-            for i in range(tree.topLevelItemCount()):
-                mark_expand_path(tree.topLevelItem(i))
+            top = tree.topLevelItem(0)
+            if not kw and not pre_values:
+                top.setExpanded(True)
+                for i in range(top.childCount()):
+                    top.child(i).setExpanded(True)
+                return
+            mark_expand_path(top)
 
         def on_accept():
             picked_urls: list[str] = []
